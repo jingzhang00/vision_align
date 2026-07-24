@@ -7,7 +7,7 @@ wheels/
 *.egg-info
 models/
 dataset/
-
+outputs/basic_pick_place_0
 
 # Virtual environments
 .venv
