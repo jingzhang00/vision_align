@@ -1,0 +1,162 @@
+{
+  "frame_count": 126,
+  "base_position": [
+    0.0,
+    0.0,
+    0.793
+  ],
+  "scale": 0.84,
+  "hand_representation": "single HDF5 hand-origin position plus rigid hand-frame rotation; no MANO or grasp state",
+  "tracking_policy": "confidence-valid targets stay active off-screen",
+  "left_tracked_frames": 126,
+  "right_tracked_frames": 126,
+  "left_visible_frames": 126,
+  "right_visible_frames": 64,
+  "left_mean_error_m": 0.00017898623681389007,
+  "left_max_error_m": 0.0002931462682761419,
+  "right_mean_error_m": 0.0006294803471483833,
+  "right_max_error_m": 0.002240145222028149,
+  "left_mean_orientation_error_deg": 0.0865922296812532,
+  "left_max_orientation_error_deg": 0.21915947123001706,
+  "right_mean_orientation_error_deg": 0.6212002459586927,
+  "right_max_orientation_error_deg": 1.7111226922655838,
+  "max_joint_step_rad": 0.08396411868185011,
+  "wrist_motion": {
+    "left_wrist_roll_joint": {
+      "range_rad": 0.43895478125195364,
+      "max_step_rad": 0.02070382851913405
+    },
+    "left_wrist_pitch_joint": {
+      "range_rad": 0.3028365023679751,
+      "max_step_rad": 0.022717982906642786
+    },
+    "left_wrist_yaw_joint": {
+      "range_rad": 0.1137706798660985,
+      "max_step_rad": 0.006249099246745528
+    },
+    "right_wrist_roll_joint": {
+      "range_rad": 1.2629424497200594,
+      "max_step_rad": 0.05629926236462804
+    },
+    "right_wrist_pitch_joint": {
+      "range_rad": 1.1912095681501542,
+      "max_step_rad": 0.06901480827054118
+    },
+    "right_wrist_yaw_joint": {
+      "range_rad": 1.0114876510862556,
+      "max_step_rad": 0.08396411868185011
+    }
+  },
+  "top_base_search_results": [
+    {
+      "base_position": [
+        0.0,
+        0.0,
+        0.793
+      ],
+      "scale": 0.84,
+      "feasible_fraction": 1.0,
+      "mean_error_m": 0.0018844851684845074,
+      "score": 9.998115514831515
+    },
+    {
+      "base_position": [
+        0.0,
+        0.0,
+        0.88
+      ],
+      "scale": 0.84,
+      "feasible_fraction": 1.0,
+      "mean_error_m": 0.0014280394893143665,
+      "score": 9.996396960510687
+    },
+    {
+      "base_position": [
+        0.12,
+        0.0,
+        0.793
+      ],
+      "scale": 0.84,
+      "feasible_fraction": 1.0,
+      "mean_error_m": 0.0007009119465955787,
+      "score": 9.996299088053405
+    },
+    {
+      "base_position": [
+        0.12,
+        0.0,
+        0.88
+      ],
+      "scale": 0.84,
+      "feasible_fraction": 1.0,
+      "mean_error_m": 0.0004663893430839714,
+      "score": 9.995828124858805
+    },
+    {
+      "base_position": [
+        0.0,
+        -0.1,
+        0.793
+      ],
+      "scale": 0.84,
+      "feasible_fraction": 1.0,
+      "mean_error_m": 0.002141684930097598,
+      "score": 9.995358315069902
+    },
+    {
+      "base_position": [
+        0.12,
+        -0.1,
+        0.793
+      ],
+      "scale": 0.84,
+      "feasible_fraction": 1.0,
+      "mean_error_m": 0.0008476008745522928,
+      "score": 9.995247274287495
+    },
+    {
+      "base_position": [
+        0.12,
+        0.1,
+        0.793
+      ],
+      "scale": 0.84,
+      "feasible_fraction": 1.0,
+      "mean_error_m": 0.0009528935794790159,
+      "score": 9.995141981582568
+    },
+    {
+      "base_position": [
+        0.0,
+        -0.1,
+        0.88
+      ],
+      "scale": 0.84,
+      "feasible_fraction": 1.0,
+      "mean_error_m": 0.0015918231637649686,
+      "score": 9.995094474224352
+    },
+    {
+      "base_position": [
+        0.0,
+        0.1,
+        0.793
+      ],
+      "scale": 0.84,
+      "feasible_fraction": 1.0,
+      "mean_error_m": 0.0024394059208329524,
+      "score": 9.995060594079167
+    },
+    {
+      "base_position": [
+        0.12,
+        0.0,
+        0.7
+      ],
+      "scale": 0.84,
+      "feasible_fraction": 1.0,
+      "mean_error_m": 0.001267200043704896,
+      "score": 9.99493732567763
+    }
+  ]
+}

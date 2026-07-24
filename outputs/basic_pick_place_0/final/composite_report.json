@@ -1,0 +1,14 @@
+{
+  "frame_count": 126,
+  "fps": 30.0,
+  "resolution": [
+    1280,
+    720
+  ],
+  "mean_robot_area_fraction": 0.09639394393463406,
+  "max_robot_area_fraction": 0.23925455729166667,
+  "mean_object_depth_occlusion_fraction": 0.000224609375,
+  "source_video": "/home/ai01/Downloads/vision_align/dataset/test/basic_pick_place/0.mp4",
+  "inpaint_video": "/home/ai01/Downloads/vision_align/outputs/basic_pick_place_0/propainter/0/inpaint_out.mp4",
+  "g1_root": "/home/ai01/Downloads/vision_align/outputs/basic_pick_place_0/g1"
+}

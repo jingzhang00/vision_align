@@ -1,0 +1,9 @@
+[submodule "sam3"]
+	path = sam3
+	url = https://github.com/facebookresearch/sam3.git
+[submodule "ProPainter"]
+	path = ProPainter
+	url = https://github.com/sczhou/ProPainter.git
+[submodule "mink"]
+	path = mink
+	url = https://github.com/kevinzakka/mink.git
