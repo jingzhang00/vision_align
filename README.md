@@ -18,8 +18,12 @@ Qwen-RobotManip technical report:
    human hand frame to the G1 palm in frame 0. The floating base and legs are
    frozen; waist, shoulder/elbow, and wrist joints remain available.
 5. Segment human arms with local SAM3 and remove them with ProPainter.
-6. Render only the two G1 shoulder subtrees with MuJoCo RGB, segmentation, and
-   metric depth, then composite them into the inpainted video.
+6. Estimate one fixed lighting profile for each task from its ProPainter
+   videos. Every episode in the task shares that profile; there is no
+   per-frame white balance.
+7. Render only the two G1 shoulder subtrees with either MuJoCo or Isaac Sim,
+   then composite their RGB, segmentation, and metric depth into the inpainted
+   video.
 
 The local models expected by the pipeline are:
 
@@ -30,53 +34,108 @@ ProPainter/weights/recurrent_flow_completion.pth
 ProPainter/weights/ProPainter.pth
 ```
 
-Run the complete 1280×720 experiment:
+### Folder pipeline
+
+The pipeline accepts either one task directory or a dataset root. It
+recursively discovers videos and only treats a file as an episode when a
+same-directory, same-stem HDF5 file exists:
+
+```text
+basic_pick_place/0.mp4
+basic_pick_place/0.hdf5
+```
+
+The directory containing the pair is the task and the shared profile is
+generated from the ProPainter results of all discovered episodes in that
+task. Unpaired MP4 files are ignored. Episodes are processed in natural
+numeric order.
+
+Run the `fry_bread` task with Isaac Sim rendering:
 
 ```bash
 .venv/bin/python -m human_to_robot.pipeline \
-  --video dataset/test/basic_pick_place/0.mp4 \
-  --hdf5 dataset/test/basic_pick_place/0.hdf5 \
-  --output outputs/basic_pick_place_0
+  --folder dataset/test/fry_bread \
+  --output outputs/fry_bread_batch \
+  --backend isaacsim
 ```
 
-Add `--reuse` to reuse finished SAM3, G1, and ProPainter stages.
+Here `--output` is the task output root, so episode `0` is written beneath
+`outputs/fry_bread_batch/0/`.
 
-### Isaac Sim 5.1 renderer with MuJoCo/Mink IK
-
-The Isaac version keeps MuJoCo/Mink as the source of truth for IK and forward
-kinematics. It imports the G1 arms into Isaac Sim, writes every MuJoCo body pose
-directly to the USD stage, and uses Isaac Sim only for camera rendering. PhysX
-is intentionally not stepped, so its joint integration cannot drift away from
-the solved MuJoCo trajectory. The default lighting is one fixed warm DomeLight
-(4300 K) plus a soft overhead key (4500 K); there is no per-frame white balance.
-
-After generating (or reusing) `g1/g1_trajectory.npz`, render all 126 frames:
+Run every task recursively under a dataset root with MuJoCo rendering:
 
 ```bash
-.venv/bin/python -m human_to_robot.render_isaacsim \
-  --trajectory outputs/basic_pick_place_0/g1/g1_trajectory.npz \
-  --mjcf assets/unitree_description/mjcf/g1.xml \
-  --video dataset/test/basic_pick_place/0.mp4 \
-  --hdf5 dataset/test/basic_pick_place/0.hdf5 \
-  --output outputs/basic_pick_place_0/g1_isaacsim_warm
+.venv/bin/python -m human_to_robot.pipeline \
+  --folder dataset/test \
+  --output outputs/test_batch \
+  --backend mujoco
 ```
 
-Composite the Isaac RGB, mask, and metric depth into the ProPainter result:
+In the dataset-root form, the relative task directories are mirrored below
+`--output`, for example
+`outputs/test_batch/basic_pick_place/0/`. `--backend` selects `mujoco` or
+`isaacsim`; MuJoCo/Mink remains the IK and forward-kinematics source in both
+cases. Complete intermediates are reused by default. Reuse is guarded by an
+episode state signature covering source files, model/code timestamps, relevant
+CLI parameters, the selected backend, and the task lighting profile. An
+interrupted phase is marked incomplete and cannot be mistaken for a reusable
+result. Pass `--no-reuse` to force regeneration.
 
-```bash
-.venv/bin/python -m human_to_robot.composite \
-  --source-video dataset/test/basic_pick_place/0.mp4 \
-  --inpaint-video outputs/basic_pick_place_0/propainter/0/inpaint_out.mp4 \
-  --hdf5 dataset/test/basic_pick_place/0.hdf5 \
-  --g1-root outputs/basic_pick_place_0/g1_isaacsim_warm \
-  --object-masks outputs/basic_pick_place_0/sam3/object_masks \
-  --output outputs/basic_pick_place_0/final_isaacsim_warm \
-  --robot-exposure -0.10 \
-  --robot-contrast 0.92 \
-  --robot-saturation 0.82 \
-  --robot-soften-sigma 0.55
+The terminal shows two episode-level progress bars: preparation, followed by
+rendering/compositing. They report the current episode, elapsed time, ETA, and
+the completed episode time. Verbose SAM3, ProPainter, IK, and renderer output
+is written to each episode's `pipeline.log` instead of producing separate
+stage progress bars. At completion, the pipeline reports total batch elapsed
+time and writes machine-readable timing fields to the episode, task, and
+batch reports.
+
+### Output layout
+
+For a dataset-root run, each task has one `lighting_profile.json`, while each
+episode keeps its own masks, inpainted video, trajectory, render, log, and
+timing report:
+
+```text
+outputs/test_batch/
+├── batch_report.json
+└── basic_pick_place/
+    ├── lighting_profile.json
+    ├── task_report.json
+    └── 0/
+        ├── pipeline.log
+        ├── pipeline_state.json
+        ├── episode_report.json
+        ├── sam3/
+        │   └── arm_masks/
+        ├── propainter/
+        │   └── 0/inpaint_out.mp4
+        ├── g1/
+        │   └── g1_trajectory.npz
+        ├── g1_isaacsim/          # present when Isaac Sim is selected
+        ├── final_mujoco/         # MuJoCo backend result
+        └── final_isaacsim/       # Isaac Sim backend result
 ```
 
+Only the selected backend's `final_<backend>/` directory is produced. Its main
+result is `synthetic_g1.mp4`; it also contains the original/inpaint/G1
+comparison video and `composite_report.json`.
+
+### Lighting profile and Isaac Sim
+
+Lighting observations come from the ProPainter videos, after human-arm
+removal. The original SAM arm region is still excluded as a low-reliability
+area so generated inpainting texture cannot dominate the estimate. Episode
+observations are robustly aggregated into one task-level
+`lighting_profile.json`; the profile records confidence and warnings when
+color or exposure varies substantially between episodes.
+
+The Isaac backend imports the G1 arms into Isaac Sim, writes every MuJoCo body
+pose directly to the USD stage, and uses Isaac Sim only for camera rendering.
+PhysX is intentionally not stepped, so its joint integration cannot drift
+away from the solved MuJoCo trajectory. Isaac consumes the shared task profile
+for its fixed DomeLight and key light, and the compositor uses the same
+profile for one fixed grade over the episode. This is a bounded display match,
+not physical inverse rendering.
 
 Current prototype limitations:
 

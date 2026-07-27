@@ -7,7 +7,7 @@ wheels/
 *.egg-info
 models/
 dataset/
-outputs/basic_pick_place_0
+outputs/
 assets/unitree_description/meshes/g1/*_tmp/
 
 # Virtual environments
