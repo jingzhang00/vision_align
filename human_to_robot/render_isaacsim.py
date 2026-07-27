@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
 import traceback
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -73,24 +72,27 @@ def _build_arm_only_mjcf(source: Path, destination: Path) -> None:
     tree.write(destination, encoding="unicode")
 
 
-def _mujoco_joint_lookup(
-    mjcf: Path,
-) -> tuple[object, list[str]]:
-    import mujoco
-
-    model = mujoco.MjModel.from_xml_path(str(mjcf))
-    names: list[str] = []
-    for joint_id in range(model.njnt):
-        name = model.joint(joint_id).name
-        if name == "floating_base_joint":
-            continue
-        names.append(name)
-    return model, names
+def _mjcf_body_names(mjcf: Path) -> list[str]:
+    tree = ET.parse(mjcf)
+    names = [
+        body.get("name")
+        for body in tree.getroot().findall(".//worldbody//body")
+        if body.get("name")
+    ]
+    if not names:
+        raise ValueError(f"No named bodies found in {mjcf}")
+    return names
 
 
 def _validate_archive(archive: np.lib.npyio.NpzFile) -> int:
     required = {
+        "kinematics",
         "qpos",
+        "joint_names",
+        "base_position",
+        "link_names",
+        "link_positions",
+        "link_quaternions",
         "camera_positions",
         "camera_gl_quaternions",
         "scale",
@@ -98,31 +100,33 @@ def _validate_archive(archive: np.lib.npyio.NpzFile) -> int:
     missing = sorted(required.difference(archive.files))
     if missing:
         raise ValueError(f"Trajectory archive is missing: {', '.join(missing)}")
+    if str(np.asarray(archive["kinematics"]).item()) != "pinocchio":
+        raise ValueError("Isaac Sim requires a Pinocchio trajectory archive")
     frame_count = int(archive["qpos"].shape[0])
     if archive["camera_positions"].shape != (frame_count, 3):
         raise ValueError("camera_positions must have shape [frame_count, 3]")
     if archive["camera_gl_quaternions"].shape != (frame_count, 4):
         raise ValueError("camera_gl_quaternions must have shape [frame_count, 4]")
+    if archive["base_position"].shape != (3,):
+        raise ValueError("base_position must have shape [3]")
+    link_count = int(archive["link_names"].shape[0])
+    if archive["link_positions"].shape != (
+        frame_count,
+        link_count,
+        3,
+    ):
+        raise ValueError(
+            "link_positions must have shape [frame_count, link_count, 3]"
+        )
+    if archive["link_quaternions"].shape != (
+        frame_count,
+        link_count,
+        4,
+    ):
+        raise ValueError(
+            "link_quaternions must have shape [frame_count, link_count, 4]"
+        )
     return frame_count
-
-
-def _write_video(path: Path, frames: list[np.ndarray], fps: float) -> None:
-    import cv2
-
-    if not frames:
-        raise ValueError("No frames were rendered")
-    height, width = frames[0].shape[:2]
-    writer = cv2.VideoWriter(
-        str(path),
-        cv2.VideoWriter_fourcc(*"mp4v"),
-        fps,
-        (width, height),
-    )
-    if not writer.isOpened():
-        raise RuntimeError(f"Could not create video: {path}")
-    for frame in frames:
-        writer.write(frame)
-    writer.release()
 
 
 def _resolve_render_settings(
@@ -182,10 +186,9 @@ def render(args: argparse.Namespace) -> dict[str, object]:
         import omni.usd
         from isaacsim.sensors.camera import Camera
         from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux
-        from scipy.spatial.transform import Rotation
 
         from .trajectory import load_single_point_trajectory
-        from .video_io import video_metadata
+        from .video_io import video_metadata, write_video
 
         trajectory_path = args.trajectory.resolve()
         source_mjcf = args.mjcf.resolve()
@@ -198,6 +201,30 @@ def render(args: argparse.Namespace) -> dict[str, object]:
 
         archive = np.load(trajectory_path)
         total_frames = _validate_archive(archive)
+        archive_joint_names = [
+            str(name) for name in archive["joint_names"].tolist()
+        ]
+        qpos = np.asarray(archive["qpos"], dtype=np.float64)
+        if qpos.shape != (total_frames, len(archive_joint_names)):
+            raise ValueError(
+                "qpos must contain one value per archived joint: "
+                f"expected {(total_frames, len(archive_joint_names))}, "
+                f"got {qpos.shape}"
+            )
+        body_names = _mjcf_body_names(source_mjcf)
+        archived_link_names = [
+            str(name) for name in archive["link_names"].tolist()
+        ]
+        link_indices = {
+            name: index for index, name in enumerate(archived_link_names)
+        }
+        body_link_indices: dict[str, int] = {}
+        for body_name in body_names:
+            if body_name not in link_indices:
+                raise ValueError(
+                    f"MJCF body has no archived Pinocchio pose: {body_name}"
+                )
+            body_link_indices[body_name] = link_indices[body_name]
         source_width, source_height, source_frame_count, source_fps = (
             video_metadata(source_video)
         )
@@ -216,8 +243,6 @@ def render(args: argparse.Namespace) -> dict[str, object]:
             if args.max_frames is not None
             else total_frames
         )
-        mujoco_model, mujoco_joint_names = _mujoco_joint_lookup(source_mjcf)
-
         extension_manager = omni.kit.app.get_app().get_extension_manager()
         extension_manager.set_extension_enabled_immediate(
             "isaacsim.asset.importer.mjcf", True
@@ -274,8 +299,7 @@ def render(args: argparse.Namespace) -> dict[str, object]:
         simulation_app.update()
 
         body_pose_ops: list[tuple[int, object, object]] = []
-        for body_id in range(1, mujoco_model.nbody):
-            body_name = mujoco_model.body(body_id).name
+        for body_name, link_index in body_link_indices.items():
             body_path = f"/World/G1/pelvis/{body_name}"
             body_prim = stage.GetPrimAtPath(body_path)
             if not body_prim.IsValid():
@@ -284,18 +308,18 @@ def render(args: argparse.Namespace) -> dict[str, object]:
             xformable.ClearXformOpOrder()
             translate_op = xformable.AddTranslateOp(
                 UsdGeom.XformOp.PrecisionDouble,
-                opSuffix="mujoco_playback",
+                opSuffix="pinocchio_playback",
             )
             orient_op = xformable.AddOrientOp(
                 UsdGeom.XformOp.PrecisionDouble,
-                opSuffix="mujoco_playback",
+                opSuffix="pinocchio_playback",
             )
             xformable.SetXformOpOrder([translate_op, orient_op])
-            body_pose_ops.append((body_id, translate_op, orient_op))
+            body_pose_ops.append((link_index, translate_op, orient_op))
 
         isaac_joint_names = [
             name
-            for name in mujoco_joint_names
+            for name in archive_joint_names
             if stage.GetPrimAtPath(f"/World/G1/joints/{name}").IsValid()
         ]
         print(
@@ -303,11 +327,15 @@ def render(args: argparse.Namespace) -> dict[str, object]:
             f"{isaac_joint_names}",
             flush=True,
         )
-        missing_in_isaac = sorted(set(mujoco_joint_names) - set(isaac_joint_names))
-        extra_in_isaac = sorted(set(isaac_joint_names) - set(mujoco_joint_names))
+        missing_in_isaac = sorted(
+            set(archive_joint_names) - set(isaac_joint_names)
+        )
+        extra_in_isaac = sorted(
+            set(isaac_joint_names) - set(archive_joint_names)
+        )
         if missing_in_isaac or extra_in_isaac:
             raise RuntimeError(
-                "MuJoCo/Isaac joint mismatch: "
+                "Pinocchio/Isaac joint mismatch: "
                 f"missing_in_isaac={missing_in_isaac}, "
                 f"extra_in_isaac={extra_in_isaac}"
             )
@@ -330,47 +358,30 @@ def render(args: argparse.Namespace) -> dict[str, object]:
         for directory in (rgb_dir, mask_dir, depth_dir):
             directory.mkdir(parents=True, exist_ok=True)
 
-        qpos = archive["qpos"]
-        world_camera_positions = archive["camera_positions"]
-        world_camera_quaternions = archive["camera_gl_quaternions"]
-        base_rotations = Rotation.from_quat(
-            np.roll(qpos[:, 3:7], -1, axis=1)
+        base_position = np.asarray(archive["base_position"], dtype=np.float64)
+        camera_positions = (
+            np.asarray(archive["camera_positions"], dtype=np.float64)
+            - base_position
         )
-        world_camera_rotations = Rotation.from_quat(
-            np.roll(world_camera_quaternions, -1, axis=1)
-        )
-        camera_positions = base_rotations.inv().apply(
-            world_camera_positions - qpos[:, :3]
-        )
-        camera_quaternions = np.roll(
-            (base_rotations.inv() * world_camera_rotations).as_quat(),
-            1,
-            axis=1,
+        camera_quaternions = np.asarray(
+            archive["camera_gl_quaternions"], dtype=np.float64
         )
         video_frames: list[np.ndarray] = []
         mask_fractions: list[float] = []
         first_frame_diagnostics: dict[str, object] = {}
-        import mujoco
-
-        mujoco_data = mujoco.MjData(mujoco_model)
+        link_positions = np.asarray(
+            archive["link_positions"], dtype=np.float64
+        )
+        link_quaternions = np.asarray(
+            archive["link_quaternions"], dtype=np.float64
+        )
 
         for frame_id in range(frame_count):
-            mujoco_data.qpos[:] = qpos[frame_id]
-            mujoco.mj_forward(mujoco_model, mujoco_data)
-            base_rotation = Rotation.from_quat(
-                np.roll(qpos[frame_id, 3:7], -1)
-            )
-            for body_id, translate_op, orient_op in body_pose_ops:
-                relative_position = base_rotation.inv().apply(
-                    mujoco_data.xpos[body_id] - qpos[frame_id, :3]
-                )
-                world_body_rotation = Rotation.from_quat(
-                    np.roll(mujoco_data.xquat[body_id], -1)
-                )
-                relative_quaternion = np.roll(
-                    (base_rotation.inv() * world_body_rotation).as_quat(),
-                    1,
-                )
+            for link_index, translate_op, orient_op in body_pose_ops:
+                relative_position = link_positions[frame_id, link_index]
+                relative_quaternion = link_quaternions[
+                    frame_id, link_index
+                ]
                 translate_op.Set(Gf.Vec3d(*relative_position))
                 orient_op.Set(
                     Gf.Quatd(
@@ -416,9 +427,14 @@ def render(args: argparse.Namespace) -> dict[str, object]:
             cv2.imwrite(str(rgb_dir / f"{frame_id:05d}.png"), rgb)
             cv2.imwrite(str(mask_dir / f"{frame_id:05d}.png"), mask_u8)
             cv2.imwrite(str(depth_dir / f"{frame_id:05d}.png"), depth_mm)
-            video_frames.append(rgb)
+            if args.debug_artifacts:
+                video_frames.append(rgb)
             mask_fractions.append(float(mask.mean()))
-            if frame_id == 0 or (frame_id + 1) % 10 == 0:
+            if (
+                frame_id == 0
+                or (frame_id + 1) % 10 == 0
+                or frame_id + 1 == frame_count
+            ):
                 print(
                     f"Isaac Sim rendered {frame_id + 1}/{frame_count}",
                     flush=True,
@@ -449,11 +465,17 @@ def render(args: argparse.Namespace) -> dict[str, object]:
                     flush=True,
                 )
 
-        _write_video(output_root / "robot_only.mp4", video_frames, source_fps)
-        shutil.copy2(trajectory_path, output_root / "g1_trajectory.npz")
+        if args.debug_artifacts:
+            write_video(
+                output_root / "robot_only.mp4",
+                video_frames,
+                source_fps,
+                source_video=source_video,
+                hardware_encoding=args.hardware_encoding,
+            )
         report: dict[str, object] = {
             "renderer": f"Isaac Sim 5.1 ({args.renderer})",
-            "ik": "MuJoCo + Mink (reused qpos trajectory)",
+            "ik": "Pinocchio (precomputed link poses)",
             "frame_count": frame_count,
             "source_frame_count": total_frames,
             "resolution": [args.width, args.height],
@@ -487,6 +509,9 @@ def render(args: argparse.Namespace) -> dict[str, object]:
             "trajectory": str(trajectory_path),
             "mjcf": str(source_mjcf),
             "arm_only_mjcf": str(arm_mjcf),
+            "asset_import": (
+                "Isaac Sim MJCF importer; motion playback uses Pinocchio FK"
+            ),
         }
         (output_root / "isaacsim_render_report.json").write_text(
             json.dumps(report, indent=2), encoding="utf-8"
@@ -502,7 +527,7 @@ def render(args: argparse.Namespace) -> dict[str, object]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Render a MuJoCo/Mink G1 IK trajectory with Isaac Sim 5.1"
+        description="Render a Pinocchio G1 IK trajectory with Isaac Sim 5.1"
     )
     parser.add_argument("--trajectory", type=Path, required=True)
     parser.add_argument("--mjcf", type=Path, required=True)
@@ -535,6 +560,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-frames", type=int)
     parser.add_argument(
         "--headless", action=argparse.BooleanOptionalAction, default=True
+    )
+    parser.add_argument("--debug-artifacts", action="store_true")
+    parser.add_argument(
+        "--hardware-encoding",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use NVIDIA NVENC for debug videos when available (default: true)",
     )
     return parser
 

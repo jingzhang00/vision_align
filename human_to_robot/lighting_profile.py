@@ -503,14 +503,17 @@ def estimate_lighting_profile(
     if not brightness_reliable:
         dome_intensity, key_intensity = 900.0, 180.0
 
-    diagnostic_path = (
-        output_path.with_name(f"{output_path.stem}_samples.jpg")
-        if output_path is not None
-        else None
-    )
     if write_artifacts:
-        assert diagnostic_path is not None
+        if output_path is None:
+            raise ValueError(
+                "output_path is required when write_artifacts is enabled"
+            )
+        diagnostic_path = output_path.with_name(
+            f"{output_path.stem}_samples.jpg"
+        )
         _write_diagnostic(diagnostic_path, frames, selected_masks, indices)
+    else:
+        diagnostic_path = None
     observed_srgb = np.clip(robust_srgb, 0.0, 1.0)
     profile: dict[str, Any] = {
         "profile_version": 1,

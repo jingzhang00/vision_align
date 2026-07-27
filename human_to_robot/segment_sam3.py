@@ -50,6 +50,8 @@ def _write_overlay(
     masks: list[np.ndarray],
     output_path: Path,
     color: tuple[int, int, int],
+    *,
+    hardware_encoding: bool,
 ) -> None:
     frames, fps = read_video(video_path)
     if len(frames) != len(masks):
@@ -60,7 +62,13 @@ def _write_overlay(
         alpha = (mask.astype(np.float32) / 255.0 * 0.5)[..., None]
         overlay = frame.astype(np.float32) * (1.0 - alpha) + color_image * alpha
         overlay_frames.append(np.clip(overlay, 0, 255).astype(np.uint8))
-    write_video(output_path, overlay_frames, fps)
+    write_video(
+        output_path,
+        overlay_frames,
+        fps,
+        source_video=video_path,
+        hardware_encoding=hardware_encoding,
+    )
 
 
 def _segment_concept(
@@ -128,6 +136,8 @@ def run_sam3_segmentation(
     object_prompt: str | None = None,
     object_prompt_frame: int | None = None,
     threshold: float = 0.45,
+    debug_artifacts: bool = False,
+    hardware_encoding: bool = True,
 ) -> dict[str, Any]:
     from sam3.model_builder import build_sam3_video_predictor
 
@@ -151,12 +161,14 @@ def run_sam3_segmentation(
             threshold=threshold,
         )
         _write_masks(output_root / "arm_masks", arm_masks)
-        _write_overlay(
-            video_path,
-            arm_masks,
-            output_root / "arm_masks_overlay.mp4",
-            (40, 40, 255),
-        )
+        if debug_artifacts:
+            _write_overlay(
+                video_path,
+                arm_masks,
+                output_root / "arm_masks_overlay.mp4",
+                (40, 40, 255),
+                hardware_encoding=hardware_encoding,
+            )
 
         object_masks: list[np.ndarray] | None = None
         resolved_object_frame: int | None = None
@@ -177,12 +189,14 @@ def run_sam3_segmentation(
                 threshold=threshold,
             )
             _write_masks(output_root / "object_masks", object_masks)
-            _write_overlay(
-                video_path,
-                object_masks,
-                output_root / "object_masks_overlay.mp4",
-                (40, 210, 40),
-            )
+            if debug_artifacts:
+                _write_overlay(
+                    video_path,
+                    object_masks,
+                    output_root / "object_masks_overlay.mp4",
+                    (40, 210, 40),
+                    hardware_encoding=hardware_encoding,
+                )
     finally:
         if hasattr(predictor, "shutdown"):
             predictor.shutdown()
@@ -201,6 +215,7 @@ def run_sam3_segmentation(
         "object_prompt": object_prompt,
         "object_prompt_frame": resolved_object_frame,
         "threshold": threshold,
+        "hardware_encoding": hardware_encoding,
         "arm_area_fraction": [
             float(np.count_nonzero(mask) / mask.size) for mask in arm_masks
         ],
@@ -227,6 +242,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--object-prompt")
     parser.add_argument("--object-prompt-frame", type=int)
     parser.add_argument("--threshold", type=float, default=0.45)
+    parser.add_argument("--debug-artifacts", action="store_true")
+    parser.add_argument(
+        "--hardware-encoding",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use NVIDIA NVENC for debug videos when available (default: true)",
+    )
     return parser
 
 
@@ -241,6 +263,8 @@ def main() -> None:
         object_prompt=args.object_prompt,
         object_prompt_frame=args.object_prompt_frame,
         threshold=args.threshold,
+        debug_artifacts=args.debug_artifacts,
+        hardware_encoding=args.hardware_encoding,
     )
     print(json.dumps(summary, indent=2))
 

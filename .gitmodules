@@ -4,6 +4,3 @@
 [submodule "ProPainter"]
 	path = ProPainter
 	url = https://github.com/sczhou/ProPainter.git
-[submodule "mink"]
-	path = mink
-	url = https://github.com/kevinzakka/mink.git
