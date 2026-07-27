@@ -12,17 +12,10 @@ ProPainter/weights/recurrent_flow_completion.pth
 ProPainter/weights/ProPainter.pth
 ```
 
-replace
-```bash
-sam3/sam3/model_builder.py
-```
-with
-```bash
-utils/model_builder.py
-```
-to bypath hf model check each time
-
-
+Every episode HDF5 must provide 3D transforms and confidences for
+`Hand`, `ThumbTip`, `IndexFingerTip`, and `MiddleFingerTip` on both sides,
+with at least two valid frames per hand. Episodes without these annotations
+are rejected before segmentation or inpainting starts.
 
 ### Folder pipeline
 
@@ -46,13 +39,18 @@ Run every task recursively under a dataset root:
 .venv/bin/python -m human_to_robot.pipeline \
   --folder dataset/test/fry_bread \
   --output outputs/
+
+.venv/bin/python -m human_to_robot.pipeline \
+  --folder dataset/basic_pick_place \
+  --output outputs/ \
+  --isaacsim-root /home/ai01/isaacsim \
+  --debug
 ```
 
 ```bash
 .venv/bin/python -m human_to_robot.pipeline \
   --folder dataset/test/fry_bread \
   --output outputs/fry_bread_batch \
-  --backend isaacsim \
   --isaacsim-root /home/ai01/isaacsim \
   --debug
 ```
@@ -81,7 +79,8 @@ the hard clip cap can be adjusted with `--propainter-context-frames`,
 ### Output layout
 
 Without `--debug`, each task directory contains only the final composited MP4
-and a copy of the source HDF5 for every successfully processed episode:
+and a byte-for-byte copy of the source HDF5 for every successfully processed
+episode:
 
 ```text
 outputs/
@@ -91,6 +90,16 @@ outputs/
     ├── 1.mp4
     └── 1.hdf5
 ```
+
+In this mode Isaac sends each rendered RGB, mask, and metric-depth frame
+directly to the compositor in the same process. The final MP4 is encoded
+incrementally and atomically published; the three numbered render-frame
+directories are never created. `--debug` retains the PNG sequences and runs
+the standalone compositor so every layer remains inspectable.
+
+The processed MP4 is published beside a byte-for-byte copy of its source
+HDF5, using the same basename. The source datasets are preserved and no robot
+trajectory or hand-action fields are injected into the published HDF5.
 
 With `--debug`, those deliverables remain at the same paths and the retained
 workspace is added alongside them:
@@ -129,22 +138,33 @@ observations are robustly aggregated into one task-level
 `lighting_profile.json`; the profile records confidence and warnings when
 color or exposure varies substantially between episodes.
 
-Pinocchio solves the 29 fixed-base G1 joint coordinates and stores every link
-pose from forward kinematics in the trajectory archive before Kit starts. The
-renderer writes those NumPy poses to the USD stage. Isaac's MJCF importer is
-used only to create the arm visual prims; the project has no MuJoCo or Mink
-Python runtime dependency. PhysX is intentionally not stepped, so its
-integration cannot drift from the solved trajectory.
+The action-alignment helper implements the paper's equations: it builds a
+virtual finger from the index and middle fingertips, places the end effector
+midway between it and the thumb, derives a right-handed grasp frame, smooths
+position/width with Savitzky-Golay filtering, and smooths orientation on
+SO(3). The production arm IK deliberately uses the stable HDF5 `leftHand` and
+`rightHand` rigid-body tracks for position and rotation; only the paper's
+fingertip-derived width drives hand articulation. This keeps noisy finger
+detections from changing the arm trajectory.
+
+Pinocchio solves the fixed-base G1 arm/body coordinates while freezing all 22
+LinkerHand joints from arm IK. The paper's continuous smoothed width `w_t` is
+scaled with the scene and mapped through a URDF-calibrated, monotonic
+fingertip-aperture curve to continuous hand joint values. No per-episode binary
+threshold is used. The full model has 51 actuated coordinates. Isaac's URDF
+importer creates the arm-and-hand visuals, and the renderer writes precomputed
+Pinocchio link poses to the USD stage. The project has no MuJoCo or Mink runtime
+dependency. PhysX is intentionally not stepped, so its integration cannot
+drift from the solved trajectory.
 Isaac consumes the shared task profile for its fixed DomeLight and key light,
 and the compositor uses the same profile for one fixed grade over the episode.
 This is a bounded display match, not physical inverse rendering.
 
 Current prototype limitations:
 
-- The fixed G1 hand mesh stays open; grasp state and finger motion are absent.
-- Hand position uses the HDF5 palm/root point and therefore retains a fixed
-  tool/contact offset. Wrist rotation uses the rigid hand frame, but finger
-  articulation is still absent.
+- LinkerHand articulation follows one calibrated scalar aperture per hand;
+  independent finger shapes and contact forces are not reconstructed.
+- Episodes without complete 3D wrist and fingertip annotations are unsupported.
 - ProPainter removes the person well but can retain the original arm shadows.
 - Optional held-object masks can lose the object under heavy hand occlusion;
   object segmentation is disabled unless `--object-prompt` is supplied.

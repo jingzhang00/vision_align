@@ -13,8 +13,7 @@ from .lighting_profile import (
     load_lighting_profile,
     resolve_profile_value,
 )
-from .trajectory import load_single_point_trajectory
-from .video_io import atomic_video_writer, video_metadata
+from .video_io import EncodedVideoWriter, atomic_video_writer, video_metadata
 
 
 def _numbered_image_paths(directory: Path) -> list[Path]:
@@ -92,11 +91,433 @@ def _soften_robot(
     return np.clip(result, 0.0, 255.0).astype(np.uint8)
 
 
+def _resolve_robot_grade(
+    *,
+    lighting_profile_path: Path | None,
+    robot_exposure: float | None,
+    robot_rgb_gain: tuple[float, float, float] | None,
+    robot_contrast: float | None,
+    robot_saturation: float | None,
+    robot_soften_sigma: float | None,
+) -> tuple[float, tuple[float, float, float], float, float, float]:
+    lighting_profile = load_lighting_profile(lighting_profile_path)
+    explicit_values: dict[str, object | None] = {
+        "robot_exposure": robot_exposure,
+        "robot_rgb_gain": robot_rgb_gain,
+        "robot_contrast": robot_contrast,
+        "robot_saturation": robot_saturation,
+        "robot_soften_sigma": robot_soften_sigma,
+    }
+    resolved_grade = {
+        key: resolve_profile_value(
+            explicit=explicit,
+            profile=lighting_profile,
+            section="composite",
+            key=key,
+            default=DEFAULT_COMPOSITE_PROFILE[key],
+        )
+        for key, explicit in explicit_values.items()
+    }
+    rgb_gain = tuple(
+        float(value)
+        for value in resolved_grade["robot_rgb_gain"]  # type: ignore[union-attr]
+    )
+    if len(rgb_gain) != 3:
+        raise ValueError("robot_rgb_gain must contain exactly three values")
+    return (
+        float(resolved_grade["robot_exposure"]),
+        rgb_gain,
+        float(resolved_grade["robot_contrast"]),
+        float(resolved_grade["robot_saturation"]),
+        float(resolved_grade["robot_soften_sigma"]),
+    )
+
+
+def _object_depths(
+    *,
+    trajectory_path: Path,
+    frame_count: int,
+    object_masks_enabled: bool,
+) -> np.ndarray:
+    with np.load(trajectory_path) as archive:
+        scale = float(archive["scale"])
+        right_observation_camera = (
+            np.asarray(
+                archive["right_observation_camera"],
+                dtype=np.float64,
+            )
+            if "right_observation_camera" in archive
+            else None
+        )
+    if (
+        right_observation_camera is not None
+        and right_observation_camera.shape != (frame_count, 3)
+    ):
+        raise ValueError(
+            "right_observation_camera and videos have different lengths"
+        )
+    if object_masks_enabled and right_observation_camera is None:
+        raise ValueError(
+            "Object occlusion requires right_observation_camera in the "
+            "trajectory archive"
+        )
+    if right_observation_camera is None:
+        return np.full(frame_count, np.inf, dtype=np.float64)
+    return np.maximum(
+        0.05,
+        scale * right_observation_camera[:, 2] - 0.02,
+    )
+
+
+def _composite_frame(
+    *,
+    source: np.ndarray,
+    background: np.ndarray,
+    robot: np.ndarray,
+    robot_mask: np.ndarray,
+    robot_depth: np.ndarray,
+    object_mask: np.ndarray | None,
+    object_depth: float,
+    robot_exposure: float,
+    robot_rgb_gain: tuple[float, float, float],
+    robot_contrast: float,
+    robot_saturation: float,
+    robot_soften_sigma: float,
+) -> tuple[np.ndarray, float, float]:
+    binary_robot = robot_mask > 0
+    robot = _grade_robot(
+        robot,
+        exposure=robot_exposure,
+        rgb_gain=robot_rgb_gain,
+        contrast=robot_contrast,
+        saturation=robot_saturation,
+    )
+    robot = _soften_robot(robot, binary_robot, robot_soften_sigma)
+
+    occluder = np.zeros(binary_robot.shape, dtype=bool)
+    if object_mask is not None:
+        occluder = (
+            (object_mask > 0)
+            & binary_robot
+            & (object_depth <= robot_depth + 0.015)
+        )
+
+    visible_robot = binary_robot & ~occluder
+    alpha = cv2.GaussianBlur(
+        visible_robot.astype(np.float32),
+        (0, 0),
+        sigmaX=0.8,
+        sigmaY=0.8,
+    )
+    alpha[visible_robot] = np.maximum(alpha[visible_robot], 0.94)
+    alpha = np.clip(alpha, 0.0, 1.0)[..., None]
+    synthetic = (
+        robot.astype(np.float32) * alpha
+        + background.astype(np.float32) * (1.0 - alpha)
+    )
+    synthetic = np.clip(synthetic, 0, 255).astype(np.uint8)
+    synthetic[occluder] = source[occluder]
+    return (
+        synthetic,
+        float(visible_robot.mean()),
+        float(occluder.mean()),
+    )
+
+
+class InMemoryVideoCompositor:
+    """Composite Isaac frames directly into an atomically published MP4."""
+
+    def __init__(
+        self,
+        *,
+        source_video: Path,
+        inpaint_video: Path,
+        trajectory_path: Path,
+        object_mask_root: Path | None,
+        output_root: Path,
+        g1_root: Path,
+        lighting_profile_path: Path | None = None,
+        robot_exposure: float | None = None,
+        robot_rgb_gain: tuple[float, float, float] | None = None,
+        robot_contrast: float | None = None,
+        robot_saturation: float | None = None,
+        robot_soften_sigma: float | None = None,
+        hardware_encoding: bool = True,
+    ) -> None:
+        self.source_video = source_video.resolve()
+        self.inpaint_video = inpaint_video.resolve()
+        self.trajectory_path = trajectory_path.resolve()
+        self.output_root = output_root.resolve()
+        self.g1_root = g1_root.resolve()
+        self.lighting_profile_path = (
+            lighting_profile_path.resolve()
+            if lighting_profile_path is not None
+            else None
+        )
+        (
+            self.robot_exposure,
+            self.robot_rgb_gain,
+            self.robot_contrast,
+            self.robot_saturation,
+            self.robot_soften_sigma,
+        ) = _resolve_robot_grade(
+            lighting_profile_path=self.lighting_profile_path,
+            robot_exposure=robot_exposure,
+            robot_rgb_gain=robot_rgb_gain,
+            robot_contrast=robot_contrast,
+            robot_saturation=robot_saturation,
+            robot_soften_sigma=robot_soften_sigma,
+        )
+
+        (
+            self.source_width,
+            self.source_height,
+            self.frame_count,
+            self.source_fps,
+        ) = video_metadata(self.source_video)
+        (
+            self.width,
+            self.height,
+            background_count,
+            background_fps,
+        ) = video_metadata(self.inpaint_video)
+        if self.frame_count != background_count:
+            raise ValueError(
+                "Source and inpaint frame counts disagree: "
+                f"{self.frame_count} != {background_count}"
+            )
+        if abs(self.source_fps - background_fps) > 0.01:
+            raise ValueError(
+                f"FPS mismatch: source={self.source_fps}, "
+                f"inpaint={background_fps}"
+            )
+        self.object_mask_paths = (
+            _numbered_image_paths(object_mask_root.resolve())
+            if object_mask_root is not None and object_mask_root.is_dir()
+            else None
+        )
+        if (
+            self.object_mask_paths is not None
+            and len(self.object_mask_paths) != self.frame_count
+        ):
+            raise ValueError(
+                "Object mask and video frame counts disagree: "
+                f"{len(self.object_mask_paths)} != {self.frame_count}"
+            )
+        self.object_depths = _object_depths(
+            trajectory_path=self.trajectory_path,
+            frame_count=self.frame_count,
+            object_masks_enabled=self.object_mask_paths is not None,
+        )
+        self.hardware_encoding = hardware_encoding
+        self._source_capture: cv2.VideoCapture | None = None
+        self._background_capture: cv2.VideoCapture | None = None
+        self._stack: ExitStack | None = None
+        self._writer: EncodedVideoWriter | None = None
+        self._next_frame = 0
+        self._robot_fractions: list[float] = []
+        self._object_occlusion_fractions: list[float] = []
+        self._encoding: dict[str, object] | None = None
+        self._report: dict[str, object] | None = None
+
+    def __enter__(self) -> InMemoryVideoCompositor:
+        self.output_root.mkdir(parents=True, exist_ok=True)
+        self._source_capture = cv2.VideoCapture(str(self.source_video))
+        self._background_capture = cv2.VideoCapture(
+            str(self.inpaint_video)
+        )
+        if (
+            not self._source_capture.isOpened()
+            or not self._background_capture.isOpened()
+        ):
+            self._release_captures()
+            raise RuntimeError("Failed to open source or inpaint video")
+        self._stack = ExitStack()
+        try:
+            self._writer = self._stack.enter_context(
+                atomic_video_writer(
+                    self.output_root / "synthetic_g1.mp4",
+                    source_video=self.source_video,
+                    output_size=(self.width, self.height),
+                    hardware_encoding=self.hardware_encoding,
+                )
+            )
+            self._encoding = self._writer.profile.to_dict()
+        except BaseException:
+            self._stack.close()
+            self._release_captures()
+            raise
+        return self
+
+    def __exit__(
+        self,
+        exception_type: type[BaseException] | None,
+        exception: BaseException | None,
+        traceback: object,
+    ) -> None:
+        try:
+            if self._stack is None:
+                return
+            if exception_type is None and self._next_frame != self.frame_count:
+                incomplete = RuntimeError(
+                    "In-memory composite received "
+                    f"{self._next_frame}/{self.frame_count} frames"
+                )
+                self._stack.__exit__(
+                    RuntimeError,
+                    incomplete,
+                    incomplete.__traceback__,
+                )
+                raise incomplete
+            self._stack.__exit__(exception_type, exception, traceback)
+            if exception_type is None:
+                self._report = self._build_report()
+                (self.output_root / "composite_report.json").write_text(
+                    json.dumps(self._report, indent=2),
+                    encoding="utf-8",
+                )
+        finally:
+            self._release_captures()
+
+    def _release_captures(self) -> None:
+        if self._source_capture is not None:
+            self._source_capture.release()
+        if self._background_capture is not None:
+            self._background_capture.release()
+        self._source_capture = None
+        self._background_capture = None
+
+    def write(
+        self,
+        robot: np.ndarray,
+        robot_mask: np.ndarray,
+        robot_depth: np.ndarray,
+    ) -> np.ndarray:
+        if (
+            self._source_capture is None
+            or self._background_capture is None
+            or self._writer is None
+        ):
+            raise RuntimeError("In-memory compositor is not open")
+        frame_id = self._next_frame
+        if frame_id >= self.frame_count:
+            raise RuntimeError(
+                f"Received more than {self.frame_count} rendered frames"
+            )
+        expected_image_shape = (self.height, self.width, 3)
+        expected_plane_shape = (self.height, self.width)
+        if robot.shape != expected_image_shape:
+            raise ValueError(
+                f"Robot frame shape {robot.shape} != {expected_image_shape}"
+            )
+        if robot_mask.shape != expected_plane_shape:
+            raise ValueError(
+                f"Robot mask shape {robot_mask.shape} != "
+                f"{expected_plane_shape}"
+            )
+        if robot_depth.shape != expected_plane_shape:
+            raise ValueError(
+                f"Robot depth shape {robot_depth.shape} != "
+                f"{expected_plane_shape}"
+            )
+
+        source_ok, source = self._source_capture.read()
+        background_ok, background = self._background_capture.read()
+        if not source_ok or not background_ok:
+            raise RuntimeError(f"Video decode stopped at frame {frame_id}")
+        if source.shape[:2] != (self.source_height, self.source_width):
+            raise RuntimeError(
+                f"Unexpected source frame shape: {source.shape}"
+            )
+        source = cv2.resize(
+            source,
+            (self.width, self.height),
+            interpolation=cv2.INTER_AREA,
+        )
+        if background.shape != expected_image_shape:
+            raise RuntimeError(
+                f"Unexpected inpaint frame shape: {background.shape}"
+            )
+        object_mask = (
+            cv2.resize(
+                _read_image(
+                    self.object_mask_paths[frame_id],
+                    cv2.IMREAD_GRAYSCALE,
+                ),
+                (self.width, self.height),
+                interpolation=cv2.INTER_NEAREST,
+            )
+            if self.object_mask_paths is not None
+            else None
+        )
+        synthetic, robot_fraction, object_fraction = _composite_frame(
+            source=source,
+            background=background,
+            robot=robot,
+            robot_mask=robot_mask,
+            robot_depth=robot_depth,
+            object_mask=object_mask,
+            object_depth=float(self.object_depths[frame_id]),
+            robot_exposure=self.robot_exposure,
+            robot_rgb_gain=self.robot_rgb_gain,
+            robot_contrast=self.robot_contrast,
+            robot_saturation=self.robot_saturation,
+            robot_soften_sigma=self.robot_soften_sigma,
+        )
+        self._writer.write(synthetic)
+        self._robot_fractions.append(robot_fraction)
+        self._object_occlusion_fractions.append(object_fraction)
+        self._next_frame += 1
+        return synthetic
+
+    @property
+    def report(self) -> dict[str, object]:
+        if self._report is None:
+            raise RuntimeError("Composite report is not available yet")
+        return self._report
+
+    def _build_report(self) -> dict[str, object]:
+        if self._encoding is None or not self._robot_fractions:
+            raise RuntimeError("Cannot report an empty composite")
+        return {
+            "frame_count": self.frame_count,
+            "fps": self.source_fps,
+            "resolution": [self.width, self.height],
+            "encoding": self._encoding,
+            "comparison_encoding": None,
+            "mean_robot_area_fraction": float(
+                np.mean(self._robot_fractions)
+            ),
+            "max_robot_area_fraction": float(
+                np.max(self._robot_fractions)
+            ),
+            "mean_object_depth_occlusion_fraction": float(
+                np.mean(self._object_occlusion_fractions)
+            ),
+            "source_video": str(self.source_video),
+            "inpaint_video": str(self.inpaint_video),
+            "g1_root": str(self.g1_root),
+            "trajectory": str(self.trajectory_path),
+            "lighting_profile": (
+                str(self.lighting_profile_path)
+                if self.lighting_profile_path is not None
+                else None
+            ),
+            "streaming_in_memory": True,
+            "robot_grade": {
+                "exposure_stops": self.robot_exposure,
+                "rgb_gain": list(self.robot_rgb_gain),
+                "contrast": self.robot_contrast,
+                "saturation": self.robot_saturation,
+                "soften_sigma_px": self.robot_soften_sigma,
+            },
+        }
+
+
 def compose_video(
     *,
     source_video: Path,
     inpaint_video: Path,
-    hdf5_path: Path,
     g1_root: Path,
     trajectory_path: Path | None = None,
     object_mask_root: Path | None,
@@ -111,32 +532,20 @@ def compose_video(
     delete_input_frames: bool = False,
     hardware_encoding: bool = True,
 ) -> dict[str, object]:
-    lighting_profile = load_lighting_profile(lighting_profile_path)
-    resolved_grade: dict[str, object] = {}
-    explicit_values: dict[str, object | None] = {
-        "robot_exposure": robot_exposure,
-        "robot_rgb_gain": robot_rgb_gain,
-        "robot_contrast": robot_contrast,
-        "robot_saturation": robot_saturation,
-        "robot_soften_sigma": robot_soften_sigma,
-    }
-    for key, explicit in explicit_values.items():
-        resolved_grade[key] = resolve_profile_value(
-            explicit=explicit,
-            profile=lighting_profile,
-            section="composite",
-            key=key,
-            default=DEFAULT_COMPOSITE_PROFILE[key],
-        )
-    robot_exposure = float(resolved_grade["robot_exposure"])
-    robot_rgb_gain = tuple(
-        float(value) for value in resolved_grade["robot_rgb_gain"]  # type: ignore[union-attr]
+    (
+        robot_exposure,
+        robot_rgb_gain,
+        robot_contrast,
+        robot_saturation,
+        robot_soften_sigma,
+    ) = _resolve_robot_grade(
+        lighting_profile_path=lighting_profile_path,
+        robot_exposure=robot_exposure,
+        robot_rgb_gain=robot_rgb_gain,
+        robot_contrast=robot_contrast,
+        robot_saturation=robot_saturation,
+        robot_soften_sigma=robot_soften_sigma,
     )
-    if len(robot_rgb_gain) != 3:
-        raise ValueError("robot_rgb_gain must contain exactly three values")
-    robot_contrast = float(resolved_grade["robot_contrast"])
-    robot_saturation = float(resolved_grade["robot_saturation"])
-    robot_soften_sigma = float(resolved_grade["robot_soften_sigma"])
 
     source_width, source_height, source_count, source_fps = video_metadata(
         source_video
@@ -166,21 +575,17 @@ def compose_video(
     if abs(source_fps - background_fps) > 0.01:
         raise ValueError(f"FPS mismatch: source={source_fps}, inpaint={background_fps}")
 
-    trajectory = load_single_point_trajectory(hdf5_path)
     resolved_trajectory_path = (
         trajectory_path
         if trajectory_path is not None
         else g1_root / "g1_trajectory.npz"
     )
-    with np.load(resolved_trajectory_path) as archive:
-        scale = float(archive["scale"])
-    if trajectory.frame_count != source_count:
-        raise ValueError("HDF5 trajectory and videos have different lengths")
-
     robot_fractions: list[float] = []
     object_occlusion_fractions: list[float] = []
-    object_depths = np.maximum(
-        0.05, scale * trajectory.right_observation_camera[:, 2] - 0.02
+    object_depths = _object_depths(
+        trajectory_path=resolved_trajectory_path,
+        frame_count=source_count,
+        object_masks_enabled=object_mask_paths is not None,
     )
     output_root.mkdir(parents=True, exist_ok=True)
     source_capture = cv2.VideoCapture(str(source_video))
@@ -240,14 +645,8 @@ def compose_video(
                     raise RuntimeError(
                         f"Unexpected inpaint frame shape: {background.shape}"
                     )
-                robot = _grade_robot(
-                    _read_image(
-                        robot_rgb_paths[frame_id], cv2.IMREAD_COLOR
-                    ),
-                    exposure=robot_exposure,
-                    rgb_gain=robot_rgb_gain,
-                    contrast=robot_contrast,
-                    saturation=robot_saturation,
+                robot = _read_image(
+                    robot_rgb_paths[frame_id], cv2.IMREAD_COLOR
                 )
                 robot_mask = _read_image(
                     robot_mask_paths[frame_id], cv2.IMREAD_GRAYSCALE
@@ -255,15 +654,10 @@ def compose_video(
                 depth_mm = _read_image(
                     robot_depth_paths[frame_id], cv2.IMREAD_UNCHANGED
                 )
-                binary_robot = robot_mask > 0
-                robot = _soften_robot(
-                    robot, binary_robot, robot_soften_sigma
-                )
                 depth = depth_mm.astype(np.float32) / 1000.0
 
-                occluder = np.zeros((height, width), dtype=bool)
-                if object_mask_paths is not None:
-                    object_mask = cv2.resize(
+                object_mask = (
+                    cv2.resize(
                         _read_image(
                             object_mask_paths[frame_id],
                             cv2.IMREAD_GRAYSCALE,
@@ -271,29 +665,25 @@ def compose_video(
                         (width, height),
                         interpolation=cv2.INTER_NEAREST,
                     )
-                    occluder = (
-                        (object_mask > 0)
-                        & binary_robot
-                        & (object_depths[frame_id] <= depth + 0.015)
+                    if object_mask_paths is not None
+                    else None
+                )
+                synthetic, robot_fraction, object_fraction = (
+                    _composite_frame(
+                        source=source,
+                        background=background,
+                        robot=robot,
+                        robot_mask=robot_mask,
+                        robot_depth=depth,
+                        object_mask=object_mask,
+                        object_depth=float(object_depths[frame_id]),
+                        robot_exposure=robot_exposure,
+                        robot_rgb_gain=robot_rgb_gain,
+                        robot_contrast=robot_contrast,
+                        robot_saturation=robot_saturation,
+                        robot_soften_sigma=robot_soften_sigma,
                     )
-
-                visible_robot = binary_robot & ~occluder
-                alpha = cv2.GaussianBlur(
-                    visible_robot.astype(np.float32),
-                    (0, 0),
-                    sigmaX=0.8,
-                    sigmaY=0.8,
                 )
-                alpha[visible_robot] = np.maximum(
-                    alpha[visible_robot], 0.94
-                )
-                alpha = np.clip(alpha, 0.0, 1.0)[..., None]
-                synthetic = (
-                    robot.astype(np.float32) * alpha
-                    + background.astype(np.float32) * (1.0 - alpha)
-                )
-                synthetic = np.clip(synthetic, 0, 255).astype(np.uint8)
-                synthetic[occluder] = source[occluder]
                 synthetic_writer.write(synthetic)
                 if comparison_writer is not None:
                     comparison_writer.write(
@@ -307,8 +697,8 @@ def compose_video(
                     )
                 if frame_id in selected:
                     selected_frames[frame_id] = synthetic.copy()
-                robot_fractions.append(float(visible_robot.mean()))
-                object_occlusion_fractions.append(float(occluder.mean()))
+                robot_fractions.append(robot_fraction)
+                object_occlusion_fractions.append(object_fraction)
                 if delete_input_frames:
                     robot_rgb_paths[frame_id].unlink(missing_ok=True)
                     robot_mask_paths[frame_id].unlink(missing_ok=True)
@@ -388,7 +778,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--source-video", type=Path, required=True)
     parser.add_argument("--inpaint-video", type=Path, required=True)
-    parser.add_argument("--hdf5", type=Path, required=True)
     parser.add_argument("--g1-root", type=Path, required=True)
     parser.add_argument(
         "--trajectory",
@@ -428,7 +817,6 @@ def main() -> None:
     report = compose_video(
         source_video=args.source_video.resolve(),
         inpaint_video=args.inpaint_video.resolve(),
-        hdf5_path=args.hdf5.resolve(),
         g1_root=args.g1_root.resolve(),
         trajectory_path=(
             args.trajectory.resolve()

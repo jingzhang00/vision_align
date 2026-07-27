@@ -527,6 +527,7 @@ def _prepare_stage_signature(
         ),
         "urdf": urdf,
         "retarget_code": repo / "human_to_robot/retarget_g1_pinocchio.py",
+        "trajectory_code": repo / "human_to_robot/trajectory.py",
     }
     return {
         "signature_version": 1,
@@ -637,22 +638,6 @@ def _trajectory_complete(path: Path, expected_count: int) -> bool:
     try:
         with np.load(path) as archive:
             return archive["qpos"].shape[0] == expected_count
-    except (OSError, KeyError, ValueError):
-        return False
-
-
-def _mano_keypoints_complete(path: Path, expected_count: int) -> bool:
-    if not path.is_file():
-        return False
-    try:
-        with np.load(path) as archive:
-            return all(
-                archive[f"{side}_keypoints_camera"].shape
-                == (expected_count, 21, 3)
-                and archive[f"{side}_confidence"].shape
-                in {(expected_count,), (expected_count, 21)}
-                for side in ("left", "right")
-            )
     except (OSError, KeyError, ValueError):
         return False
 
@@ -914,6 +899,16 @@ def _prepare_episode(
     _, _, frame_count, _ = video_metadata(episode.video)
     if frame_count <= 0:
         raise ValueError(f"Episode has no video frames: {episode.video}")
+    hand_keypoints = hdf5_action_keypoint_availability(episode.hdf5)
+    missing_hands = [
+        side for side, usable in hand_keypoints.items() if not usable
+    ]
+    if missing_hands:
+        raise ValueError(
+            f"Episode requires annotated wrist/thumb/index/middle 3D "
+            f"keypoints for both hands; unusable: {', '.join(missing_hands)} "
+            f"({episode.hdf5})"
+        )
     episode_label = _episode_label(episode)
 
     sam_root = output / "sam3"
@@ -1153,74 +1148,23 @@ def _prepare_episode(
             f"ProPainter frame count changed for {episode.video}: "
             f"{frame_count} -> {inpaint_count}"
         )
-    hand_keypoints = hdf5_action_keypoint_availability(episode.hdf5)
-    needs_mano = not all(hand_keypoints.values())
-    mano_keypoints = g1_root / "mano_keypoints.npz"
-    if needs_mano and not _mano_keypoints_complete(
-        mano_keypoints, frame_count
-    ):
-        mano_root = (
-            args.mano_root.expanduser().resolve()
-            if args.mano_root is not None
-            else (repo / "mano_v1_2").resolve()
-        )
-        wilor_weights = (
-            args.wilor_weights.expanduser().resolve()
-            if args.wilor_weights is not None
-            else (repo / "models/wilor").resolve()
-        )
-        _validate_file(
-            mano_root / "models/MANO_RIGHT.pkl",
-            "MANO right-hand model",
-        )
-        estimator_environment = os.environ.copy()
-        estimator_environment.setdefault(
-            "TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1"
-        )
-        _run_logged(
-            [
-                python,
-                "-m",
-                "human_to_robot.estimate_mano_wilor",
-                "--video",
-                str(episode.video),
-                "--mano-root",
-                str(mano_root),
-                "--weights",
-                str(wilor_weights),
-                "--output",
-                str(mano_keypoints),
-            ],
-            cwd=repo,
-            environment=estimator_environment,
-            log_path=log_path,
-            progress=progress,
-            current_episode=episode_label,
-            episode_started=started,
-            stage_label="prepare",
-            frame_progress_pattern=r"MANO estimated (\d+)/(\d+)",
-            frame_progress_label="mano",
-        )
-        if not _mano_keypoints_complete(mano_keypoints, frame_count):
-            missing_sides = [
-                side for side, available in hand_keypoints.items() if not available
-            ]
-            raise RuntimeError(
-                "MANO hand estimation is incomplete for "
-                f"{', '.join(missing_sides)}: {mano_keypoints}"
-            )
     trajectory_ready = _trajectory_complete(
         g1_root / "g1_trajectory.npz", frame_count
     )
+    trajectory_signature_inputs = {
+        "video",
+        "hdf5",
+        "urdf",
+        "retarget_code",
+        "trajectory_code",
+    }
     reuse_trajectory = (
         reuse_existing_prepare
         and trajectory_ready
         and _signature_subset_matches(
             previous_signature,
             prepare_signature,
-            input_names=frozenset(
-                {"video", "hdf5", "urdf", "retarget_code"}
-            ),
+            input_names=frozenset(trajectory_signature_inputs),
             parameter_names=frozenset({"python"}),
         )
     )
@@ -1239,10 +1183,6 @@ def _prepare_episode(
             "--output",
             str(g1_root),
         ]
-        if needs_mano:
-            retarget_command.extend(
-                ["--mano-keypoints", str(mano_keypoints)]
-            )
         _run_logged(
             retarget_command,
             cwd=repo,
@@ -1338,7 +1278,7 @@ def _render_episode(
         else None
     )
 
-    render_complete = all(
+    render_sequences_complete = all(
         _image_sequence_complete(
             render_root / directory,
             prepared.frame_count,
@@ -1347,18 +1287,6 @@ def _render_episode(
         for directory in ("robot_rgb", "robot_masks", "robot_depth_mm")
     )
     isaac_report = render_root / "isaacsim_render_report.json"
-    render_complete = render_complete and isaac_report.is_file()
-    reuse_render = render_complete and _signatures_match(
-        (
-            previous_finish.get("signature")
-            if isinstance(previous_finish, dict)
-            else None
-        ),
-        finish_signature,
-        ignored_inputs=frozenset(
-            {"composite_code", "pipeline_code", "video_io_code"}
-        ),
-    )
     final_complete = (
         _video_complete(
             final_video,
@@ -1366,6 +1294,25 @@ def _render_episode(
             expected_size=render_size,
         )
         and composite_report.is_file()
+    )
+    render_complete = isaac_report.is_file() and (
+        render_sequences_complete if args.debug else final_complete
+    )
+    reuse_render = (
+        args.debug
+        and render_sequences_complete
+        and isaac_report.is_file()
+        and _signatures_match(
+            (
+                previous_finish.get("signature")
+                if isinstance(previous_finish, dict)
+                else None
+            ),
+            finish_signature,
+            ignored_inputs=frozenset(
+                {"composite_code", "pipeline_code", "video_io_code"}
+            ),
+        )
     )
     reuse_finish = (
         args.reuse
@@ -1384,6 +1331,14 @@ def _render_episode(
             status="running",
             signature=finish_signature,
             started_at_ns=stage_started_at_ns,
+        )
+        object_masks = prepared.sam_root / "object_masks"
+        object_masks_available = (
+            args.object_prompt is not None
+            and _image_sequence_complete(
+                object_masks,
+                prepared.frame_count,
+            )
         )
         if not reuse_render:
             if isaac_runtime is None:
@@ -1416,6 +1371,19 @@ def _render_episode(
             ]
             if args.debug:
                 isaac_command.append("--debug-artifacts")
+            else:
+                isaac_command.extend(
+                    [
+                        "--inpaint-video",
+                        str(prepared.inpaint_video),
+                        "--composite-output",
+                        str(final_root),
+                    ]
+                )
+                if object_masks_available:
+                    isaac_command.extend(
+                        ["--object-masks", str(object_masks)]
+                    )
             _run_logged(
                 isaac_command,
                 cwd=repo,
@@ -1431,67 +1399,75 @@ def _render_episode(
                 ),
                 frame_progress_label="render",
             )
-            if not all(
-                _image_sequence_complete(
-                    render_root / directory,
-                    prepared.frame_count,
-                    expected_size=render_size,
+            rendered_output_complete = (
+                all(
+                    _image_sequence_complete(
+                        render_root / directory,
+                        prepared.frame_count,
+                        expected_size=render_size,
+                    )
+                    for directory in (
+                        "robot_rgb",
+                        "robot_masks",
+                        "robot_depth_mm",
+                    )
                 )
-                for directory in (
-                    "robot_rgb",
-                    "robot_masks",
-                    "robot_depth_mm",
+                if args.debug
+                else (
+                    _video_complete(
+                        final_video,
+                        prepared.frame_count,
+                        expected_size=render_size,
+                    )
+                    and composite_report.is_file()
                 )
-            ) or not isaac_report.is_file():
+            )
+            if not rendered_output_complete or not isaac_report.is_file():
                 raise RuntimeError(
-                    f"Isaac Sim render is incomplete: {render_root}"
+                    "Isaac Sim render/composite is incomplete: "
+                    f"{render_root}"
                 )
 
-        composite_command = [
-            sys.executable,
-            "-m",
-            "human_to_robot.composite",
-            "--source-video",
-            str(episode.video),
-            "--inpaint-video",
-            str(prepared.inpaint_video),
-            "--hdf5",
-            str(episode.hdf5),
-            "--g1-root",
-            str(render_root),
-            "--trajectory",
-            str(trajectory_path),
-            "--lighting-profile",
-            str(task_profile_path),
-            "--output",
-            str(final_root),
-            (
-                "--hardware-encoding"
-                if args.hardware_encoding
-                else "--no-hardware-encoding"
-            ),
-        ]
-        object_masks = prepared.sam_root / "object_masks"
-        if args.object_prompt is not None and _image_sequence_complete(
-            object_masks, prepared.frame_count
-        ):
-            composite_command.extend(["--object-masks", str(object_masks)])
         if args.debug:
-            composite_command.append("--debug-artifacts")
-        else:
-            composite_command.append("--delete-input-frames")
-        _run_logged(
-            composite_command,
-            cwd=repo,
-            log_path=log_path,
-            progress=progress,
-            current_episode=episode_label,
-            episode_started=started,
-            elapsed_offset=prepared.prepare_seconds,
-            stage_label="finish",
-            frame_progress_pattern=r"Composite processed (\d+)/(\d+)",
-            frame_progress_label="composite",
-        )
+            composite_command = [
+                sys.executable,
+                "-m",
+                "human_to_robot.composite",
+                "--source-video",
+                str(episode.video),
+                "--inpaint-video",
+                str(prepared.inpaint_video),
+                "--g1-root",
+                str(render_root),
+                "--trajectory",
+                str(trajectory_path),
+                "--lighting-profile",
+                str(task_profile_path),
+                "--output",
+                str(final_root),
+                (
+                    "--hardware-encoding"
+                    if args.hardware_encoding
+                    else "--no-hardware-encoding"
+                ),
+                "--debug-artifacts",
+            ]
+            if object_masks_available:
+                composite_command.extend(
+                    ["--object-masks", str(object_masks)]
+                )
+            _run_logged(
+                composite_command,
+                cwd=repo,
+                log_path=log_path,
+                progress=progress,
+                current_episode=episode_label,
+                episode_started=started,
+                elapsed_offset=prepared.prepare_seconds,
+                stage_label="finish",
+                frame_progress_pattern=r"Composite processed (\d+)/(\d+)",
+                frame_progress_label="composite",
+            )
         if not _video_complete(
             final_video,
             prepared.frame_count,
@@ -2160,7 +2136,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Keep masks, inpainted video, render frames, logs, and JSON "
-            "reports; by default only each synthetic MP4 and copied HDF5 remain"
+            "reports; by default only each synthetic MP4 and augmented HDF5 "
+            "remain"
         ),
     )
     parser.add_argument(

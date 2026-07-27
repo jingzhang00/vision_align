@@ -67,7 +67,14 @@ HAND_JOINTS = tuple(
     for suffix in HAND_JOINT_SUFFIXES
 )
 
+HAND_TIP_LOCAL_OFFSETS = {
+    "thumb": np.array([-0.00679, 0.0, 0.04790], dtype=np.float64),
+    "index": np.array([0.01458, 0.0, 0.03707], dtype=np.float64),
+    "middle": np.array([0.01458, 0.0, 0.03707], dtype=np.float64),
+}
 PALM_FRAMES = ("left_palm", "right_palm")
+PALM_OFFSET_FROM_WRIST = np.array([0.08, 0.0, 0.0], dtype=np.float64)
+TRAJECTORY_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -83,6 +90,10 @@ class PinocchioRetargetResult:
     right_orientation_errors: np.ndarray
     left_visible: np.ndarray
     right_visible: np.ndarray
+    hand_closures: np.ndarray
+    target_hand_widths: np.ndarray
+    achieved_hand_widths: np.ndarray
+    hand_aperture_profiles: list[dict[str, float]]
     base_position: np.ndarray
     scale: float
     search_results: list[dict[str, float | list[float]]]
@@ -91,19 +102,22 @@ class PinocchioRetargetResult:
 def build_pinocchio_g1(urdf_path: str | Path) -> pin.Model:
     model = pin.buildModelFromUrdf(str(Path(urdf_path).resolve()))
     for side in ("left", "right"):
-        hand_frame_id = model.getFrameId(f"{side}_hand_base_link")
-        if hand_frame_id >= model.nframes:
-            raise ValueError(f"Missing {side} hand frame in G1 URDF")
-        hand_frame = model.frames[hand_frame_id]
+        wrist_frame_id = model.getFrameId(f"{side}_wrist_yaw_link")
+        if wrist_frame_id >= model.nframes:
+            raise ValueError(f"Missing {side} wrist frame in G1 URDF")
+        wrist_frame = model.frames[wrist_frame_id]
         palm = pin.Frame(
             f"{side}_palm",
-            hand_frame.parent,
-            hand_frame.previousFrame,
-            hand_frame.placement
-            * pin.SE3(np.eye(3), np.array([0.0, 0.0, 0.105])),
+            wrist_frame.parent,
+            wrist_frame.previousFrame,
+            wrist_frame.placement
+            * pin.SE3(np.eye(3), PALM_OFFSET_FROM_WRIST),
             pin.FrameType.OP_FRAME,
         )
         model.addFrame(palm)
+        hand_frame_id = model.getFrameId(f"{side}_hand_base_link")
+        if hand_frame_id >= model.nframes:
+            raise ValueError(f"Missing {side} hand frame in G1 URDF")
     missing_joints = [
         name
         for name in HAND_JOINTS
@@ -116,53 +130,176 @@ def build_pinocchio_g1(urdf_path: str | Path) -> pin.Model:
     return model
 
 
-def _set_binary_hand_configuration(
+def _closed_hand_joint_values(
     model: pin.Model,
-    q: np.ndarray,
-    binary_action: np.ndarray,
-) -> None:
-    """Expand ``[left, right]`` close bits into the LinkerHand joint space."""
+    side: str,
+) -> dict[str, float]:
+    values: dict[str, float] = {}
+    for suffix in HAND_JOINT_SUFFIXES:
+        joint_name = f"{side}_{suffix}"
+        joint_id = model.getJointId(joint_name)
+        q_index = model.idx_qs[joint_id]
+        values[suffix] = float(model.upperPositionLimit[q_index])
 
-    action = np.asarray(binary_action, dtype=np.uint8)
-    if action.shape != (2,) or np.any(action > 1):
-        raise ValueError(f"Binary hand action must be [2] of 0/1, got {action}")
     mimic_scale = {
         "index_dip": 0.89,
         "middle_dip": 0.89,
         "pinky_dip": 0.89,
         "ring_dip": 0.89,
     }
+    for suffix, scale in mimic_scale.items():
+        master = suffix.replace("_dip", "_mcp_pitch")
+        values[suffix] = min(values[suffix], scale * values[master])
+    thumb_scale = 2.29 if side == "left" else 1.86
+    values["thumb_cmc_pitch"] = min(
+        values["thumb_cmc_pitch"],
+        values["thumb_ip"] / thumb_scale,
+    )
+    values["thumb_ip"] = min(
+        values["thumb_ip"],
+        thumb_scale * values["thumb_cmc_pitch"],
+    )
+    return values
+
+
+def _set_continuous_hand_configuration(
+    model: pin.Model,
+    q: np.ndarray,
+    closures: np.ndarray,
+) -> None:
+    """Map continuous ``[left, right]`` closure values into LinkerHand joints."""
+
+    action = np.asarray(closures, dtype=np.float64)
+    if (
+        action.shape != (2,)
+        or not np.isfinite(action).all()
+        or np.any(action < 0.0)
+        or np.any(action > 1.0)
+    ):
+        raise ValueError(
+            "Continuous hand closure must be finite [left, right] values "
+            f"within [0, 1], got {action}"
+        )
     for side_index, side in enumerate(("left", "right")):
-        closed = bool(action[side_index])
-        values: dict[str, float] = {}
+        closure = float(action[side_index])
+        closed_values = _closed_hand_joint_values(model, side)
         for suffix in HAND_JOINT_SUFFIXES:
             joint_name = f"{side}_{suffix}"
             joint_id = model.getJointId(joint_name)
             q_index = model.idx_qs[joint_id]
             lower = float(model.lowerPositionLimit[q_index])
-            upper = float(model.upperPositionLimit[q_index])
-            values[suffix] = upper if closed else lower
-
-        if closed:
-            for suffix, scale in mimic_scale.items():
-                master = suffix.replace("_dip", "_mcp_pitch")
-                values[suffix] = min(
-                    values[suffix],
-                    scale * values[master],
-                )
-            thumb_scale = 2.29 if side == "left" else 1.86
-            values["thumb_cmc_pitch"] = min(
-                values["thumb_cmc_pitch"],
-                values["thumb_ip"] / thumb_scale,
-            )
-            values["thumb_ip"] = min(
-                values["thumb_ip"],
-                thumb_scale * values["thumb_cmc_pitch"],
+            q[q_index] = lower + closure * (
+                closed_values[suffix] - lower
             )
 
-        for suffix, value in values.items():
-            joint_id = model.getJointId(f"{side}_{suffix}")
-            q[model.idx_qs[joint_id]] = value
+
+def _current_hand_jaw_width(
+    model: pin.Model,
+    data: pin.Data,
+    *,
+    side: str,
+) -> float:
+    tips: dict[str, np.ndarray] = {}
+    for digit, offset in HAND_TIP_LOCAL_OFFSETS.items():
+        placement = data.oMf[model.getFrameId(f"{side}_{digit}_distal")]
+        tips[digit] = placement.translation + placement.rotation @ offset
+    virtual_finger = 0.7 * tips["index"] + 0.3 * tips["middle"]
+    return float(np.linalg.norm(tips["thumb"] - virtual_finger))
+
+
+def _hand_aperture_curve(
+    model: pin.Model,
+    *,
+    side: str,
+    sample_count: int = 257,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return the monotonic closing jaw-width branch for one hand."""
+
+    closures = np.linspace(0.0, 1.0, sample_count, dtype=np.float64)
+    widths = np.empty(sample_count, dtype=np.float64)
+    data = model.createData()
+    side_index = 0 if side == "left" else 1
+    for sample_id, closure in enumerate(closures):
+        q = pin.neutral(model)
+        action = np.zeros(2, dtype=np.float64)
+        action[side_index] = closure
+        _set_continuous_hand_configuration(model, q, action)
+        pin.forwardKinematics(model, data, q)
+        pin.updateFramePlacements(model, data)
+        widths[sample_id] = _current_hand_jaw_width(
+            model,
+            data,
+            side=side,
+        )
+
+    minimum_index = int(np.argmin(widths))
+    closures = closures[: minimum_index + 1]
+    widths = widths[: minimum_index + 1]
+    if len(widths) < 2 or np.any(np.diff(widths) >= 0.0):
+        raise RuntimeError(
+            f"{side} hand aperture is not strictly decreasing before contact"
+        )
+    return closures, widths
+
+
+def _retarget_hand_widths(
+    model: pin.Model,
+    human_widths: np.ndarray,
+    *,
+    scale: float,
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    list[dict[str, float]],
+]:
+    """Map the paper's continuous ``w_t`` to calibrated hand closure."""
+
+    widths = np.asarray(human_widths, dtype=np.float64)
+    if widths.ndim != 2 or widths.shape[1] != 2:
+        raise ValueError(
+            f"Human hand widths must have shape [N, 2], got {widths.shape}"
+        )
+    if not np.isfinite(widths).all() or np.any(widths < 0.0):
+        raise ValueError("Human hand widths must be finite and non-negative")
+    target_widths = scale * widths
+    closures = np.empty_like(target_widths)
+    profiles: list[dict[str, float]] = []
+    for side_index, side in enumerate(("left", "right")):
+        curve_closures, curve_widths = _hand_aperture_curve(
+            model,
+            side=side,
+        )
+        clamped_targets = np.clip(
+            target_widths[:, side_index],
+            curve_widths[-1],
+            curve_widths[0],
+        )
+        closures[:, side_index] = np.interp(
+            clamped_targets,
+            curve_widths[::-1],
+            curve_closures[::-1],
+        )
+        profiles.append(
+            {
+                "open_width_m": float(curve_widths[0]),
+                "minimum_width_m": float(curve_widths[-1]),
+                "maximum_calibrated_closure": float(curve_closures[-1]),
+            }
+        )
+
+    achieved_widths = np.empty_like(target_widths)
+    data = model.createData()
+    for frame_id, frame_closures in enumerate(closures):
+        q = pin.neutral(model)
+        _set_continuous_hand_configuration(model, q, frame_closures)
+        pin.forwardKinematics(model, data, q)
+        pin.updateFramePlacements(model, data)
+        for side_index, side in enumerate(("left", "right")):
+            achieved_widths[frame_id, side_index] = (
+                _current_hand_jaw_width(model, data, side=side)
+            )
+    return closures, target_widths, achieved_widths, profiles
 
 
 def _visible(
@@ -543,6 +680,19 @@ def retarget_with_pinocchio(
         scale,
         camera_origin,
     )
+    (
+        hand_closures,
+        target_hand_widths,
+        achieved_hand_widths,
+        hand_aperture_profiles,
+    ) = _retarget_hand_widths(
+        model,
+        np.stack(
+            [trajectory.left_widths, trajectory.right_widths],
+            axis=1,
+        ),
+        scale=scale,
+    )
 
     q = pin.neutral(model)
     data = model.createData()
@@ -625,10 +775,10 @@ def retarget_with_pinocchio(
                 active_indices=active_indices,
                 iterations=0,
             )
-        _set_binary_hand_configuration(
+        _set_continuous_hand_configuration(
             model,
             q,
-            trajectory.binary_actions[frame_id],
+            hand_closures[frame_id],
         )
         qpos[frame_id] = q
         (
@@ -649,6 +799,10 @@ def retarget_with_pinocchio(
         right_orientation_errors=right_orientation_errors,
         left_visible=left_visible,
         right_visible=right_visible,
+        hand_closures=hand_closures,
+        target_hand_widths=target_hand_widths,
+        achieved_hand_widths=achieved_hand_widths,
+        hand_aperture_profiles=hand_aperture_profiles,
         base_position=base_position,
         scale=scale,
         search_results=search_results,
@@ -698,6 +852,22 @@ def save_pinocchio_trajectory(
         )
     )
     joint_steps = np.abs(np.diff(result.qpos, axis=0))
+    hand_q_indices = np.asarray(
+        [
+            q_index
+            for joint_name in HAND_JOINTS
+            for q_index in range(
+                model.idx_qs[model.getJointId(joint_name)],
+                model.idx_qs[model.getJointId(joint_name)]
+                + model.nqs[model.getJointId(joint_name)],
+            )
+        ],
+        dtype=np.int64,
+    )
+    arm_q_mask = np.ones(model.nq, dtype=bool)
+    arm_q_mask[hand_q_indices] = False
+    arm_joint_steps = joint_steps[:, arm_q_mask]
+    hand_joint_steps = joint_steps[:, hand_q_indices]
     wrist_motion: dict[str, dict[str, float]] = {}
     for joint_name in WRIST_JOINTS:
         joint_id = model.getJointId(joint_name)
@@ -709,7 +879,10 @@ def save_pinocchio_trajectory(
             "max_step_rad": float(np.max(steps)) if steps.size else 0.0,
         }
     report: dict[str, object] = {
+        "trajectory_schema_version": TRAJECTORY_SCHEMA_VERSION,
         "ik_solver": f"Pinocchio {pin.__version__}",
+        "ik_target_source": "HDF5 leftHand/rightHand rigid-body tracks",
+        "hand_action_source": "continuous HDF5 fingertip width",
         "frame_count": trajectory.frame_count,
         "joint_count": model.nq,
         "joint_names": list(model.names[1:]),
@@ -729,18 +902,64 @@ def save_pinocchio_trajectory(
         "max_joint_step_rad": (
             float(np.max(joint_steps)) if joint_steps.size else 0.0
         ),
+        "max_arm_joint_step_rad": (
+            float(np.max(arm_joint_steps))
+            if arm_joint_steps.size
+            else 0.0
+        ),
+        "max_hand_joint_step_rad": (
+            float(np.max(hand_joint_steps))
+            if hand_joint_steps.size
+            else 0.0
+        ),
         "wrist_motion": wrist_motion,
         "hand_action": {
+            "type": "continuous_width",
             "shape": [trajectory.frame_count, 2],
             "order": ["left", "right"],
-            "semantics": {"0": "open", "1": "closed"},
+            "formula": (
+                "w=||thumb-(0.7*index+0.3*middle)||_2"
+            ),
+            "closure_semantics": (
+                "0=open; increasing values close the hand along the "
+                "calibrated monotonic aperture branch"
+            ),
             "source": list(trajectory.hand_sources),
-            "normalized_width_thresholds": (
-                trajectory.action_thresholds.tolist()
-            ),
-            "closed_frame_fraction": (
-                trajectory.binary_actions.mean(axis=0).tolist()
-            ),
+            "human_width_range_m": {
+                side: [
+                    float(np.min(widths)),
+                    float(np.max(widths)),
+                ]
+                for side, widths in (
+                    ("left", trajectory.left_widths),
+                    ("right", trajectory.right_widths),
+                )
+            },
+            "target_width_range_m": {
+                side: [
+                    float(np.min(result.target_hand_widths[:, side_index])),
+                    float(np.max(result.target_hand_widths[:, side_index])),
+                ]
+                for side_index, side in enumerate(("left", "right"))
+            },
+            "achieved_width_range_m": {
+                side: [
+                    float(np.min(result.achieved_hand_widths[:, side_index])),
+                    float(np.max(result.achieved_hand_widths[:, side_index])),
+                ]
+                for side_index, side in enumerate(("left", "right"))
+            },
+            "closure_range": {
+                side: [
+                    float(np.min(result.hand_closures[:, side_index])),
+                    float(np.max(result.hand_closures[:, side_index])),
+                ]
+                for side_index, side in enumerate(("left", "right"))
+            },
+            "aperture_profiles": {
+                side: result.hand_aperture_profiles[side_index]
+                for side_index, side in enumerate(("left", "right"))
+            },
         },
         "top_base_search_results": result.search_results[:10],
     }
@@ -750,7 +969,15 @@ def save_pinocchio_trajectory(
     )
     np.savez_compressed(
         output_root / "g1_trajectory.npz",
+        trajectory_schema_version=np.asarray(
+            TRAJECTORY_SCHEMA_VERSION,
+            dtype=np.int64,
+        ),
         kinematics=np.asarray("pinocchio"),
+        ik_target_source=np.asarray(
+            "HDF5 leftHand/rightHand rigid-body tracks"
+        ),
+        hand_action_source=np.asarray("continuous HDF5 fingertip width"),
         joint_names=np.asarray(model.names[1:]),
         qpos=result.qpos,
         link_names=np.asarray(link_names),
@@ -766,9 +993,14 @@ def save_pinocchio_trajectory(
         right_orientation_errors=result.right_orientation_errors,
         left_visible=result.left_visible,
         right_visible=result.right_visible,
-        hand_binary_actions=trajectory.binary_actions,
-        hand_action_order=np.asarray(["left", "right"]),
-        hand_action_semantics=np.asarray("0=open,1=closed"),
+        hand_closures=result.hand_closures,
+        hand_closure_order=np.asarray(["left", "right"]),
+        hand_closure_semantics=np.asarray(
+            "0=open; increasing closes along the calibrated monotonic "
+            "aperture branch"
+        ),
+        hand_target_widths=result.target_hand_widths,
+        hand_achieved_widths=result.achieved_hand_widths,
         hand_sources=np.asarray(trajectory.hand_sources),
         hand_widths=np.stack(
             [trajectory.left_widths, trajectory.right_widths], axis=1
@@ -780,7 +1012,8 @@ def save_pinocchio_trajectory(
             ],
             axis=1,
         ),
-        hand_action_thresholds=trajectory.action_thresholds,
+        left_observation_camera=trajectory.left_observation_camera,
+        right_observation_camera=trajectory.right_observation_camera,
         base_position=result.base_position,
         scale=result.scale,
         camera_positions=camera_positions,
@@ -796,11 +1029,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--video", type=Path, required=True)
     parser.add_argument("--hdf5", type=Path, required=True)
-    parser.add_argument(
-        "--mano-keypoints",
-        type=Path,
-        help="Cached video-to-MANO 3D keypoints used when HDF5 fingers are absent",
-    )
     parser.add_argument("--urdf", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     return parser
@@ -809,10 +1037,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     source_width, source_height, frame_count, _ = video_metadata(args.video)
-    trajectory = load_hand_trajectory(
-        args.hdf5,
-        mano_keypoints_path=args.mano_keypoints,
-    )
+    trajectory = load_hand_trajectory(args.hdf5)
     if trajectory.frame_count != frame_count:
         raise ValueError(
             f"HDF5 has {trajectory.frame_count} frames; video has "

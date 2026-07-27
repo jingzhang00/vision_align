@@ -15,21 +15,16 @@ HAND_KEYPOINT_NAMES = (
     "IndexFingerTip",
     "MiddleFingerTip",
 )
-MANO_KEYPOINT_INDICES = {
-    "wrist": 0,
-    "thumb": 4,
-    "index": 8,
-    "middle": 12,
-}
 
 
 @dataclass(frozen=True)
 class HandTrajectory:
-    """Human hand actions expressed in the first camera frame.
+    """Wrist IK targets plus continuous hand widths in the first camera frame.
 
-    End-effector position, orientation, and width follow the action-alignment
-    construction from the paper. ``binary_actions`` has shape ``[N, 2]`` in
-    left/right order, where 0 is open and 1 is closed.
+    The end-effector position, orientation, visibility, and confidence come
+    from the stable ``*Hand`` rigid-body tracks. Finger keypoints are used only
+    to estimate the paper's continuous jaw width ``w_t``. This separation
+    ensures that enabling articulated hands cannot change the arm IK targets.
     """
 
     left_reference_camera: np.ndarray
@@ -40,8 +35,6 @@ class HandTrajectory:
     right_widths: np.ndarray
     left_normalized_widths: np.ndarray
     right_normalized_widths: np.ndarray
-    binary_actions: np.ndarray
-    action_thresholds: np.ndarray
     hand_sources: tuple[str, str]
     left_observation_camera: np.ndarray
     right_observation_camera: np.ndarray
@@ -65,8 +58,6 @@ class _AlignedHand:
     width: np.ndarray
     normalized_width: np.ndarray
     confidence: np.ndarray
-    binary_action: np.ndarray
-    action_threshold: float
 
 
 def _transform_points(transform: np.ndarray, points: np.ndarray) -> np.ndarray:
@@ -203,45 +194,35 @@ def _smooth_rotations_gaussian(
     return result
 
 
-def _binary_close_action(
-    normalized_width: np.ndarray,
+def _smooth_rigid_body_rotations(
+    matrices: np.ndarray,
     valid: np.ndarray,
-) -> tuple[np.ndarray, float]:
-    samples = np.asarray(normalized_width, dtype=np.float64)[valid]
-    samples = samples[np.isfinite(samples)]
-    if samples.size < 2:
-        raise ValueError("Cannot infer hand open/closed state from fewer than 2 frames")
+    window: int,
+    polynomial_order: int,
+) -> np.ndarray:
+    """Smooth tracked rigid-body rotations without changing their frame."""
 
-    low, high = np.percentile(samples, [20.0, 80.0])
-    for _ in range(20):
-        threshold = 0.5 * (low + high)
-        low_group = samples[samples <= threshold]
-        high_group = samples[samples > threshold]
-        if low_group.size == 0 or high_group.size == 0:
-            break
-        updated = float(low_group.mean()), float(high_group.mean())
-        if np.allclose(updated, (low, high), atol=1e-6):
-            low, high = updated
-            break
-        low, high = updated
-
-    separation = float(high - low)
-    threshold = (
-        0.5 * float(low + high)
-        if separation >= 0.04
-        else 0.35
+    matrices = np.asarray(matrices, dtype=np.float64)
+    valid = np.asarray(valid, dtype=bool) & np.isfinite(matrices).all(
+        axis=(1, 2)
     )
-    hysteresis = max(0.01, min(0.04, 0.15 * max(separation, 0.04)))
-    values = np.asarray(normalized_width, dtype=np.float64)
-    actions = np.empty(len(values), dtype=np.uint8)
-    closed = bool(values[0] < threshold)
-    for frame_id, value in enumerate(values):
-        if closed and value >= threshold + hysteresis:
-            closed = False
-        elif not closed and value <= threshold - hysteresis:
-            closed = True
-        actions[frame_id] = int(closed)
-    return actions, threshold
+    if valid.sum() < 2:
+        raise ValueError(
+            "The hand orientation contains fewer than two valid frames"
+        )
+    anchor_id = int(np.flatnonzero(valid)[0])
+    anchor = Rotation.from_matrix(matrices[anchor_id])
+    relative_vectors = np.full((len(matrices), 3), np.nan, dtype=np.float64)
+    relative_vectors[valid] = (
+        anchor.inv() * Rotation.from_matrix(matrices[valid])
+    ).as_rotvec()
+    smoothed_vectors = _smooth_values(
+        relative_vectors,
+        valid,
+        window,
+        polynomial_order,
+    )
+    return (anchor * Rotation.from_rotvec(smoothed_vectors)).as_matrix()
 
 
 def align_hand_action(
@@ -253,7 +234,7 @@ def align_hand_action(
     orientation_smooth_window: int = 15,
     polynomial_order: int = 2,
 ) -> _AlignedHand:
-    """Construct ``(p, R, w)`` and a binary grasp action from four keypoints."""
+    """Construct the paper's continuous ``(p, R, w)`` hand action."""
 
     if side not in {"left", "right"}:
         raise ValueError(f"Unknown hand side: {side}")
@@ -280,32 +261,63 @@ def align_hand_action(
     x_axis = np.cross(y_axis, z_axis)
     raw_rotations = np.stack([x_axis, y_axis, z_axis], axis=2)
     frame_confidence = np.min(confidence, axis=1)
-    valid = (
-        np.isfinite(points).all(axis=(1, 2))
+    usable_keypoints = (
+        np.isfinite(points).all(axis=2)
+        & np.isfinite(confidence)
+        & (confidence > 0.0)
+    )
+    raw_position = 0.5 * (thumb + virtual_finger)
+    finger_valid = usable_keypoints[:, 1:].all(axis=1)
+    position_valid = (
+        finger_valid
+        & np.isfinite(raw_position).all(axis=1)
+        & np.isfinite(width)
+        & (width > 1e-6)
+    )
+    width_valid = (
+        finger_valid
+        & np.isfinite(width)
+        & (width > 1e-6)
+    )
+    palm_valid = (
+        usable_keypoints[:, [0, 2, 3]].all(axis=1)
+        & np.isfinite(palm_length)
+        & (palm_length > 1e-6)
+    )
+    orientation_valid = (
+        usable_keypoints.all(axis=1)
         & np.isfinite(raw_rotations).all(axis=(1, 2))
-        & (frame_confidence > 0.2)
+        & np.isfinite(width)
+        & np.isfinite(palm_length)
+        & np.isfinite(y_norm)
         & (width > 1e-6)
         & (palm_length > 1e-6)
         & (y_norm > 1e-6)
     )
     position = _smooth_values(
-        0.5 * (thumb + virtual_finger),
-        valid,
+        raw_position,
+        position_valid,
         smooth_window,
         polynomial_order,
     )
-    smoothed_width = _smooth_values(
-        width[:, None],
-        valid,
-        smooth_window,
-        polynomial_order,
-    )[:, 0]
-    smoothed_palm_length = _smooth_values(
-        palm_length[:, None],
-        valid,
-        smooth_window,
-        polynomial_order,
-    )[:, 0]
+    smoothed_width = np.maximum(
+        _smooth_values(
+            width[:, None],
+            width_valid,
+            smooth_window,
+            polynomial_order,
+        )[:, 0],
+        0.0,
+    )
+    smoothed_palm_length = np.maximum(
+        _smooth_values(
+            palm_length[:, None],
+            palm_valid,
+            smooth_window,
+            polynomial_order,
+        )[:, 0],
+        0.0,
+    )
     normalized_width = np.clip(
         smoothed_width / np.maximum(smoothed_palm_length, 1e-6),
         0.0,
@@ -313,12 +325,8 @@ def align_hand_action(
     )
     rotations = _smooth_rotations_gaussian(
         raw_rotations,
-        valid,
+        orientation_valid,
         orientation_smooth_window,
-    )
-    binary_action, action_threshold = _binary_close_action(
-        normalized_width,
-        valid,
     )
     return _AlignedHand(
         position=position,
@@ -326,8 +334,6 @@ def align_hand_action(
         width=smoothed_width,
         normalized_width=normalized_width,
         confidence=frame_confidence,
-        binary_action=binary_action,
-        action_threshold=action_threshold,
     )
 
 
@@ -339,12 +345,31 @@ def _hdf5_hand_keys(side: str) -> tuple[str, ...]:
     )
 
 
+def _hdf5_hand_usable(handle: h5py.File, *, side: str) -> bool:
+    if not all(key in handle for key in _hdf5_hand_keys(side)):
+        return False
+    frame_count = int(handle["transforms/camera"].shape[0])
+    valid = np.ones(frame_count, dtype=bool)
+    for name in HAND_KEYPOINT_NAMES:
+        transform = handle[f"transforms/{side}{name}"]
+        confidence = handle[f"confidences/{side}{name}"]
+        if transform.shape != (frame_count, 4, 4) or confidence.shape != (
+            frame_count,
+        ):
+            return False
+        confidence_values = np.asarray(confidence, dtype=np.float64)
+        valid &= np.isfinite(transform[:, :3, 3]).all(axis=1)
+        valid &= np.isfinite(confidence_values)
+        valid &= confidence_values > 0.0
+    return int(valid.sum()) >= 2
+
+
 def hdf5_action_keypoint_availability(
     hdf5_path: str | Path,
 ) -> dict[str, bool]:
     with h5py.File(hdf5_path, "r") as handle:
         return {
-            side: all(key in handle for key in _hdf5_hand_keys(side))
+            side: _hdf5_hand_usable(handle, side=side)
             for side in ("left", "right")
         }
 
@@ -378,43 +403,6 @@ def _hdf5_keypoints_reference_camera(
     return _transform_points(repeated, points_world), confidence
 
 
-def _mano_keypoints_reference_camera(
-    cache: np.lib.npyio.NpzFile,
-    *,
-    side: str,
-    camera_motion: np.ndarray,
-    frame_count: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    points_key = f"{side}_keypoints_camera"
-    confidence_key = f"{side}_confidence"
-    if points_key not in cache or confidence_key not in cache:
-        raise KeyError(
-            f"MANO cache is missing {points_key!r} or {confidence_key!r}"
-        )
-    points = np.asarray(cache[points_key], dtype=np.float64)
-    confidence = np.asarray(cache[confidence_key], dtype=np.float64)
-    if points.shape != (frame_count, 21, 3):
-        raise ValueError(
-            f"{points_key} must have shape {(frame_count, 21, 3)}, "
-            f"got {points.shape}"
-        )
-    if confidence.shape == (frame_count,):
-        confidence = np.repeat(confidence[:, None], 21, axis=1)
-    if confidence.shape != (frame_count, 21):
-        raise ValueError(
-            f"{confidence_key} must have shape {(frame_count, 21)}, "
-            f"got {confidence.shape}"
-        )
-    indices = [
-        MANO_KEYPOINT_INDICES[name]
-        for name in ("wrist", "thumb", "index", "middle")
-    ]
-    return (
-        _transform_points(camera_motion, points[:, indices]),
-        confidence[:, indices],
-    )
-
-
 def _project(points_camera: np.ndarray, intrinsic: np.ndarray) -> np.ndarray:
     z = points_camera[:, 2]
     valid = z > 1e-6
@@ -428,19 +416,13 @@ def _project(points_camera: np.ndarray, intrinsic: np.ndarray) -> np.ndarray:
 def load_hand_trajectory(
     hdf5_path: str | Path,
     *,
-    mano_keypoints_path: str | Path | None = None,
     smooth_window: int = 11,
     orientation_smooth_window: int = 15,
     polynomial_order: int = 2,
 ) -> HandTrajectory:
-    """Load action-aligned hands from HDF5, with MANO as a per-hand fallback."""
+    """Load wrist IK targets and independently infer continuous hand widths."""
 
     path = Path(hdf5_path)
-    mano_path = (
-        Path(mano_keypoints_path)
-        if mano_keypoints_path is not None
-        else None
-    )
     with h5py.File(path, "r") as handle:
         required = ("camera/intrinsic", "transforms/camera")
         missing = [key for key in required if key not in handle]
@@ -460,37 +442,41 @@ def load_hand_trajectory(
             "ij,njk->nik", reference_world_to_camera, camera_to_world
         )
         availability = {
-            side: all(key in handle for key in _hdf5_hand_keys(side))
+            side: _hdf5_hand_usable(handle, side=side)
             for side in ("left", "right")
         }
-        cache = np.load(mano_path) if mano_path is not None else None
-        try:
-            keypoints: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-            sources: list[str] = []
-            for side in ("left", "right"):
-                if availability[side]:
-                    keypoints[side] = _hdf5_keypoints_reference_camera(
-                        handle,
-                        side=side,
-                        reference_world_to_camera=reference_world_to_camera,
-                    )
-                    sources.append("hdf5")
-                elif cache is not None:
-                    keypoints[side] = _mano_keypoints_reference_camera(
-                        cache,
-                        side=side,
-                        camera_motion=camera_motion,
-                        frame_count=frame_count,
-                    )
-                    sources.append("mano")
-                else:
-                    raise KeyError(
-                        f"{path} has no complete {side} hand keypoints; "
-                        "provide --mano-keypoints generated from the video"
-                    )
-        finally:
-            if cache is not None:
-                cache.close()
+        missing_sides = [
+            side for side, usable in availability.items() if not usable
+        ]
+        if missing_sides:
+            required_names = ", ".join(HAND_KEYPOINT_NAMES)
+            raise ValueError(
+                f"{path} lacks usable annotated keypoints for "
+                f"{', '.join(missing_sides)} hand(s). Required transforms "
+                f"and confidences: {required_names}, with at least two "
+                "valid frames."
+            )
+        keypoints = {
+            side: _hdf5_keypoints_reference_camera(
+                handle,
+                side=side,
+                reference_world_to_camera=reference_world_to_camera,
+            )
+            for side in ("left", "right")
+        }
+        rigid_body_tracks = {
+            side: (
+                np.asarray(
+                    handle[f"transforms/{side}Hand"],
+                    dtype=np.float64,
+                ),
+                np.asarray(
+                    handle[f"confidences/{side}Hand"],
+                    dtype=np.float64,
+                ),
+            )
+            for side in ("left", "right")
+        }
 
     aligned = {
         side: align_hand_action(
@@ -504,41 +490,76 @@ def load_hand_trajectory(
     }
     left = aligned["left"]
     right = aligned["right"]
+    ik_targets: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    repeated_reference_transform = np.repeat(
+        reference_world_to_camera[None],
+        frame_count,
+        axis=0,
+    )
+    for side in ("left", "right"):
+        transforms, confidence = rigid_body_tracks[side]
+        position_valid = (
+            np.isfinite(transforms[:, :3, 3]).all(axis=1)
+            & np.isfinite(confidence)
+            & (confidence > 0.2)
+        )
+        reference_position = _smooth_values(
+            _transform_points(
+                repeated_reference_transform,
+                transforms[:, :3, 3],
+            ),
+            position_valid,
+            smooth_window,
+            polynomial_order,
+        )
+        rotation_valid = (
+            np.isfinite(confidence)
+            & (confidence > 0.2)
+            & np.isfinite(transforms[:, :3, :3]).all(axis=(1, 2))
+        )
+        world_rotation = _smooth_rigid_body_rotations(
+            transforms[:, :3, :3],
+            rotation_valid,
+            orientation_smooth_window,
+            polynomial_order,
+        )
+        reference_rotation = np.einsum(
+            "ij,njk->nik",
+            reference_world_to_camera[:3, :3],
+            world_rotation,
+        )
+        ik_targets[side] = (
+            reference_position,
+            reference_rotation,
+            confidence,
+        )
+
+    left_position, left_rotation, left_confidence = ik_targets["left"]
+    right_position, right_rotation, right_confidence = ik_targets["right"]
     current_from_reference = np.linalg.inv(camera_motion)
     left_observation_camera = _transform_points(
-        current_from_reference, left.position
+        current_from_reference, left_position
     )
     right_observation_camera = _transform_points(
-        current_from_reference, right.position
+        current_from_reference, right_position
     )
     return HandTrajectory(
-        left_reference_camera=left.position,
-        right_reference_camera=right.position,
-        left_reference_rotations=left.rotation,
-        right_reference_rotations=right.rotation,
+        left_reference_camera=left_position,
+        right_reference_camera=right_position,
+        left_reference_rotations=left_rotation,
+        right_reference_rotations=right_rotation,
         left_widths=left.width,
         right_widths=right.width,
         left_normalized_widths=left.normalized_width,
         right_normalized_widths=right.normalized_width,
-        binary_actions=np.stack(
-            [left.binary_action, right.binary_action], axis=1
-        ),
-        action_thresholds=np.asarray(
-            [left.action_threshold, right.action_threshold],
-            dtype=np.float64,
-        ),
-        hand_sources=(sources[0], sources[1]),
+        hand_sources=("hdf5", "hdf5"),
         left_observation_camera=left_observation_camera,
         right_observation_camera=right_observation_camera,
         left_pixels=_project(left_observation_camera, intrinsic),
         right_pixels=_project(right_observation_camera, intrinsic),
-        left_confidence=left.confidence,
-        right_confidence=right.confidence,
+        left_confidence=left_confidence,
+        right_confidence=right_confidence,
         intrinsic=intrinsic,
         camera_to_world=camera_to_world,
         camera_motion=camera_motion,
     )
-
-
-# Kept as a narrow compatibility alias for callers outside this repository.
-load_single_point_trajectory = load_hand_trajectory

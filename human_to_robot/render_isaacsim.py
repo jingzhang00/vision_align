@@ -5,6 +5,7 @@ import json
 import os
 import traceback
 import xml.etree.ElementTree as ET
+from contextlib import ExitStack
 from pathlib import Path
 
 import numpy as np
@@ -214,6 +215,10 @@ def _resolve_render_settings(
 
 
 def render(args: argparse.Namespace) -> dict[str, object]:
+    if (args.inpaint_video is None) != (args.composite_output is None):
+        raise ValueError(
+            "--inpaint-video and --composite-output must be supplied together"
+        )
     lighting_profile, lighting_profile_path = _resolve_render_settings(args)
     # SimulationApp must be constructed before importing any omni/pxr modules.
     from isaacsim import SimulationApp
@@ -238,6 +243,7 @@ def render(args: argparse.Namespace) -> dict[str, object]:
         from isaacsim.sensors.camera import Camera
         from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux, UsdPhysics
 
+        from .composite import InMemoryVideoCompositor
         from .video_io import video_metadata, write_video
 
         trajectory_path = args.trajectory.resolve()
@@ -246,6 +252,22 @@ def render(args: argparse.Namespace) -> dict[str, object]:
         source_hdf5 = args.hdf5.resolve()
         output_root = args.output.resolve()
         output_root.mkdir(parents=True, exist_ok=True)
+        stream_composite = args.composite_output is not None
+        inpaint_video = (
+            args.inpaint_video.resolve()
+            if args.inpaint_video is not None
+            else None
+        )
+        composite_output = (
+            args.composite_output.resolve()
+            if args.composite_output is not None
+            else None
+        )
+        object_mask_root = (
+            args.object_masks.resolve()
+            if args.object_masks is not None
+            else None
+        )
         render_urdf = output_root / "g1_arms_hands_isaacsim.urdf"
         visible_link_names = _build_arm_hand_urdf(
             source_urdf,
@@ -480,8 +502,9 @@ def render(args: argparse.Namespace) -> dict[str, object]:
         rgb_dir = output_root / "robot_rgb"
         mask_dir = output_root / "robot_masks"
         depth_dir = output_root / "robot_depth_mm"
-        for directory in (rgb_dir, mask_dir, depth_dir):
-            directory.mkdir(parents=True, exist_ok=True)
+        if not stream_composite:
+            for directory in (rgb_dir, mask_dir, depth_dir):
+                directory.mkdir(parents=True, exist_ok=True)
 
         base_position = np.asarray(archive["base_position"], dtype=np.float64)
         camera_positions = (
@@ -500,93 +523,152 @@ def render(args: argparse.Namespace) -> dict[str, object]:
         link_quaternions = np.asarray(
             archive["link_quaternions"], dtype=np.float64
         )
-
-        for frame_id in range(frame_count):
-            for link_index, translate_op, orient_op in body_pose_ops:
-                relative_position = link_positions[frame_id, link_index]
-                relative_quaternion = link_quaternions[
-                    frame_id, link_index
-                ]
-                translate_op.Set(Gf.Vec3d(*relative_position))
-                orient_op.Set(
-                    Gf.Quatd(
-                        float(relative_quaternion[0]),
-                        Gf.Vec3d(*relative_quaternion[1:]),
+        compositor: InMemoryVideoCompositor | None = None
+        with ExitStack() as render_stack:
+            if stream_composite:
+                if inpaint_video is None or composite_output is None:
+                    raise RuntimeError(
+                        "Streaming composite paths were not resolved"
+                    )
+                compositor = render_stack.enter_context(
+                    InMemoryVideoCompositor(
+                        source_video=source_video,
+                        inpaint_video=inpaint_video,
+                        trajectory_path=trajectory_path,
+                        object_mask_root=object_mask_root,
+                        output_root=composite_output,
+                        g1_root=output_root,
+                        lighting_profile_path=lighting_profile_path,
+                        hardware_encoding=args.hardware_encoding,
                     )
                 )
-            camera.set_world_pose(
-                position=np.asarray(camera_positions[frame_id], dtype=np.float32),
-                orientation=np.asarray(
-                    camera_quaternions[frame_id], dtype=np.float32
-                ),
-                camera_axes="usd",
-            )
-            rep.orchestrator.step(
-                rt_subframes=2,
-                pause_timeline=True,
-                delta_time=0.0,
-                wait_for_render=True,
-            )
-            rgba = camera.get_rgba()
-            depth = camera.get_depth()
-            if rgba is None or depth is None:
-                raise RuntimeError(f"Camera returned no data at frame {frame_id}")
-            rgba = np.asarray(rgba)
-            depth = np.asarray(depth, dtype=np.float32)
-            if rgba.shape[:2] != (args.height, args.width):
-                raise RuntimeError(f"Unexpected RGBA shape: {rgba.shape}")
-            if depth.shape != (args.height, args.width):
-                raise RuntimeError(f"Unexpected depth shape: {depth.shape}")
+                if compositor.frame_count != frame_count:
+                    raise ValueError(
+                        "Rendered and composite frame counts disagree: "
+                        f"{frame_count} != {compositor.frame_count}"
+                    )
+                if (compositor.width, compositor.height) != (
+                    args.width,
+                    args.height,
+                ):
+                    raise ValueError(
+                        "Inpaint and render resolutions disagree: "
+                        f"{compositor.width}x{compositor.height} != "
+                        f"{args.width}x{args.height}"
+                    )
 
-            mask = (
-                np.isfinite(depth)
-                & (depth > 0.01)
-                & (depth < 100.0)
-            )
-            depth_mm = np.where(
-                mask, np.clip(depth * 1000.0, 0.0, 65535.0), 0.0
-            ).astype(np.uint16)
-            rgb = cv2.cvtColor(rgba[:, :, :3], cv2.COLOR_RGB2BGR)
-            mask_u8 = mask.astype(np.uint8) * 255
+            for frame_id in range(frame_count):
+                for link_index, translate_op, orient_op in body_pose_ops:
+                    relative_position = link_positions[frame_id, link_index]
+                    relative_quaternion = link_quaternions[
+                        frame_id, link_index
+                    ]
+                    translate_op.Set(Gf.Vec3d(*relative_position))
+                    orient_op.Set(
+                        Gf.Quatd(
+                            float(relative_quaternion[0]),
+                            Gf.Vec3d(*relative_quaternion[1:]),
+                        )
+                    )
+                camera.set_world_pose(
+                    position=np.asarray(
+                        camera_positions[frame_id], dtype=np.float32
+                    ),
+                    orientation=np.asarray(
+                        camera_quaternions[frame_id], dtype=np.float32
+                    ),
+                    camera_axes="usd",
+                )
+                rep.orchestrator.step(
+                    rt_subframes=2,
+                    pause_timeline=True,
+                    delta_time=0.0,
+                    wait_for_render=True,
+                )
+                rgba = camera.get_rgba()
+                depth = camera.get_depth()
+                if rgba is None or depth is None:
+                    raise RuntimeError(
+                        f"Camera returned no data at frame {frame_id}"
+                    )
+                rgba = np.asarray(rgba)
+                depth = np.asarray(depth, dtype=np.float32)
+                if rgba.shape[:2] != (args.height, args.width):
+                    raise RuntimeError(f"Unexpected RGBA shape: {rgba.shape}")
+                if depth.shape != (args.height, args.width):
+                    raise RuntimeError(f"Unexpected depth shape: {depth.shape}")
 
-            cv2.imwrite(str(rgb_dir / f"{frame_id:05d}.png"), rgb)
-            cv2.imwrite(str(mask_dir / f"{frame_id:05d}.png"), mask_u8)
-            cv2.imwrite(str(depth_dir / f"{frame_id:05d}.png"), depth_mm)
-            if args.debug_artifacts:
-                video_frames.append(rgb)
-            mask_fractions.append(float(mask.mean()))
-            if (
-                frame_id == 0
-                or (frame_id + 1) % 10 == 0
-                or frame_id + 1 == frame_count
-            ):
-                print(
-                    f"Isaac Sim rendered {frame_id + 1}/{frame_count}",
-                    flush=True,
+                mask = (
+                    np.isfinite(depth)
+                    & (depth > 0.01)
+                    & (depth < 100.0)
                 )
-            if frame_id == 0:
-                bbox_cache = UsdGeom.BBoxCache(
-                    Usd.TimeCode.Default(),
-                    [UsdGeom.Tokens.default_, UsdGeom.Tokens.render],
-                    useExtentsHint=False,
-                )
-                bbox_range = (
-                    bbox_cache.ComputeWorldBound(robot_prim)
-                    .ComputeAlignedRange()
-                )
-                actual_camera_pose = camera.get_world_pose(camera_axes="usd")
-                first_frame_diagnostics = {
-                    "robot_bbox_min": list(bbox_range.GetMin()),
-                    "robot_bbox_max": list(bbox_range.GetMax()),
-                    "camera_position": actual_camera_pose[0].tolist(),
-                    "camera_quaternion": actual_camera_pose[1].tolist(),
-                    "finite_depth_pixels": int(mask.sum()),
-                }
-                print(
-                    "First-frame diagnostics: "
-                    f"{first_frame_diagnostics}",
-                    flush=True,
-                )
+                rgb = cv2.cvtColor(rgba[:, :, :3], cv2.COLOR_RGB2BGR)
+                mask_u8 = mask.astype(np.uint8) * 255
+
+                if compositor is not None:
+                    compositor.write(rgb, mask_u8, depth)
+                else:
+                    depth_mm = np.where(
+                        mask,
+                        np.clip(depth * 1000.0, 0.0, 65535.0),
+                        0.0,
+                    ).astype(np.uint16)
+                    if not cv2.imwrite(
+                        str(rgb_dir / f"{frame_id:05d}.png"), rgb
+                    ):
+                        raise RuntimeError(
+                            f"Failed to write rendered RGB frame {frame_id}"
+                        )
+                    if not cv2.imwrite(
+                        str(mask_dir / f"{frame_id:05d}.png"), mask_u8
+                    ):
+                        raise RuntimeError(
+                            f"Failed to write rendered mask frame {frame_id}"
+                        )
+                    if not cv2.imwrite(
+                        str(depth_dir / f"{frame_id:05d}.png"), depth_mm
+                    ):
+                        raise RuntimeError(
+                            f"Failed to write rendered depth frame {frame_id}"
+                        )
+                if args.debug_artifacts:
+                    video_frames.append(rgb)
+                mask_fractions.append(float(mask.mean()))
+                if (
+                    frame_id == 0
+                    or (frame_id + 1) % 10 == 0
+                    or frame_id + 1 == frame_count
+                ):
+                    print(
+                        f"Isaac Sim rendered {frame_id + 1}/{frame_count}",
+                        flush=True,
+                    )
+                if frame_id == 0:
+                    bbox_cache = UsdGeom.BBoxCache(
+                        Usd.TimeCode.Default(),
+                        [UsdGeom.Tokens.default_, UsdGeom.Tokens.render],
+                        useExtentsHint=False,
+                    )
+                    bbox_range = (
+                        bbox_cache.ComputeWorldBound(robot_prim)
+                        .ComputeAlignedRange()
+                    )
+                    actual_camera_pose = camera.get_world_pose(
+                        camera_axes="usd"
+                    )
+                    first_frame_diagnostics = {
+                        "robot_bbox_min": list(bbox_range.GetMin()),
+                        "robot_bbox_max": list(bbox_range.GetMax()),
+                        "camera_position": actual_camera_pose[0].tolist(),
+                        "camera_quaternion": actual_camera_pose[1].tolist(),
+                        "finite_depth_pixels": int(mask.sum()),
+                    }
+                    print(
+                        "First-frame diagnostics: "
+                        f"{first_frame_diagnostics}",
+                        flush=True,
+                    )
 
         if args.debug_artifacts:
             write_video(
@@ -634,6 +716,14 @@ def render(args: argparse.Namespace) -> dict[str, object]:
             "first_frame_diagnostics": first_frame_diagnostics,
             "mean_robot_area_fraction": float(np.mean(mask_fractions)),
             "max_robot_area_fraction": float(np.max(mask_fractions)),
+            "output_mode": (
+                "in_memory_composite"
+                if compositor is not None
+                else "png_sequences"
+            ),
+            "composite": (
+                compositor.report if compositor is not None else None
+            ),
             "trajectory": str(trajectory_path),
             "urdf": str(source_urdf),
             "render_urdf": str(render_urdf),
@@ -664,6 +754,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--video", type=Path, required=True)
     parser.add_argument("--hdf5", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--inpaint-video",
+        type=Path,
+        help=(
+            "ProPainter video for in-process compositing; requires "
+            "--composite-output"
+        ),
+    )
+    parser.add_argument(
+        "--composite-output",
+        type=Path,
+        help=(
+            "Write synthetic_g1.mp4 directly while rendering instead of "
+            "writing RGB/mask/depth PNG sequences"
+        ),
+    )
+    parser.add_argument(
+        "--object-masks",
+        type=Path,
+        help="Optional numbered object masks for depth-aware occlusion",
+    )
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
     parser.add_argument(
@@ -696,7 +807,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--hardware-encoding",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Use NVIDIA NVENC for debug videos when available (default: true)",
+        help="Use NVIDIA NVENC for output videos when available (default: true)",
     )
     return parser
 

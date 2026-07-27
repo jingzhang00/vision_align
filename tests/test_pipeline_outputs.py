@@ -7,12 +7,16 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import h5py
+
 from human_to_robot.pipeline import (
     Episode,
     EpisodeInterrupted,
+    IsaacRuntime,
     PreparedEpisode,
     _discard_episode_workspace,
     _publish_episode_outputs,
+    _render_episode,
     _resolve_isaacsim_runtime,
     _run_logged,
     _run_pipeline,
@@ -23,6 +27,127 @@ from human_to_robot.pipeline import (
 
 
 class PipelineOutputTests(unittest.TestCase):
+    def test_non_debug_routes_render_and_composite_through_one_process(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_task = root / "source" / "task_a"
+            source_task.mkdir(parents=True)
+            video = source_task / "0.mp4"
+            hdf5 = source_task / "0.hdf5"
+            video.touch()
+            hdf5.touch()
+            episode_root = root / "workspace" / "task_a" / "0"
+            inpaint = episode_root / "propainter" / "inpaint.mp4"
+            trajectory = episode_root / "g1" / "g1_trajectory.npz"
+            inpaint.parent.mkdir(parents=True)
+            trajectory.parent.mkdir(parents=True)
+            inpaint.touch()
+            trajectory.touch()
+            episode = Episode(
+                task_dir=source_task,
+                task_relative=Path("task_a"),
+                task_name="task_a",
+                name="0",
+                video=video,
+                hdf5=hdf5,
+                output_root=episode_root,
+            )
+            prepared = PreparedEpisode(
+                episode=episode,
+                frame_count=2,
+                inpaint_video=inpaint,
+                sam_root=episode_root / "sam3",
+                g1_root=trajectory.parent,
+                lighting_observation={},
+                prepare_seconds=1.0,
+                prepare_generation=1,
+            )
+            task_profile = root / "lighting_profile.json"
+            task_profile.write_text("{}", encoding="utf-8")
+            urdf = root / "g1.urdf"
+            urdf.touch()
+            args = build_parser().parse_args(
+                [
+                    "--folder",
+                    str(source_task),
+                    "--output",
+                    str(root / "published"),
+                    "--no-hardware-encoding",
+                ]
+            )
+            commands: list[list[str]] = []
+
+            def fake_run_logged(
+                command: list[str],
+                **_kwargs: object,
+            ) -> None:
+                commands.append(command)
+                render_root = episode_root / "g1_isaacsim"
+                final_root = episode_root / "final"
+                render_root.mkdir(parents=True)
+                final_root.mkdir(parents=True)
+                (render_root / "isaacsim_render_report.json").write_text(
+                    "{}",
+                    encoding="utf-8",
+                )
+                (final_root / "composite_report.json").write_text(
+                    "{}",
+                    encoding="utf-8",
+                )
+                (final_root / "synthetic_g1.mp4").touch()
+
+            with (
+                mock.patch(
+                    "human_to_robot.pipeline.video_metadata",
+                    return_value=(48, 32, 2, 12.0),
+                ),
+                mock.patch(
+                    "human_to_robot.pipeline._video_complete",
+                    return_value=True,
+                ),
+                mock.patch(
+                    "human_to_robot.pipeline._run_logged",
+                    side_effect=fake_run_logged,
+                ),
+                mock.patch(
+                    "human_to_robot.pipeline._publish_episode_outputs",
+                    return_value=(
+                        root / "published/task_a/0.mp4",
+                        root / "published/task_a/0.hdf5",
+                    ),
+                ),
+            ):
+                _render_episode(
+                    prepared,
+                    args=args,
+                    repo=Path.cwd(),
+                    urdf=urdf,
+                    isaac_runtime=IsaacRuntime(
+                        command=("isaac-python",),
+                        environment={},
+                        description="test",
+                    ),
+                    task_profile_path=task_profile,
+                    progress=mock.Mock(),
+                )
+
+            self.assertEqual(len(commands), 1)
+            command = commands[0]
+            self.assertIn("human_to_robot.render_isaacsim", command)
+            self.assertIn("--inpaint-video", command)
+            self.assertIn("--composite-output", command)
+            self.assertNotIn("human_to_robot.composite", command)
+            for directory_name in (
+                "robot_rgb",
+                "robot_masks",
+                "robot_depth_mm",
+            ):
+                self.assertFalse(
+                    (episode_root / "g1_isaacsim" / directory_name).exists()
+                )
+
     def test_explicit_isaacsim_root_uses_standalone_launcher(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -285,6 +410,41 @@ class PipelineOutputTests(unittest.TestCase):
             )
             self.assertEqual(published_video.read_bytes(), b"synthetic video")
             self.assertEqual(published_hdf5.read_bytes(), b"original hdf5")
+
+    def test_publish_keeps_source_hdf5_byte_identical(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_task = root / "source" / "task_a"
+            source_task.mkdir(parents=True)
+            source_video = source_task / "0.mp4"
+            source_hdf5 = source_task / "0.hdf5"
+            synthetic_video = root / "workspace" / "synthetic_g1.mp4"
+            synthetic_video.parent.mkdir()
+            source_video.write_bytes(b"original")
+            synthetic_video.write_bytes(b"synthetic")
+            with h5py.File(source_hdf5, "w") as handle:
+                handle.create_dataset("source", data=[0, 1, 2])
+            source_bytes = source_hdf5.read_bytes()
+            episode = Episode(
+                task_dir=source_task,
+                task_relative=Path("task_a"),
+                task_name="task_a",
+                name="0",
+                video=source_video,
+                hdf5=source_hdf5,
+                output_root=root / "workspace" / "task_a" / "0",
+            )
+
+            _, published_hdf5 = _publish_episode_outputs(
+                episode,
+                synthetic_video=synthetic_video,
+                output=root / "outputs",
+            )
+
+            self.assertEqual(published_hdf5.read_bytes(), source_bytes)
+            with h5py.File(published_hdf5, "r") as handle:
+                self.assertIn("source", handle)
+                self.assertNotIn("human_to_robot", handle)
 
     def test_default_workspace_is_removed_but_debug_workspace_is_kept(
         self,
