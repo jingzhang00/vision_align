@@ -41,6 +41,37 @@ Run the complete 1280×720 experiment:
 
 Add `--reuse` to reuse finished SAM3, G1, and ProPainter stages.
 
+### Isaac Sim 5.1 renderer with MuJoCo/Mink IK
+
+The Isaac version keeps MuJoCo/Mink as the source of truth for IK and forward
+kinematics. It imports the G1 arms into Isaac Sim, writes every MuJoCo body pose
+directly to the USD stage, and uses Isaac Sim only for camera rendering. PhysX
+is intentionally not stepped, so its joint integration cannot drift away from
+the solved MuJoCo trajectory.
+
+After generating (or reusing) `g1/g1_trajectory.npz`, render all 126 frames:
+
+```bash
+.venv/bin/python -m human_to_robot.render_isaacsim \
+  --trajectory outputs/basic_pick_place_0/g1/g1_trajectory.npz \
+  --mjcf assets/unitree_description/mjcf/g1.xml \
+  --video dataset/test/basic_pick_place/0.mp4 \
+  --hdf5 dataset/test/basic_pick_place/0.hdf5 \
+  --output outputs/basic_pick_place_0/g1_isaacsim
+```
+
+Composite the Isaac RGB, mask, and metric depth into the ProPainter result:
+
+```bash
+.venv/bin/python -m human_to_robot.composite \
+  --source-video dataset/test/basic_pick_place/0.mp4 \
+  --inpaint-video outputs/basic_pick_place_0/propainter/0/inpaint_out.mp4 \
+  --hdf5 dataset/test/basic_pick_place/0.hdf5 \
+  --g1-root outputs/basic_pick_place_0/g1_isaacsim \
+  --object-masks outputs/basic_pick_place_0/sam3/object_masks \
+  --output outputs/basic_pick_place_0/final_isaacsim
+```
+
 
 Current prototype limitations:
 

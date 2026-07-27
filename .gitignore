@@ -8,6 +8,7 @@ wheels/
 models/
 dataset/
 outputs/basic_pick_place_0
+assets/unitree_description/meshes/g1/*_tmp/
 
 # Virtual environments
 .venv
