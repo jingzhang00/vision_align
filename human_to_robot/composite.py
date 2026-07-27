@@ -39,6 +39,51 @@ def _label(frame: np.ndarray, text: str) -> np.ndarray:
     return result
 
 
+def _grade_robot(
+    frame: np.ndarray,
+    *,
+    exposure: float,
+    rgb_gain: tuple[float, float, float],
+    contrast: float,
+    saturation: float,
+) -> np.ndarray:
+    """Apply one fixed, video-editor-style grade to the robot layer."""
+
+    rgb = frame[..., ::-1].astype(np.float32) / 255.0
+    linear = np.where(
+        rgb <= 0.04045,
+        rgb / 12.92,
+        ((rgb + 0.055) / 1.055) ** 2.4,
+    )
+    linear *= np.asarray(rgb_gain, dtype=np.float32) * (2.0**exposure)
+    rgb = np.where(
+        linear <= 0.0031308,
+        12.92 * linear,
+        1.055 * np.maximum(linear, 0.0) ** (1.0 / 2.4) - 0.055,
+    )
+    luma = rgb @ np.asarray([0.2126, 0.7152, 0.0722], dtype=np.float32)
+    rgb = luma[..., None] + saturation * (rgb - luma[..., None])
+    rgb = (rgb - 0.5) * contrast + 0.5
+    return np.clip(rgb[..., ::-1] * 255.0, 0.0, 255.0).astype(np.uint8)
+
+
+def _soften_robot(
+    frame: np.ndarray, mask: np.ndarray, sigma: float
+) -> np.ndarray:
+    """Soften the robot without bleeding the render background into its edge."""
+
+    if sigma <= 0.0:
+        return frame
+    weight = mask.astype(np.float32)
+    blurred_weight = cv2.GaussianBlur(weight, (0, 0), sigma)
+    premultiplied = frame.astype(np.float32) * weight[..., None]
+    blurred = cv2.GaussianBlur(premultiplied, (0, 0), sigma)
+    valid = blurred_weight > 1e-5
+    result = frame.astype(np.float32)
+    result[valid] = blurred[valid] / blurred_weight[valid, None]
+    return np.clip(result, 0.0, 255.0).astype(np.uint8)
+
+
 def compose_video(
     *,
     source_video: Path,
@@ -47,7 +92,12 @@ def compose_video(
     g1_root: Path,
     object_mask_root: Path | None,
     output_root: Path,
-) -> dict[str, float | int | str]:
+    robot_exposure: float = 0.0,
+    robot_rgb_gain: tuple[float, float, float] = (1.0, 1.0, 1.0),
+    robot_contrast: float = 1.0,
+    robot_saturation: float = 1.0,
+    robot_soften_sigma: float = 0.0,
+) -> dict[str, object]:
     source_frames, source_fps = read_video(source_video)
     backgrounds, background_fps = read_video(inpaint_video)
     robot_frames = _read_numbered_images(g1_root / "robot_rgb")
@@ -96,8 +146,15 @@ def compose_video(
             source_frames[frame_id], (width, height), interpolation=cv2.INTER_AREA
         )
         background = backgrounds[frame_id]
-        robot = robot_frames[frame_id]
+        robot = _grade_robot(
+            robot_frames[frame_id],
+            exposure=robot_exposure,
+            rgb_gain=robot_rgb_gain,
+            contrast=robot_contrast,
+            saturation=robot_saturation,
+        )
         binary_robot = robot_masks[frame_id] > 0
+        robot = _soften_robot(robot, binary_robot, robot_soften_sigma)
         depth = robot_depth_mm[frame_id].astype(np.float32) / 1000.0
 
         occluder = np.zeros((height, width), dtype=bool)
@@ -168,6 +225,13 @@ def compose_video(
         "source_video": str(source_video),
         "inpaint_video": str(inpaint_video),
         "g1_root": str(g1_root),
+        "robot_grade": {
+            "exposure_stops": robot_exposure,
+            "rgb_gain": list(robot_rgb_gain),
+            "contrast": robot_contrast,
+            "saturation": robot_saturation,
+            "soften_sigma_px": robot_soften_sigma,
+        },
     }
     (output_root / "composite_report.json").write_text(
         json.dumps(report, indent=2), encoding="utf-8"
@@ -185,6 +249,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--g1-root", type=Path, required=True)
     parser.add_argument("--object-masks", type=Path)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--robot-exposure", type=float, default=0.0)
+    parser.add_argument(
+        "--robot-rgb-gain",
+        type=float,
+        nargs=3,
+        metavar=("R", "G", "B"),
+        default=(1.0, 1.0, 1.0),
+    )
+    parser.add_argument("--robot-contrast", type=float, default=1.0)
+    parser.add_argument("--robot-saturation", type=float, default=1.0)
+    parser.add_argument("--robot-soften-sigma", type=float, default=0.0)
     return parser
 
 
@@ -199,6 +274,11 @@ def main() -> None:
             args.object_masks.resolve() if args.object_masks is not None else None
         ),
         output_root=args.output.resolve(),
+        robot_exposure=args.robot_exposure,
+        robot_rgb_gain=tuple(args.robot_rgb_gain),
+        robot_contrast=args.robot_contrast,
+        robot_saturation=args.robot_saturation,
+        robot_soften_sigma=args.robot_soften_sigma,
     )
     print(json.dumps(report, indent=2))
 

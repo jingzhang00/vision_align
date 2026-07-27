@@ -209,8 +209,18 @@ def render(args: argparse.Namespace) -> dict[str, object]:
         simulation_app.update()
 
         dome = UsdLux.DomeLight.Define(stage, Sdf.Path("/World/DomeLight"))
-        dome.CreateIntensityAttr(900.0)
+        dome.CreateIntensityAttr(args.dome_intensity)
         dome.CreateColorAttr((1.0, 1.0, 1.0))
+        dome.CreateEnableColorTemperatureAttr(True)
+        dome.CreateColorTemperatureAttr(args.dome_temperature)
+
+        key = UsdLux.DistantLight.Define(stage, Sdf.Path("/World/KeyLight"))
+        key.CreateIntensityAttr(args.key_intensity)
+        key.CreateColorAttr((1.0, 1.0, 1.0))
+        key.CreateEnableColorTemperatureAttr(True)
+        key.CreateColorTemperatureAttr(args.key_temperature)
+        key.CreateAngleAttr(args.key_angle)
+        key.AddRotateXYZOp().Set(Gf.Vec3f(*args.key_rotation))
 
         camera = Camera(
             prim_path="/World/SynthesisCamera",
@@ -409,6 +419,15 @@ def render(args: argparse.Namespace) -> dict[str, object]:
             "source_resolution": [source_width, source_height],
             "source_fps": source_fps,
             "focal_length_px": float(hand_trajectory.intrinsic[0, 0]),
+            "lighting": {
+                "dome_intensity": args.dome_intensity,
+                "dome_temperature_kelvin": args.dome_temperature,
+                "key_type": "UsdLux.DistantLight",
+                "key_intensity": args.key_intensity,
+                "key_temperature_kelvin": args.key_temperature,
+                "key_angle_degrees": args.key_angle,
+                "key_rotation_xyz_degrees": list(args.key_rotation),
+            },
             "joint_count": len(isaac_joint_names),
             "joint_names": isaac_joint_names,
             "first_frame_diagnostics": first_frame_diagnostics,
@@ -445,6 +464,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--renderer",
         choices=("RaytracedLighting", "PathTracing"),
         default="RaytracedLighting",
+    )
+    parser.add_argument("--dome-intensity", type=float, default=900.0)
+    parser.add_argument("--dome-temperature", type=float, default=4300.0)
+    parser.add_argument("--key-intensity", type=float, default=180.0)
+    parser.add_argument("--key-temperature", type=float, default=4500.0)
+    parser.add_argument("--key-angle", type=float, default=8.0)
+    parser.add_argument(
+        "--key-rotation",
+        type=float,
+        nargs=3,
+        metavar=("X", "Y", "Z"),
+        default=(-20.0, 15.0, 0.0),
     )
     parser.add_argument("--max-frames", type=int)
     parser.add_argument(

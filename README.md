@@ -47,7 +47,8 @@ The Isaac version keeps MuJoCo/Mink as the source of truth for IK and forward
 kinematics. It imports the G1 arms into Isaac Sim, writes every MuJoCo body pose
 directly to the USD stage, and uses Isaac Sim only for camera rendering. PhysX
 is intentionally not stepped, so its joint integration cannot drift away from
-the solved MuJoCo trajectory.
+the solved MuJoCo trajectory. The default lighting is one fixed warm DomeLight
+(4300 K) plus a soft overhead key (4500 K); there is no per-frame white balance.
 
 After generating (or reusing) `g1/g1_trajectory.npz`, render all 126 frames:
 
@@ -57,7 +58,7 @@ After generating (or reusing) `g1/g1_trajectory.npz`, render all 126 frames:
   --mjcf assets/unitree_description/mjcf/g1.xml \
   --video dataset/test/basic_pick_place/0.mp4 \
   --hdf5 dataset/test/basic_pick_place/0.hdf5 \
-  --output outputs/basic_pick_place_0/g1_isaacsim
+  --output outputs/basic_pick_place_0/g1_isaacsim_warm
 ```
 
 Composite the Isaac RGB, mask, and metric depth into the ProPainter result:
@@ -67,9 +68,13 @@ Composite the Isaac RGB, mask, and metric depth into the ProPainter result:
   --source-video dataset/test/basic_pick_place/0.mp4 \
   --inpaint-video outputs/basic_pick_place_0/propainter/0/inpaint_out.mp4 \
   --hdf5 dataset/test/basic_pick_place/0.hdf5 \
-  --g1-root outputs/basic_pick_place_0/g1_isaacsim \
+  --g1-root outputs/basic_pick_place_0/g1_isaacsim_warm \
   --object-masks outputs/basic_pick_place_0/sam3/object_masks \
-  --output outputs/basic_pick_place_0/final_isaacsim
+  --output outputs/basic_pick_place_0/final_isaacsim_warm \
+  --robot-exposure -0.10 \
+  --robot-contrast 0.92 \
+  --robot-saturation 0.82 \
+  --robot-soften-sigma 0.55
 ```
 
 
