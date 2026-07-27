@@ -577,9 +577,7 @@ def _prepare_episode(
             "--threshold",
             str(args.sam_threshold),
         ]
-        if args.object_prompt is None:
-            sam_command.append("--skip-object")
-        else:
+        if args.object_prompt is not None:
             assert object_prompt_frame is not None
             sam_command.extend(
                 [
@@ -717,7 +715,6 @@ def _prepare_episode(
 
     observation = estimate_lighting_profile(
         inpaint_video=inpaint_video,
-        output_path=output / "_unused_episode_profile.json",
         reliability_mask_root=sam_root / "arm_masks",
         sample_count=args.lighting_sample_count,
         max_dimension=args.lighting_max_dimension,
@@ -1362,7 +1359,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
         "--backend",
-        "--render-backend",
         dest="backend",
         choices=("mujoco", "isaacsim"),
         default="mujoco",

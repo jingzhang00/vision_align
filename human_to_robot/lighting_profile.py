@@ -32,6 +32,25 @@ DEFAULT_COMPOSITE_PROFILE: dict[str, object] = {
 }
 
 
+def _write_profile(
+    path: Path,
+    profile: dict[str, Any],
+    *,
+    skip_if_unchanged: bool = False,
+) -> None:
+    serialized = json.dumps(profile, indent=2)
+    if (
+        skip_if_unchanged
+        and path.is_file()
+        and path.read_text(encoding="utf-8") == serialized
+    ):
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(serialized, encoding="utf-8")
+    os.replace(temporary, path)
+
+
 def load_lighting_profile(path: Path | None) -> dict[str, Any] | None:
     if path is None:
         return None
@@ -70,14 +89,6 @@ def _srgb_to_linear(rgb: np.ndarray) -> np.ndarray:
         rgb <= 0.04045,
         rgb / 12.92,
         ((rgb + 0.055) / 1.055) ** 2.4,
-    )
-
-
-def _linear_to_srgb(rgb: np.ndarray) -> np.ndarray:
-    return np.where(
-        rgb <= 0.0031308,
-        12.92 * rgb,
-        1.055 * np.maximum(rgb, 0.0) ** (1.0 / 2.4) - 0.055,
     )
 
 
@@ -344,12 +355,14 @@ def _write_diagnostic(
 def estimate_lighting_profile(
     *,
     inpaint_video: Path,
-    output_path: Path,
+    output_path: Path | None = None,
     reliability_mask_root: Path | None = None,
     sample_count: int = 16,
     max_dimension: int = 384,
     write_artifacts: bool = True,
 ) -> dict[str, Any]:
+    if write_artifacts and output_path is None:
+        raise ValueError("output_path is required when write_artifacts is enabled")
     if sample_count < 3:
         raise ValueError("sample_count must be at least 3")
     if max_dimension < 64:
@@ -490,8 +503,13 @@ def estimate_lighting_profile(
     if not brightness_reliable:
         dome_intensity, key_intensity = 900.0, 180.0
 
-    diagnostic_path = output_path.with_name(f"{output_path.stem}_samples.jpg")
+    diagnostic_path = (
+        output_path.with_name(f"{output_path.stem}_samples.jpg")
+        if output_path is not None
+        else None
+    )
     if write_artifacts:
+        assert diagnostic_path is not None
         _write_diagnostic(diagnostic_path, frames, selected_masks, indices)
     observed_srgb = np.clip(robust_srgb, 0.0, 1.0)
     profile: dict[str, Any] = {
@@ -516,7 +534,9 @@ def estimate_lighting_profile(
             "sample_indices": indices,
             "analysis_max_dimension": max_dimension,
             "diagnostic_image": (
-                str(diagnostic_path.resolve()) if write_artifacts else None
+                str(diagnostic_path.resolve())
+                if diagnostic_path is not None
+                else None
             ),
             "reliability_mask_directory": (
                 str(reliability_mask_root.resolve())
@@ -565,8 +585,9 @@ def estimate_lighting_profile(
         "composite": dict(DEFAULT_COMPOSITE_PROFILE),
     }
     if write_artifacts:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(json.dumps(profile, indent=2), encoding="utf-8")
+        if output_path is None:
+            raise RuntimeError("validated output_path unexpectedly missing")
+        _write_profile(output_path, profile)
     return profile
 
 
@@ -750,15 +771,7 @@ def aggregate_task_lighting_profiles(
         },
         "composite": dict(DEFAULT_COMPOSITE_PROFILE),
     }
-    serialized_profile = json.dumps(task_profile, indent=2)
-    if (
-        not output_path.is_file()
-        or output_path.read_text(encoding="utf-8") != serialized_profile
-    ):
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = output_path.with_name(f".{output_path.name}.tmp")
-        temporary.write_text(serialized_profile, encoding="utf-8")
-        os.replace(temporary, output_path)
+    _write_profile(output_path, task_profile, skip_if_unchanged=True)
     return task_profile
 
 

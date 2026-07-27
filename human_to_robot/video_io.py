@@ -18,45 +18,6 @@ def video_metadata(path: str | Path) -> tuple[int, int, int, float]:
     return width, height, count, fps
 
 
-def transcode_video(
-    source: str | Path,
-    destination: str | Path,
-    *,
-    width: int,
-    height: int,
-) -> tuple[int, float]:
-    source = Path(source)
-    destination = Path(destination)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-
-    capture = cv2.VideoCapture(str(source))
-    if not capture.isOpened():
-        raise FileNotFoundError(f"Could not open video: {source}")
-    fps = float(capture.get(cv2.CAP_PROP_FPS))
-    expected = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
-    writer = cv2.VideoWriter(
-        str(destination),
-        cv2.VideoWriter_fourcc(*"mp4v"),
-        fps,
-        (width, height),
-    )
-    if not writer.isOpened():
-        raise RuntimeError(f"Could not create video: {destination}")
-
-    count = 0
-    while True:
-        ok, frame = capture.read()
-        if not ok:
-            break
-        writer.write(cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA))
-        count += 1
-    capture.release()
-    writer.release()
-    if expected and count != expected:
-        raise RuntimeError(f"Decoded {count} frames but metadata advertised {expected}")
-    return count, fps
-
-
 def read_video(path: str | Path) -> tuple[list[np.ndarray], float]:
     capture = cv2.VideoCapture(str(path))
     if not capture.isOpened():

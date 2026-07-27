@@ -9,11 +9,6 @@ import h5py
 import numpy as np
 
 
-DEFAULT_PATHS = [
-    # Path("/home/ai01/Downloads/vision_align/dataset/part2-basic_pick_place-20125_000"),
-    Path("/home/ai01/Downloads/vision_align/dataset/test/add_remove_lid/0.hdf5"),
-]
-
 def is_camera_name(name: str) -> bool:
     return "camera" in name.lower()
 
@@ -97,14 +92,15 @@ def main() -> int:
     )
     parser.add_argument(
         "paths",
-        nargs="*",
+        nargs="+",
         type=Path,
-        help="HDF5 file or directory to check (default: check two default paths)",
+        help="HDF5 file or directory to check",
     )
     args = parser.parse_args()
 
-    targets = args.paths or DEFAULT_PATHS
-    results = [inspect_target(path.expanduser().resolve()) for path in targets]
+    results = [
+        inspect_target(path.expanduser().resolve()) for path in args.paths
+    ]
     return 0 if all(results) else 1
 
 

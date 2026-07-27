@@ -144,9 +144,8 @@ Current prototype limitations:
   tool/contact offset. Wrist rotation uses the rigid hand frame, but finger
   articulation is still absent.
 - ProPainter removes the person well but can retain the original arm shadows.
-- The optional SAM3 stapler mask loses the object under heavy hand occlusion;
-  the source object is nevertheless mostly retained because the arm mask does
-  not include its black pixels.
+- Optional held-object masks can lose the object under heavy hand occlusion;
+  object segmentation is disabled unless `--object-prompt` is supplied.
 - Only robot arms are rendered. This avoids the head/torso entering the
   egocentric camera while the waist bends.
 
@@ -155,6 +154,4 @@ Current prototype limitations:
 ```bash
 .venv/bin/python -m mujoco.viewer \
   --mjcf=assets/unitree_description/mjcf/g1.xml
-
-uv run examples/arm_ur5e.py
 ```

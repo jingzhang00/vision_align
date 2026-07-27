@@ -123,10 +123,10 @@ def run_sam3_segmentation(
     video_path: Path,
     checkpoint_path: Path,
     output_root: Path,
-    arm_prompt: str | None = "human arm",
+    arm_prompt: str = "human arm",
     arm_prompt_frame: int = 0,
-    object_prompt: str | None = "black stapler",
-    object_prompt_frame: int = 60,
+    object_prompt: str | None = None,
+    object_prompt_frame: int | None = None,
     threshold: float = 0.45,
 ) -> dict[str, Any]:
     from sam3.model_builder import build_sam3_video_predictor
@@ -140,33 +140,37 @@ def run_sam3_segmentation(
         gpus_to_use=[0],
     )
     try:
-        arm_masks: list[np.ndarray] | None = None
-        if arm_prompt:
-            arm_masks = _segment_concept(
-                predictor,
-                video_path,
-                prompt=arm_prompt,
-                prompt_frame=arm_prompt_frame,
-                frame_count=frame_count,
-                height=height,
-                width=width,
-                threshold=threshold,
-            )
-            _write_masks(output_root / "arm_masks", arm_masks)
-            _write_overlay(
-                video_path,
-                arm_masks,
-                output_root / "arm_masks_overlay.mp4",
-                (40, 40, 255),
-            )
+        arm_masks = _segment_concept(
+            predictor,
+            video_path,
+            prompt=arm_prompt,
+            prompt_frame=arm_prompt_frame,
+            frame_count=frame_count,
+            height=height,
+            width=width,
+            threshold=threshold,
+        )
+        _write_masks(output_root / "arm_masks", arm_masks)
+        _write_overlay(
+            video_path,
+            arm_masks,
+            output_root / "arm_masks_overlay.mp4",
+            (40, 40, 255),
+        )
 
         object_masks: list[np.ndarray] | None = None
+        resolved_object_frame: int | None = None
         if object_prompt:
+            resolved_object_frame = (
+                object_prompt_frame
+                if object_prompt_frame is not None
+                else arm_prompt_frame
+            )
             object_masks = _segment_concept(
                 predictor,
                 video_path,
                 prompt=object_prompt,
-                prompt_frame=object_prompt_frame,
+                prompt_frame=resolved_object_frame,
                 frame_count=frame_count,
                 height=height,
                 width=width,
@@ -195,13 +199,11 @@ def run_sam3_segmentation(
         "arm_prompt": arm_prompt,
         "arm_prompt_frame": arm_prompt_frame,
         "object_prompt": object_prompt,
-        "object_prompt_frame": object_prompt_frame if object_prompt else None,
+        "object_prompt_frame": resolved_object_frame,
         "threshold": threshold,
-        "arm_area_fraction": (
-            [float(np.count_nonzero(mask) / mask.size) for mask in arm_masks]
-            if arm_masks is not None
-            else None
-        ),
+        "arm_area_fraction": [
+            float(np.count_nonzero(mask) / mask.size) for mask in arm_masks
+        ],
         "object_area_fraction": (
             [float(np.count_nonzero(mask) / mask.size) for mask in object_masks]
             if object_masks is not None
@@ -222,19 +224,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--arm-prompt", default="human arm")
     parser.add_argument("--arm-prompt-frame", type=int, default=0)
-    parser.add_argument("--object-prompt", default="black stapler")
-    parser.add_argument("--object-prompt-frame", type=int, default=60)
+    parser.add_argument("--object-prompt")
+    parser.add_argument("--object-prompt-frame", type=int)
     parser.add_argument("--threshold", type=float, default=0.45)
-    parser.add_argument(
-        "--skip-arm",
-        action="store_true",
-        help="Skip arm segmentation (useful for an additional object-only pass)",
-    )
-    parser.add_argument(
-        "--skip-object",
-        action="store_true",
-        help="Do not run the optional held-object mask used by depth compositing",
-    )
     return parser
 
 
@@ -244,9 +236,9 @@ def main() -> None:
         video_path=args.video.resolve(),
         checkpoint_path=args.checkpoint.resolve(),
         output_root=args.output.resolve(),
-        arm_prompt=None if args.skip_arm else args.arm_prompt,
+        arm_prompt=args.arm_prompt,
         arm_prompt_frame=args.arm_prompt_frame,
-        object_prompt=None if args.skip_object else args.object_prompt,
+        object_prompt=args.object_prompt,
         object_prompt_frame=args.object_prompt_frame,
         threshold=args.threshold,
     )
