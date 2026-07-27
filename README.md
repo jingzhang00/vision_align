@@ -10,12 +10,16 @@ models/sam3/sam3.pt
 ProPainter/weights/raft-things.pth
 ProPainter/weights/recurrent_flow_completion.pth
 ProPainter/weights/ProPainter.pth
+mano_v1_2/
 ```
 
 Every episode HDF5 must provide 3D transforms and confidences for
 `Hand`, `ThumbTip`, `IndexFingerTip`, and `MiddleFingerTip` on both sides,
 with at least two valid frames per hand. Episodes without these annotations
-are rejected before segmentation or inpainting starts.
+are rejected before segmentation or inpainting starts. The default hand
+controller evaluates these four landmarks independently on every frame and
+maps the resulting exact binary action to the six independent LinkerHand O6
+motors. `--no-binary-hands` selects the continuous-width fallback.
 
 ### Folder pipeline
 
@@ -43,8 +47,7 @@ Run every task recursively under a dataset root:
 .venv/bin/python -m human_to_robot.pipeline \
   --folder dataset/basic_pick_place \
   --output outputs/ \
-  --isaacsim-root /home/ai01/isaacsim \
-  --debug
+  --isaacsim-root /home/ai01/isaacsim
 ```
 
 ```bash
@@ -59,6 +62,8 @@ options:
 `--debug`: to retain masks, inpainted video, trajectory, render
 frames, logs, lighting profiles, and JSON reports.
 `--no-reuse`: to force regeneration
+`--no-binary-hands`: to use continuous fingertip-width articulation instead
+of the default full-chain binary O6 controller.
 `--no-hardware-encoding`: to force software encoding. Be default, use NVIDIA NVENC hardware acceleration, If NVENC is
 unavailable at runtime, the pipeline automatically falls back to the source
 codec (or software H.264).
@@ -66,7 +71,10 @@ codec (or software H.264).
 
 ProPainter keeps the requested output canvas (1280×720 by default), but no
 longer loads a whole long episode at that resolution in one invocation. The
-pipeline groups non-empty arm-mask intervals into temporal chunks, adds
+SAM arm-mask sequence first repairs one- or two-frame area collapses only when
+the masks on both sides agree in area and location. This prevents a prompt
+boundary dropout from leaking the original hand into ProPainter.
+The pipeline groups non-empty arm-mask intervals into temporal chunks, adds
 context, crops one fixed padded ROI per chunk, runs the unmodified ProPainter
 inside that ROI, and pastes only the repaired mask region back into the full
 canvas. `--propainter-subvideo-length` also acts as the 1280×720-equivalent
@@ -142,28 +150,36 @@ The action-alignment helper implements the paper's equations: it builds a
 virtual finger from the index and middle fingertips, places the end effector
 midway between it and the thumb, derives a right-handed grasp frame, smooths
 position/width with Savitzky-Golay filtering, and smooths orientation on
-SO(3). The production arm IK deliberately uses the stable HDF5 `leftHand` and
-`rightHand` rigid-body tracks for position and rotation; only the paper's
-fingertip-derived width drives hand articulation. This keeps noisy finger
-detections from changing the arm trajectory.
+SO(3). With full articulated tracks, production IK targets this grasp frame
+directly. The robot TCP origin follows the current O6
+thumb/virtual-finger midpoint, while its semantic gripper basis is fixed from
+the open hand. Fixing that basis prevents curled fingertips from introducing
+a false 80–170 degree orientation flip. The stable HDF5 `leftHand` and
+`rightHand` tracks still supply visibility and tracking confidence.
 
 Pinocchio solves the fixed-base G1 arm/body coordinates while freezing all 22
-LinkerHand joints from arm IK. The paper's continuous smoothed width `w_t` is
-scaled with the scene and mapped through a URDF-calibrated, monotonic
-fingertip-aperture curve to continuous hand joint values. No per-episode binary
-threshold is used. The full model has 51 actuated coordinates. Isaac's URDF
-importer creates the arm-and-hand visuals, and the renderer writes precomputed
-Pinocchio link poses to the USD stage. The project has no MuJoCo or Mink runtime
-dependency. PhysX is intentionally not stepped, so its integration cannot
-drift from the solved trajectory.
+LinkerHand joints from arm IK. Binary grasp inference uses the paper's
+per-frame virtual-finger aperture divided by the wrist-to-virtual-finger
+length. A visible operation hand is closed exactly when this ratio is at most
+`3/8`; the 0/1 result drives the O6 open/power-fist preset directly. There is
+no event detector, temporal latch, interpolation, hysteresis, or actuator
+blend in this binary path. `--no-binary-hands` maps the paper's continuous
+smoothed width `w_t` through the calibrated monotonic aperture curve instead.
+The full model has 51 actuated coordinates. Isaac's URDF importer creates the
+arm-and-hand visuals, and the renderer writes precomputed Pinocchio link poses
+to the USD stage. The project has no MuJoCo or Mink runtime dependency. PhysX
+is intentionally not stepped, so its integration cannot drift from the solved
+trajectory.
 Isaac consumes the shared task profile for its fixed DomeLight and key light,
 and the compositor uses the same profile for one fixed grade over the episode.
 This is a bounded display match, not physical inverse rendering.
 
 Current prototype limitations:
 
-- LinkerHand articulation follows one calibrated scalar aperture per hand;
-  independent finger shapes and contact forces are not reconstructed.
+- Binary LinkerHand articulation selects one six-motor power-fist preset per
+  hand; independent finger intent and contact forces are not reconstructed.
+- The URDF full-close preset is valid for simulation. Real hardware still
+  needs device-specific angle, current, and contact calibration.
 - Episodes without complete 3D wrist and fingertip annotations are unsupported.
 - ProPainter removes the person well but can retain the original arm shadows.
 - Optional held-object masks can lose the object under heavy hand occlusion;

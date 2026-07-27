@@ -38,6 +38,117 @@ def union_output_masks(
     return union
 
 
+def repair_temporal_mask_dropouts(
+    masks: list[np.ndarray],
+    *,
+    max_gap: int = 2,
+    collapse_area_ratio: float = 0.6,
+    neighbor_overlap_threshold: float = 0.65,
+    neighbor_area_ratio: float = 0.5,
+) -> tuple[list[np.ndarray], list[int]]:
+    """Repair very short SAM mask collapses bracketed by consistent masks.
+
+    A frame is repaired only when all masks in a run of at most ``max_gap``
+    frames have abruptly lost most of their area, while the masks immediately
+    before and after the run have similar area and overlap after allowing for a
+    small amount of inter-frame motion.  This deliberately does not extrapolate
+    masks at sequence boundaries or across a sustained disappearance.
+    """
+
+    if max_gap < 1:
+        raise ValueError("max_gap must be at least 1")
+    for name, value in (
+        ("collapse_area_ratio", collapse_area_ratio),
+        ("neighbor_overlap_threshold", neighbor_overlap_threshold),
+        ("neighbor_area_ratio", neighbor_area_ratio),
+    ):
+        if not 0.0 < value <= 1.0:
+            raise ValueError(f"{name} must be in (0, 1]")
+    if not masks:
+        return [], []
+
+    shape = masks[0].shape
+    if len(shape) != 2:
+        raise ValueError(f"Masks must be two-dimensional; got {shape}")
+    if any(mask.shape != shape for mask in masks):
+        raise ValueError("All temporal masks must have the same shape")
+
+    source = [np.asarray(mask) != 0 for mask in masks]
+    repaired = [np.asarray(mask).copy() for mask in masks]
+    repaired_indices: set[int] = set()
+    height, width = shape
+    motion_radius = max(1, int(round(min(height, width) * 0.005)))
+    motion_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (2 * motion_radius + 1, 2 * motion_radius + 1),
+    )
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    minimum_area = max(4, int(round(height * width * 1e-5)))
+
+    def _dilate(mask: np.ndarray) -> np.ndarray:
+        return cv2.dilate(mask.astype(np.uint8), motion_kernel) != 0
+
+    for gap_length in range(1, max_gap + 1):
+        for start in range(1, len(source) - gap_length):
+            end = start + gap_length
+            frame_indices = range(start, end)
+            if any(index in repaired_indices for index in frame_indices):
+                continue
+
+            previous = source[start - 1]
+            following = source[end]
+            previous_area = int(np.count_nonzero(previous))
+            following_area = int(np.count_nonzero(following))
+            if min(previous_area, following_area) < minimum_area:
+                continue
+            if (
+                min(previous_area, following_area)
+                / max(previous_area, following_area)
+                < neighbor_area_ratio
+            ):
+                continue
+
+            dilated_previous = _dilate(previous)
+            dilated_following = _dilate(following)
+            previous_overlap = (
+                np.count_nonzero(previous & dilated_following) / previous_area
+            )
+            following_overlap = (
+                np.count_nonzero(following & dilated_previous) / following_area
+            )
+            if (
+                min(previous_overlap, following_overlap)
+                < neighbor_overlap_threshold
+            ):
+                continue
+
+            expected_area = 0.5 * (previous_area + following_area)
+            if any(
+                np.count_nonzero(source[index])
+                > collapse_area_ratio * expected_area
+                for index in frame_indices
+            ):
+                continue
+
+            reconstructed = cv2.bitwise_or(
+                previous.astype(np.uint8) * 255,
+                following.astype(np.uint8) * 255,
+            )
+            reconstructed = cv2.morphologyEx(
+                reconstructed,
+                cv2.MORPH_CLOSE,
+                close_kernel,
+            )
+            for index in frame_indices:
+                repaired[index] = cv2.bitwise_or(
+                    (source[index].astype(np.uint8) * 255),
+                    reconstructed,
+                )
+                repaired_indices.add(index)
+
+    return repaired, sorted(repaired_indices)
+
+
 def _write_masks(directory: Path, masks: list[np.ndarray]) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     for index, mask in enumerate(masks):
@@ -160,6 +271,9 @@ def run_sam3_segmentation(
             width=width,
             threshold=threshold,
         )
+        arm_masks, arm_temporal_repair_frames = repair_temporal_mask_dropouts(
+            arm_masks
+        )
         _write_masks(output_root / "arm_masks", arm_masks)
         if debug_artifacts:
             _write_overlay(
@@ -216,6 +330,7 @@ def run_sam3_segmentation(
         "object_prompt_frame": resolved_object_frame,
         "threshold": threshold,
         "hardware_encoding": hardware_encoding,
+        "arm_temporal_repair_frames": arm_temporal_repair_frames,
         "arm_area_fraction": [
             float(np.count_nonzero(mask) / mask.size) for mask in arm_masks
         ],

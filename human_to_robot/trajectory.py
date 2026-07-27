@@ -19,18 +19,22 @@ HAND_KEYPOINT_NAMES = (
 
 @dataclass(frozen=True)
 class HandTrajectory:
-    """Wrist IK targets plus continuous hand widths in the first camera frame.
+    """Wrist tracks and paper action targets in the first camera frame.
 
-    The end-effector position, orientation, visibility, and confidence come
-    from the stable ``*Hand`` rigid-body tracks. Finger keypoints are used only
-    to estimate the paper's continuous jaw width ``w_t``. This separation
-    ensures that enabling articulated hands cannot change the arm IK targets.
+    The stable ``*Hand`` rigid-body tracks remain available for visibility and
+    tracking confidence.  ``*_action_reference_*`` stores the paper's
+    fingertip-derived grasp frame ``(p, R)`` and is the operational target used
+    when a dexterous hand supplies a matching jaw/TCP frame.
     """
 
     left_reference_camera: np.ndarray
     right_reference_camera: np.ndarray
     left_reference_rotations: np.ndarray
     right_reference_rotations: np.ndarray
+    left_action_reference_camera: np.ndarray
+    right_action_reference_camera: np.ndarray
+    left_action_reference_rotations: np.ndarray
+    right_action_reference_rotations: np.ndarray
     left_widths: np.ndarray
     right_widths: np.ndarray
     left_normalized_widths: np.ndarray
@@ -548,6 +552,10 @@ def load_hand_trajectory(
         right_reference_camera=right_position,
         left_reference_rotations=left_rotation,
         right_reference_rotations=right_rotation,
+        left_action_reference_camera=left.position,
+        right_action_reference_camera=right.position,
+        left_action_reference_rotations=left.rotation,
+        right_action_reference_rotations=right.rotation,
         left_widths=left.width,
         right_widths=right.width,
         left_normalized_widths=left.normalized_width,

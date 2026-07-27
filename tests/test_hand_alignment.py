@@ -13,6 +13,8 @@ from human_to_robot.retarget_g1_pinocchio import (
     HAND_JOINTS,
     PALM_OFFSET_FROM_WRIST,
     _active_velocity_indices,
+    _hand_tcp_transforms,
+    _map_action_targets,
     _retarget_hand_widths,
     _set_continuous_hand_configuration,
     build_pinocchio_g1,
@@ -484,6 +486,119 @@ class LinkerHandUrdfTests(unittest.TestCase):
             self.assertLess(
                 profile["maximum_calibrated_closure"],
                 1.0,
+            )
+
+    def test_binary_tcp_keeps_canonical_basis_while_origin_moves(self) -> None:
+        commands = np.array(
+            [
+                [0.0, 0.0],
+                [0.0, 0.5],
+                [0.0, 1.0],
+            ],
+            dtype=np.float64,
+        )
+
+        translations, rotations = _hand_tcp_transforms(
+            self.model,
+            commands,
+        )
+
+        self.assertEqual(translations.shape, (3, 2, 3))
+        self.assertEqual(rotations.shape, (2, 3, 3))
+        np.testing.assert_allclose(
+            np.einsum(
+                "nij,njk->nik",
+                np.transpose(rotations, (0, 2, 1)),
+                rotations,
+            ),
+            np.repeat(np.eye(3)[None], 2, axis=0),
+            atol=1e-12,
+        )
+        np.testing.assert_allclose(
+            np.linalg.det(rotations),
+            1.0,
+            atol=1e-12,
+        )
+        self.assertGreater(
+            float(np.linalg.norm(translations[2, 1] - translations[0, 1])),
+            0.01,
+        )
+        np.testing.assert_allclose(
+            translations[:, 0],
+            np.repeat(translations[0:1, 0], len(commands), axis=0),
+            atol=1e-12,
+        )
+
+    @unittest.skipUnless(
+        (REPOSITORY / "dataset/basic_pick_place/0.hdf5").exists(),
+        "local sample is not available",
+    )
+    def test_action_to_palm_tcp_mapping_round_trips(self) -> None:
+        trajectory = load_hand_trajectory(
+            REPOSITORY / "dataset/basic_pick_place/0.hdf5"
+        )
+        commands = np.zeros((trajectory.frame_count, 2), dtype=np.float64)
+        translations, tcp_rotations = _hand_tcp_transforms(
+            self.model,
+            commands,
+        )
+        (
+            left_grasp,
+            right_grasp,
+            left_grasp_rotation,
+            right_grasp_rotation,
+            left_palm,
+            right_palm,
+            left_palm_rotation,
+            right_palm_rotation,
+        ) = _map_action_targets(
+            trajectory,
+            0.84,
+            np.array([0.10, 0.0, 1.30]),
+            translations,
+            tcp_rotations,
+        )
+
+        for side_index, (
+            grasp,
+            grasp_rotation,
+            palm,
+            palm_rotation,
+        ) in enumerate(
+            (
+                (
+                    left_grasp,
+                    left_grasp_rotation,
+                    left_palm,
+                    left_palm_rotation,
+                ),
+                (
+                    right_grasp,
+                    right_grasp_rotation,
+                    right_palm,
+                    right_palm_rotation,
+                ),
+            )
+        ):
+            reconstructed_rotation = np.einsum(
+                "nij,jk->nik",
+                palm_rotation,
+                tcp_rotations[side_index],
+            )
+            reconstructed_position = palm + np.einsum(
+                "nij,nj->ni",
+                palm_rotation,
+                translations[:, side_index],
+            )
+            np.testing.assert_allclose(
+                reconstructed_rotation,
+                grasp_rotation,
+                atol=1e-12,
+            )
+            np.testing.assert_allclose(
+                reconstructed_position,
+                grasp,
+                atol=1e-12,
             )
 
     def test_every_urdf_mesh_path_exists(self) -> None:
