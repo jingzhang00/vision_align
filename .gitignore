@@ -9,6 +9,7 @@ models/
 dataset/
 outputs/
 assets/unitree_description/meshes/g1/*_tmp/
-
+.DS_Store
+._*
 # Virtual environments
 .venv

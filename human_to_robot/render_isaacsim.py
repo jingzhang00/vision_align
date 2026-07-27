@@ -16,7 +16,7 @@ from .lighting_profile import (
 )
 
 
-ARM_MESHES = {
+ARM_LINKS = {
     f"{side}_{link}"
     for side in ("left", "right")
     for link in (
@@ -27,61 +27,111 @@ ARM_MESHES = {
         "wrist_roll_link",
         "wrist_pitch_link",
         "wrist_yaw_link",
-        "rubber_hand",
     )
 }
 
+HAND_LINK_PREFIXES = tuple(
+    f"{side}_{part}"
+    for side in ("left", "right")
+    for part in (
+        "hand_",
+        "thumb_",
+        "index_",
+        "middle_",
+        "ring_",
+        "pinky_",
+    )
+)
 
-def _build_arm_only_mjcf(source: Path, destination: Path) -> None:
-    """Keep G1 kinematics intact while removing every non-arm render geom."""
 
+def _is_render_link(name: str) -> bool:
+    return name in ARM_LINKS or name.startswith(HAND_LINK_PREFIXES)
+
+
+def _resolve_urdf_mesh(source: Path, filename: str) -> Path:
+    mesh_path = Path(filename)
+    if mesh_path.is_absolute():
+        resolved = mesh_path.resolve()
+    else:
+        parts = mesh_path.parts
+        if (
+            len(parts) >= 4
+            and parts[0].lower() == "linker_hand_o6"
+            and parts[1] in {"left", "right"}
+            and parts[2] == "meshes"
+        ):
+            resolved = (
+                source.parent.parent
+                / "hand"
+                / f"{parts[1]}_hand"
+                / "meshes"
+                / Path(*parts[3:])
+            ).resolve()
+        else:
+            resolved = (source.parent / mesh_path).resolve()
+    if not resolved.is_file():
+        raise FileNotFoundError(
+            f"URDF mesh does not exist: {filename} -> {resolved}"
+        )
+    return resolved
+
+
+def _build_arm_hand_urdf(
+    source: Path,
+    destination: Path,
+) -> set[str]:
+    """Keep the complete G1 tree but render only both arms and new hands."""
+
+    source = source.resolve()
+    destination = destination.resolve()
     tree = ET.parse(source)
     root = tree.getroot()
-    compiler = root.find("compiler")
-    if compiler is None:
-        raise ValueError(f"No <compiler> element in {source}")
-    mesh_directory = (source.parent / "../meshes/g1").resolve()
-    compiler.set(
-        "meshdir",
-        os.path.relpath(mesh_directory, start=destination.parent.resolve()),
-    )
+    if root.tag != "robot" or not root.get("name"):
+        raise ValueError(f"Invalid robot URDF: {source}")
 
-    worldbodies = root.findall("worldbody")
-    if not worldbodies:
-        raise ValueError(f"No <worldbody> element in {source}")
-    for worldbody in worldbodies:
-        for parent in worldbody.iter():
-            for geom in list(parent.findall("geom")):
-                mesh = geom.get("mesh")
-                if geom.get("class") != "visual" or mesh not in ARM_MESHES:
-                    parent.remove(geom)
-            for light in list(parent.findall("light")):
-                parent.remove(light)
+    retained_links: set[str] = set()
+    for link in root.findall("link"):
+        link_name = link.get("name")
+        if not link_name:
+            raise ValueError(f"URDF contains an unnamed link: {source}")
+        if not _is_render_link(link_name):
+            for element_name in ("visual", "collision"):
+                for element in list(link.findall(element_name)):
+                    link.remove(element)
+            continue
 
-    # Isaac's MJCF importer converts every declared mesh, including unused
-    # assets. Remove non-arm assets so it does not create *_tmp USD caches for
-    # the torso and legs next to the source STL files.
-    for asset in root.findall("asset"):
-        for mesh in list(asset.findall("mesh")):
-            if mesh.get("name") not in ARM_MESHES:
-                asset.remove(mesh)
-    for contact in root.findall("contact"):
-        root.remove(contact)
+        if link.find("visual") is not None:
+            retained_links.add(link_name)
+        for mesh in link.findall("./visual/geometry/mesh") + link.findall(
+            "./collision/geometry/mesh"
+        ):
+            filename = mesh.get("filename")
+            if not filename:
+                raise ValueError(
+                    f"Mesh in {link_name} has no filename: {source}"
+                )
+            resolved = _resolve_urdf_mesh(source, filename)
+            mesh.set(
+                "filename",
+                os.path.relpath(resolved, start=destination.parent),
+            )
+
+    expected_hand_bases = {"left_hand_base_link", "right_hand_base_link"}
+    if not expected_hand_bases.issubset(retained_links):
+        missing = sorted(expected_hand_bases - retained_links)
+        raise ValueError(
+            "New G1 hand links are missing from the URDF: "
+            f"{', '.join(missing)}"
+        )
+    if not ARM_LINKS.issubset(retained_links):
+        missing = sorted(ARM_LINKS - retained_links)
+        raise ValueError(
+            f"G1 arm links are missing from the URDF: {', '.join(missing)}"
+        )
 
     destination.parent.mkdir(parents=True, exist_ok=True)
-    tree.write(destination, encoding="unicode")
-
-
-def _mjcf_body_names(mjcf: Path) -> list[str]:
-    tree = ET.parse(mjcf)
-    names = [
-        body.get("name")
-        for body in tree.getroot().findall(".//worldbody//body")
-        if body.get("name")
-    ]
-    if not names:
-        raise ValueError(f"No named bodies found in {mjcf}")
-    return names
+    tree.write(destination, encoding="utf-8", xml_declaration=True)
+    return retained_links
 
 
 def _validate_archive(archive: np.lib.npyio.NpzFile) -> int:
@@ -180,24 +230,27 @@ def render(args: argparse.Namespace) -> dict[str, object]:
 
     try:
         import cv2
+        import h5py
         import omni.kit.app
         import omni.kit.commands
         import omni.replicator.core as rep
         import omni.usd
         from isaacsim.sensors.camera import Camera
-        from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux
+        from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux, UsdPhysics
 
-        from .trajectory import load_single_point_trajectory
         from .video_io import video_metadata, write_video
 
         trajectory_path = args.trajectory.resolve()
-        source_mjcf = args.mjcf.resolve()
+        source_urdf = args.urdf.resolve()
         source_video = args.video.resolve()
         source_hdf5 = args.hdf5.resolve()
         output_root = args.output.resolve()
         output_root.mkdir(parents=True, exist_ok=True)
-        arm_mjcf = output_root / "g1_arms_isaacsim.xml"
-        _build_arm_only_mjcf(source_mjcf, arm_mjcf)
+        render_urdf = output_root / "g1_arms_hands_isaacsim.urdf"
+        visible_link_names = _build_arm_hand_urdf(
+            source_urdf,
+            render_urdf,
+        )
 
         archive = np.load(trajectory_path)
         total_frames = _validate_archive(archive)
@@ -211,31 +264,37 @@ def render(args: argparse.Namespace) -> dict[str, object]:
                 f"expected {(total_frames, len(archive_joint_names))}, "
                 f"got {qpos.shape}"
             )
-        body_names = _mjcf_body_names(source_mjcf)
         archived_link_names = [
             str(name) for name in archive["link_names"].tolist()
         ]
         link_indices = {
             name: index for index, name in enumerate(archived_link_names)
         }
-        body_link_indices: dict[str, int] = {}
-        for body_name in body_names:
-            if body_name not in link_indices:
-                raise ValueError(
-                    f"MJCF body has no archived Pinocchio pose: {body_name}"
-                )
-            body_link_indices[body_name] = link_indices[body_name]
+        if len(link_indices) != len(archived_link_names):
+            raise ValueError("Archived Pinocchio link names must be unique")
+        missing_visible_poses = sorted(visible_link_names - set(link_indices))
+        if missing_visible_poses:
+            raise ValueError(
+                "Rendered URDF links have no archived Pinocchio pose: "
+                f"{missing_visible_poses}"
+            )
         source_width, source_height, source_frame_count, source_fps = (
             video_metadata(source_video)
         )
-        hand_trajectory = load_single_point_trajectory(source_hdf5)
+        with h5py.File(source_hdf5, "r") as source_data:
+            intrinsic = np.asarray(
+                source_data["camera/intrinsic"], dtype=np.float64
+            )
+            hdf5_frame_count = int(
+                source_data["transforms/camera"].shape[0]
+            )
         if (
             source_frame_count != total_frames
-            or hand_trajectory.frame_count != total_frames
+            or hdf5_frame_count != total_frames
         ):
             raise ValueError(
                 "Video, HDF5, and qpos trajectory frame counts must agree: "
-                f"video={source_frame_count}, hdf5={hand_trajectory.frame_count}, "
+                f"video={source_frame_count}, hdf5={hdf5_frame_count}, "
                 f"qpos={total_frames}"
             )
         frame_count = (
@@ -245,7 +304,7 @@ def render(args: argparse.Namespace) -> dict[str, object]:
         )
         extension_manager = omni.kit.app.get_app().get_extension_manager()
         extension_manager.set_extension_enabled_immediate(
-            "isaacsim.asset.importer.mjcf", True
+            "isaacsim.asset.importer.urdf", True
         )
         extension_manager.set_extension_enabled_immediate(
             "isaacsim.sensors.camera", True
@@ -258,21 +317,42 @@ def render(args: argparse.Namespace) -> dict[str, object]:
         stage = context.get_stage()
 
         status, import_config = omni.kit.commands.execute(
-            "MJCFCreateImportConfig"
+            "URDFCreateImportConfig"
         )
         if not status:
-            raise RuntimeError("MJCFCreateImportConfig failed")
+            raise RuntimeError("URDFCreateImportConfig failed")
         import_config.set_fix_base(True)
         import_config.set_import_inertia_tensor(True)
-        imported = omni.kit.commands.execute(
-            "MJCFCreateAsset",
-            mjcf_path=str(arm_mjcf),
+        import_config.set_merge_fixed_joints(False)
+        import_config.set_parse_mimic(True)
+        import_config.set_self_collision(False)
+        import_config.set_collision_from_visuals(False)
+        import_config.set_create_physics_scene(False)
+        parsed, urdf_robot = omni.kit.commands.execute(
+            "URDFParseFile",
+            urdf_path=str(render_urdf),
             import_config=import_config,
-            prim_path="/World/G1",
         )
-        if not imported[0]:
-            raise RuntimeError("MJCFCreateAsset failed")
+        if not parsed or urdf_robot is None:
+            raise RuntimeError(f"URDFParseFile failed: {render_urdf}")
+        imported, robot_prim_path = omni.kit.commands.execute(
+            "URDFImportRobot",
+            urdf_path=str(render_urdf),
+            urdf_robot=urdf_robot,
+            import_config=import_config,
+            dest_path="",
+            get_articulation_root=False,
+        )
+        if not imported or not robot_prim_path:
+            raise RuntimeError(f"URDFImportRobot failed: {render_urdf}")
         simulation_app.update()
+        robot_prim_path = str(robot_prim_path)
+        robot_prim = stage.GetPrimAtPath(robot_prim_path)
+        if not robot_prim.IsValid():
+            raise RuntimeError(
+                "Isaac Sim returned an invalid URDF root path: "
+                f"{robot_prim_path}"
+            )
 
         dome = UsdLux.DomeLight.Define(stage, Sdf.Path("/World/DomeLight"))
         dome.CreateIntensityAttr(args.dome_intensity)
@@ -298,12 +378,59 @@ def render(args: argparse.Namespace) -> dict[str, object]:
         simulation_app.update()
         simulation_app.update()
 
+        prim_candidates: dict[str, list[object]] = {}
+        archive_link_set = set(archived_link_names)
+        archive_joint_set = set(archive_joint_names)
+        isaac_joint_names: set[str] = set()
+        for prim in Usd.PrimRange(
+            robot_prim, Usd.TraverseInstanceProxies()
+        ):
+            prim_name = prim.GetName()
+            if prim_name in archive_joint_set:
+                isaac_joint_names.add(prim_name)
+            if prim_name not in archive_link_set or prim.IsInstanceProxy():
+                continue
+            xformable = UsdGeom.Xformable(prim)
+            if not xformable.GetPrim().IsValid():
+                continue
+            prim_candidates.setdefault(prim_name, []).append(prim)
+
+        def candidate_score(prim: object) -> tuple[int, int, int]:
+            path = str(prim.GetPath())  # type: ignore[attr-defined]
+            is_render_child = int(
+                "/visuals/" in path
+                or "/collisions/" in path
+                or path.endswith("/visuals")
+                or path.endswith("/collisions")
+            )
+            is_rigid_body = int(
+                prim.HasAPI(UsdPhysics.RigidBodyAPI)  # type: ignore[attr-defined]
+            )
+            return (
+                is_rigid_body,
+                -is_render_child,
+                -path.count("/"),
+            )
+
+        selected_link_prims: dict[str, object] = {}
+        for link_name, candidates in prim_candidates.items():
+            selected_link_prims[link_name] = max(
+                candidates,
+                key=candidate_score,
+            )
+
+        missing_visible_prims = sorted(
+            visible_link_names - selected_link_prims.keys()
+        )
+        if missing_visible_prims:
+            raise RuntimeError(
+                "Isaac URDF import omitted rendered links: "
+                f"{missing_visible_prims}"
+            )
+
         body_pose_ops: list[tuple[int, object, object]] = []
-        for body_name, link_index in body_link_indices.items():
-            body_path = f"/World/G1/pelvis/{body_name}"
-            body_prim = stage.GetPrimAtPath(body_path)
-            if not body_prim.IsValid():
-                raise RuntimeError(f"Isaac Sim body prim not found: {body_path}")
+        for link_name, body_prim in selected_link_prims.items():
+            link_index = link_indices[link_name]
             xformable = UsdGeom.Xformable(body_prim)
             xformable.ClearXformOpOrder()
             translate_op = xformable.AddTranslateOp(
@@ -317,33 +444,31 @@ def render(args: argparse.Namespace) -> dict[str, object]:
             xformable.SetXformOpOrder([translate_op, orient_op])
             body_pose_ops.append((link_index, translate_op, orient_op))
 
-        isaac_joint_names = [
-            name
-            for name in archive_joint_names
-            if stage.GetPrimAtPath(f"/World/G1/joints/{name}").IsValid()
-        ]
+        matched_link_names = sorted(selected_link_prims)
+        missing_link_names = sorted(
+            archive_link_set - selected_link_prims.keys()
+        )
+        isaac_joint_name_list = sorted(isaac_joint_names)
+        missing_joint_names = sorted(
+            archive_joint_set - isaac_joint_names
+        )
         print(
-            f"Isaac Sim joints ({len(isaac_joint_names)}): "
-            f"{isaac_joint_names}",
+            "Isaac Sim URDF links matched by archive name "
+            f"({len(matched_link_names)}/{len(archived_link_names)}); "
+            f"missing={missing_link_names}",
             flush=True,
         )
-        missing_in_isaac = sorted(
-            set(archive_joint_names) - set(isaac_joint_names)
+        print(
+            "Isaac Sim URDF joints matched by archive name "
+            f"({len(isaac_joint_name_list)}/{len(archive_joint_names)}); "
+            f"missing={missing_joint_names}",
+            flush=True,
         )
-        extra_in_isaac = sorted(
-            set(isaac_joint_names) - set(archive_joint_names)
-        )
-        if missing_in_isaac or extra_in_isaac:
-            raise RuntimeError(
-                "Pinocchio/Isaac joint mismatch: "
-                f"missing_in_isaac={missing_in_isaac}, "
-                f"extra_in_isaac={extra_in_isaac}"
-            )
         # Match the OpenCV pinhole calibration. USD stores focal length and
         # aperture in the same arbitrary unit, so their ratio is what matters.
         horizontal_aperture = 20.955
         focal_length = (
-            float(hand_trajectory.intrinsic[0, 0])
+            float(intrinsic[0, 0])
             / float(source_width)
             * horizontal_aperture
         )
@@ -446,9 +571,7 @@ def render(args: argparse.Namespace) -> dict[str, object]:
                     useExtentsHint=False,
                 )
                 bbox_range = (
-                    bbox_cache.ComputeWorldBound(
-                        stage.GetPrimAtPath("/World/G1")
-                    )
+                    bbox_cache.ComputeWorldBound(robot_prim)
                     .ComputeAlignedRange()
                 )
                 actual_camera_pose = camera.get_world_pose(camera_axes="usd")
@@ -481,7 +604,7 @@ def render(args: argparse.Namespace) -> dict[str, object]:
             "resolution": [args.width, args.height],
             "source_resolution": [source_width, source_height],
             "source_fps": source_fps,
-            "focal_length_px": float(hand_trajectory.intrinsic[0, 0]),
+            "focal_length_px": float(intrinsic[0, 0]),
             "lighting": {
                 "profile": (
                     str(lighting_profile_path)
@@ -501,16 +624,23 @@ def render(args: argparse.Namespace) -> dict[str, object]:
                     else None
                 ),
             },
-            "joint_count": len(isaac_joint_names),
-            "joint_names": isaac_joint_names,
+            "joint_count": len(isaac_joint_name_list),
+            "joint_names": isaac_joint_name_list,
+            "missing_archive_joint_names": missing_joint_names,
+            "matched_link_count": len(matched_link_names),
+            "matched_link_names": matched_link_names,
+            "missing_archive_link_names": missing_link_names,
+            "visible_link_names": sorted(visible_link_names),
             "first_frame_diagnostics": first_frame_diagnostics,
             "mean_robot_area_fraction": float(np.mean(mask_fractions)),
             "max_robot_area_fraction": float(np.max(mask_fractions)),
             "trajectory": str(trajectory_path),
-            "mjcf": str(source_mjcf),
-            "arm_only_mjcf": str(arm_mjcf),
+            "urdf": str(source_urdf),
+            "render_urdf": str(render_urdf),
+            "robot_prim_path": robot_prim_path,
             "asset_import": (
-                "Isaac Sim MJCF importer; motion playback uses Pinocchio FK"
+                "Isaac Sim URDF importer; motion playback uses "
+                "precomputed Pinocchio link poses"
             ),
         }
         (output_root / "isaacsim_render_report.json").write_text(
@@ -530,7 +660,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Render a Pinocchio G1 IK trajectory with Isaac Sim 5.1"
     )
     parser.add_argument("--trajectory", type=Path, required=True)
-    parser.add_argument("--mjcf", type=Path, required=True)
+    parser.add_argument("--urdf", type=Path, required=True)
     parser.add_argument("--video", type=Path, required=True)
     parser.add_argument("--hdf5", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)

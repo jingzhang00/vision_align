@@ -24,6 +24,7 @@ from .lighting_profile import (
     aggregate_task_lighting_profiles,
     estimate_lighting_profile,
 )
+from .trajectory import hdf5_action_keypoint_availability
 from .video_io import video_metadata
 
 
@@ -640,6 +641,22 @@ def _trajectory_complete(path: Path, expected_count: int) -> bool:
         return False
 
 
+def _mano_keypoints_complete(path: Path, expected_count: int) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        with np.load(path) as archive:
+            return all(
+                archive[f"{side}_keypoints_camera"].shape
+                == (expected_count, 21, 3)
+                and archive[f"{side}_confidence"].shape
+                in {(expected_count,), (expected_count, 21)}
+                for side in ("left", "right")
+            )
+    except (OSError, KeyError, ValueError):
+        return False
+
+
 def _auto_arm_prompt_frame(hdf5_path: Path, frame_count: int) -> int:
     with h5py.File(hdf5_path, "r") as handle:
         left = np.asarray(handle["confidences/leftHand"], dtype=np.float32)
@@ -1136,6 +1153,62 @@ def _prepare_episode(
             f"ProPainter frame count changed for {episode.video}: "
             f"{frame_count} -> {inpaint_count}"
         )
+    hand_keypoints = hdf5_action_keypoint_availability(episode.hdf5)
+    needs_mano = not all(hand_keypoints.values())
+    mano_keypoints = g1_root / "mano_keypoints.npz"
+    if needs_mano and not _mano_keypoints_complete(
+        mano_keypoints, frame_count
+    ):
+        mano_root = (
+            args.mano_root.expanduser().resolve()
+            if args.mano_root is not None
+            else (repo / "mano_v1_2").resolve()
+        )
+        wilor_weights = (
+            args.wilor_weights.expanduser().resolve()
+            if args.wilor_weights is not None
+            else (repo / "models/wilor").resolve()
+        )
+        _validate_file(
+            mano_root / "models/MANO_RIGHT.pkl",
+            "MANO right-hand model",
+        )
+        estimator_environment = os.environ.copy()
+        estimator_environment.setdefault(
+            "TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1"
+        )
+        _run_logged(
+            [
+                python,
+                "-m",
+                "human_to_robot.estimate_mano_wilor",
+                "--video",
+                str(episode.video),
+                "--mano-root",
+                str(mano_root),
+                "--weights",
+                str(wilor_weights),
+                "--output",
+                str(mano_keypoints),
+            ],
+            cwd=repo,
+            environment=estimator_environment,
+            log_path=log_path,
+            progress=progress,
+            current_episode=episode_label,
+            episode_started=started,
+            stage_label="prepare",
+            frame_progress_pattern=r"MANO estimated (\d+)/(\d+)",
+            frame_progress_label="mano",
+        )
+        if not _mano_keypoints_complete(mano_keypoints, frame_count):
+            missing_sides = [
+                side for side, available in hand_keypoints.items() if not available
+            ]
+            raise RuntimeError(
+                "MANO hand estimation is incomplete for "
+                f"{', '.join(missing_sides)}: {mano_keypoints}"
+            )
     trajectory_ready = _trajectory_complete(
         g1_root / "g1_trajectory.npz", frame_count
     )
@@ -1166,6 +1239,10 @@ def _prepare_episode(
             "--output",
             str(g1_root),
         ]
+        if needs_mano:
+            retarget_command.extend(
+                ["--mano-keypoints", str(mano_keypoints)]
+            )
         _run_logged(
             retarget_command,
             cwd=repo,
@@ -1222,7 +1299,7 @@ def _render_episode(
     *,
     args: argparse.Namespace,
     repo: Path,
-    mjcf: Path,
+    urdf: Path,
     isaac_runtime: IsaacRuntime | None,
     task_profile_path: Path,
     progress: tqdm[Any],
@@ -1317,8 +1394,8 @@ def _render_episode(
                 "human_to_robot.render_isaacsim",
                 "--trajectory",
                 str(trajectory_path),
-                "--mjcf",
-                str(mjcf),
+                "--urdf",
+                str(urdf),
                 "--video",
                 str(episode.video),
                 "--hdf5",
@@ -1629,9 +1706,9 @@ def _run_pipeline(
     batch_started = time.perf_counter()
     repo = Path(__file__).resolve().parent.parent
     sam_checkpoint = (repo / "models/sam3/sam3.pt").resolve()
-    mjcf = (repo / "assets/unitree_description/mjcf/g1.xml").resolve()
     urdf = (
-        repo / "assets/unitree_description/urdf/g1/main.urdf"
+        repo
+        / "assets/unitree_description/urdf/g1/main_with_hand_new.urdf"
     ).resolve()
     propainter = (repo / "ProPainter").resolve()
     isaac_runtime: IsaacRuntime | None = None
@@ -1651,7 +1728,6 @@ def _run_pipeline(
     )
     try:
         _validate_file(sam_checkpoint, "SAM3 checkpoint", 3_000_000_000)
-        _validate_file(mjcf, "G1 MJCF")
         _validate_file(urdf, "G1 URDF")
         isaac_runtime = _resolve_isaacsim_runtime(args, repo=repo)
         tqdm.write(f"Isaac runtime: {isaac_runtime.description}")
@@ -1863,7 +1939,7 @@ def _run_pipeline(
                                     prepared,
                                     args=args,
                                     repo=repo,
-                                    mjcf=mjcf,
+                                    urdf=urdf,
                                     isaac_runtime=isaac_runtime,
                                     task_profile_path=task_profile_path,
                                     progress=progress,

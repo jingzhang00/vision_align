@@ -801,7 +801,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/left/meshes/hand_base_link.STL" />
+            filename="../hand/left_hand/meshes/hand_base_link.STL" />
         </geometry>
         <material name="BlackAccent"/>
         </visual>
@@ -811,7 +811,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/left/meshes/hand_base_link.STL" />
+            filename="../hand/left_hand/meshes/hand_base_link.STL" />
         </geometry>
         </collision>
     </link>
@@ -837,7 +837,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/left/meshes/thumb_metacarpals_base2.STL" />
+            filename="../hand/left_hand/meshes/thumb_metacarpals_base2.STL" />
         </geometry>
         <material name="BlackAccent"/>
         </visual>
@@ -847,7 +847,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/left/meshes/thumb_metacarpals_base2.STL" />
+            filename="../hand/left_hand/meshes/thumb_metacarpals_base2.STL" />
         </geometry>
         </collision>
     </link>
@@ -891,7 +891,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/left/meshes/thumb_metacarpals.STL" />
+            filename="../hand/left_hand/meshes/thumb_metacarpals.STL" />
         </geometry>
         <material name="BlackAccent"/>
         </visual>
@@ -901,7 +901,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/left/meshes/thumb_metacarpals.STL" />
+            filename="../hand/left_hand/meshes/thumb_metacarpals.STL" />
         </geometry>
         </collision>
     </link>
@@ -945,7 +945,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/left/meshes/thumb_distal.STL" />
+            filename="../hand/left_hand/meshes/thumb_distal.STL" />
         </geometry>
         <material name="BlackAccent"/>
         </visual>
@@ -955,7 +955,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/left/meshes/thumb_distal.STL" />
+            filename="../hand/left_hand/meshes/thumb_distal.STL" />
         </geometry>
         </collision>
     </link>
@@ -1003,7 +1003,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/left/meshes/index_proximal.STL" />
+            filename="../hand/left_hand/meshes/index_proximal.STL" />
         </geometry>
         <material name="BlackAccent"/>
         </visual>
@@ -1013,7 +1013,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/left/meshes/index_proximal.STL" />
+            filename="../hand/left_hand/meshes/index_proximal.STL" />
         </geometry>
         </collision>
     </link>
@@ -1057,7 +1057,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/left/meshes/index_distal.STL" />
+            filename="../hand/left_hand/meshes/index_distal.STL" />
         </geometry>
         <material name="BlackAccent"/>
         </visual>
@@ -1067,7 +1067,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/left/meshes/index_distal.STL" />
+            filename="../hand/left_hand/meshes/index_distal.STL" />
         </geometry>
         </collision>
     </link>
@@ -1115,7 +1115,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/left/meshes/middle_proximal.STL" />
+            filename="../hand/left_hand/meshes/middle_proximal.STL" />
         </geometry>
         <material name="BlackAccent"/>
         </visual>
@@ -1125,7 +1125,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/left/meshes/middle_proximal.STL" />
+            filename="../hand/left_hand/meshes/middle_proximal.STL" />
         </geometry>
         </collision>
     </link>
@@ -1169,7 +1169,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/left/meshes/middle_distal.STL" />
+            filename="../hand/left_hand/meshes/middle_distal.STL" />
         </geometry>
         <material name="BlackAccent"/>
         </visual>
@@ -1179,7 +1179,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/left/meshes/middle_distal.STL" />
+            filename="../hand/left_hand/meshes/middle_distal.STL" />
         </geometry>
         </collision>
     </link>
@@ -1227,7 +1227,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/left/meshes/ring_proximal.STL" />
+            filename="../hand/left_hand/meshes/ring_proximal.STL" />
         </geometry>
         <material name="BlackAccent"/>
         </visual>
@@ -1237,7 +1237,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/left/meshes/ring_proximal.STL" />
+            filename="../hand/left_hand/meshes/ring_proximal.STL" />
         </geometry>
         </collision>
     </link>
@@ -1281,7 +1281,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/left/meshes/ring_distal.STL" />
+            filename="../hand/left_hand/meshes/ring_distal.STL" />
         </geometry>
         <material name="BlackAccent"/>
         </visual>
@@ -1291,7 +1291,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/left/meshes/ring_distal.STL" />
+            filename="../hand/left_hand/meshes/ring_distal.STL" />
         </geometry>
         </collision>
     </link>
@@ -1339,7 +1339,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/left/meshes/pinky_proximal.STL" />
+            filename="../hand/left_hand/meshes/pinky_proximal.STL" />
         </geometry>
         <material name="BlackAccent"/>
         </visual>
@@ -1349,7 +1349,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/left/meshes/pinky_proximal.STL" />
+            filename="../hand/left_hand/meshes/pinky_proximal.STL" />
         </geometry>
         </collision>
     </link>
@@ -1394,7 +1394,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/left/meshes/pinky_distal.STL" />
+            filename="../hand/left_hand/meshes/pinky_distal.STL" />
         </geometry>
         <material name="BlackAccent"/>
         </visual>
@@ -1404,7 +1404,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/left/meshes/pinky_distal.STL" />
+            filename="../hand/left_hand/meshes/pinky_distal.STL" />
         </geometry>
         </collision>
     </link>
@@ -1654,7 +1654,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/right/meshes/hand_base_link.STL" />
+            filename="../hand/right_hand/meshes/hand_base_link.STL" />
         </geometry>
         <material name="BlackAccent"/>
         </visual>
@@ -1664,7 +1664,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/right/meshes/hand_base_link.STL" />
+            filename="../hand/right_hand/meshes/hand_base_link.STL" />
         </geometry>
         </collision>
     </link>
@@ -1690,7 +1690,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/right/meshes/thumb_metacarpals_base2.STL" />
+            filename="../hand/right_hand/meshes/thumb_metacarpals_base2.STL" />
         </geometry>
         <material name="BlackAccent"/>
         </visual>
@@ -1700,7 +1700,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/right/meshes/thumb_metacarpals_base2.STL" />
+            filename="../hand/right_hand/meshes/thumb_metacarpals_base2.STL" />
         </geometry>
         </collision>
     </link>
@@ -1744,7 +1744,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/right/meshes/thumb_metacarpals.STL" />
+            filename="../hand/right_hand/meshes/thumb_metacarpals.STL" />
         </geometry>
         <material name="BlackAccent"/>
         </visual>
@@ -1754,7 +1754,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/right/meshes/thumb_metacarpals.STL" />
+            filename="../hand/right_hand/meshes/thumb_metacarpals.STL" />
         </geometry>
         </collision>
     </link>
@@ -1798,7 +1798,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/right/meshes/thumb_distal.STL" />
+            filename="../hand/right_hand/meshes/thumb_distal.STL" />
         </geometry>
         <material name="BlackAccent"/>
         </visual>
@@ -1808,7 +1808,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/right/meshes/thumb_distal.STL" />
+            filename="../hand/right_hand/meshes/thumb_distal.STL" />
         </geometry>
         </collision>
     </link>
@@ -1856,7 +1856,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/right/meshes/index_proximal.STL" />
+            filename="../hand/right_hand/meshes/index_proximal.STL" />
         </geometry>
         <material name="BlackAccent"/>
         </visual>
@@ -1866,7 +1866,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/right/meshes/index_proximal.STL" />
+            filename="../hand/right_hand/meshes/index_proximal.STL" />
         </geometry>
         </collision>
     </link>
@@ -1910,7 +1910,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/right/meshes/index_distal.STL" />
+            filename="../hand/right_hand/meshes/index_distal.STL" />
         </geometry>
         <material name="BlackAccent"/>
         </visual>
@@ -1920,7 +1920,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/right/meshes/index_distal.STL" />
+            filename="../hand/right_hand/meshes/index_distal.STL" />
         </geometry>
         </collision>
     </link>
@@ -1968,7 +1968,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/right/meshes/middle_proximal.STL" />
+            filename="../hand/right_hand/meshes/middle_proximal.STL" />
         </geometry>
         <material name="BlackAccent"/>
         </visual>
@@ -1978,7 +1978,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/right/meshes/middle_proximal.STL" />
+            filename="../hand/right_hand/meshes/middle_proximal.STL" />
         </geometry>
         </collision>
     </link>
@@ -2022,7 +2022,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/right/meshes/middle_distal.STL" />
+            filename="../hand/right_hand/meshes/middle_distal.STL" />
         </geometry>
         <material name="BlackAccent"/>
         </visual>
@@ -2032,7 +2032,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/right/meshes/middle_distal.STL" />
+            filename="../hand/right_hand/meshes/middle_distal.STL" />
         </geometry>
         </collision>
     </link>
@@ -2080,7 +2080,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/right/meshes/ring_proximal.STL" />
+            filename="../hand/right_hand/meshes/ring_proximal.STL" />
         </geometry>
         <material name="BlackAccent"/>
         </visual>
@@ -2090,7 +2090,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/right/meshes/ring_proximal.STL" />
+            filename="../hand/right_hand/meshes/ring_proximal.STL" />
         </geometry>
         </collision>
     </link>
@@ -2134,7 +2134,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/right/meshes/ring_distal.STL" />
+            filename="../hand/right_hand/meshes/ring_distal.STL" />
         </geometry>
         <material name="BlackAccent"/>
         </visual>
@@ -2144,7 +2144,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/right/meshes/ring_distal.STL" />
+            filename="../hand/right_hand/meshes/ring_distal.STL" />
         </geometry>
         </collision>
     </link>
@@ -2192,7 +2192,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/right/meshes/pinky_proximal.STL" />
+            filename="../hand/right_hand/meshes/pinky_proximal.STL" />
         </geometry>
         <material name="BlackAccent"/>
         </visual>
@@ -2202,7 +2202,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/right/meshes/pinky_proximal.STL" />
+            filename="../hand/right_hand/meshes/pinky_proximal.STL" />
         </geometry>
         </collision>
     </link>
@@ -2246,7 +2246,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/right/meshes/pinky_distal.STL" />
+            filename="../hand/right_hand/meshes/pinky_distal.STL" />
         </geometry>
         <material name="BlackAccent"/>
         </visual>
@@ -2256,7 +2256,7 @@
             rpy="0 0 0" />
         <geometry>
             <mesh
-            filename="linker_hand_o6/right/meshes/pinky_distal.STL" />
+            filename="../hand/right_hand/meshes/pinky_distal.STL" />
         </geometry>
         </collision>
     </link>
