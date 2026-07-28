@@ -4,15 +4,19 @@ import unittest
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 
 import h5py
 import numpy as np
 from scipy.signal import savgol_filter
+from scipy.spatial.transform import Rotation
 
 from human_to_robot.retarget_g1_pinocchio import (
+    CV_TO_G1_WORLD,
     HAND_JOINTS,
     PALM_OFFSET_FROM_WRIST,
     _active_velocity_indices,
+    _fixed_open_hand_action,
     _hand_tcp_transforms,
     _map_action_targets,
     _retarget_hand_widths,
@@ -24,6 +28,8 @@ from human_to_robot.render_isaacsim import (
     _is_render_link,
 )
 from human_to_robot.trajectory import (
+    FINGERTIP_GRASP_TARGET,
+    RIGID_PALM_TARGET,
     align_hand_action,
     load_hand_trajectory,
 )
@@ -57,7 +63,7 @@ def _joint_q_value(model, q: np.ndarray, joint_name: str) -> float:
 
 
 class HandActionAlignmentTests(unittest.TestCase):
-    def test_paper_position_width_and_right_handed_orientation(self) -> None:
+    def test_position_width_and_right_handed_orientation(self) -> None:
         points = _constant_keypoints()
         confidence = np.ones(points.shape[:2], dtype=np.float64)
         expected_position = np.array([0.5, 1.0, 0.0])
@@ -488,7 +494,9 @@ class LinkerHandUrdfTests(unittest.TestCase):
                 1.0,
             )
 
-    def test_binary_tcp_keeps_canonical_basis_while_origin_moves(self) -> None:
+    def test_continuous_tcp_keeps_canonical_basis_while_origin_moves(
+        self,
+    ) -> None:
         commands = np.array(
             [
                 [0.0, 0.0],
@@ -528,6 +536,268 @@ class LinkerHandUrdfTests(unittest.TestCase):
             np.repeat(translations[0:1, 0], len(commands), axis=0),
             atol=1e-12,
         )
+
+    def test_continuous_action_to_palm_mapping_uses_p_and_r(
+        self,
+    ) -> None:
+        frame_count = 3
+        left_positions = np.array(
+            [
+                [-0.20, 0.10, 0.70],
+                [-0.18, 0.12, 0.72],
+                [-0.16, 0.14, 0.74],
+            ],
+            dtype=np.float64,
+        )
+        right_positions = -left_positions
+        left_rotations = np.repeat(
+            np.eye(3, dtype=np.float64)[None],
+            frame_count,
+            axis=0,
+        )
+        right_rotation = np.array(
+            [
+                [0.0, -1.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        )
+        right_rotations = np.repeat(
+            right_rotation[None],
+            frame_count,
+            axis=0,
+        )
+        trajectory = SimpleNamespace(
+            frame_count=frame_count,
+            target_mode=FINGERTIP_GRASP_TARGET,
+            left_action_reference_camera=left_positions,
+            right_action_reference_camera=right_positions,
+            left_action_reference_rotations=left_rotations,
+            right_action_reference_rotations=right_rotations,
+        )
+        commands = np.array(
+            [
+                [0.0, 0.25],
+                [0.5, 0.75],
+                [1.0, 0.4],
+            ],
+            dtype=np.float64,
+        )
+        translations, tcp_rotations = _hand_tcp_transforms(
+            self.model,
+            commands,
+        )
+        camera_origin = np.array([0.10, 0.0, 1.30])
+        scale = 0.84
+        mapped = _map_action_targets(
+            trajectory,
+            scale,
+            camera_origin,
+            translations,
+            tcp_rotations,
+        )
+        (
+            left_grasp,
+            right_grasp,
+            left_grasp_rotation,
+            right_grasp_rotation,
+            left_palm,
+            right_palm,
+            left_palm_rotation,
+            right_palm_rotation,
+        ) = mapped
+
+        for side_index, (
+            source_position,
+            source_rotation,
+            grasp,
+            grasp_rotation,
+            palm,
+            palm_rotation,
+        ) in enumerate(
+            (
+                (
+                    left_positions,
+                    left_rotations,
+                    left_grasp,
+                    left_grasp_rotation,
+                    left_palm,
+                    left_palm_rotation,
+                ),
+                (
+                    right_positions,
+                    right_rotations,
+                    right_grasp,
+                    right_grasp_rotation,
+                    right_palm,
+                    right_palm_rotation,
+                ),
+            )
+        ):
+            expected_grasp = camera_origin + (
+                CV_TO_G1_WORLD @ (scale * source_position).T
+            ).T
+            expected_rotation = np.einsum(
+                "ij,njk->nik",
+                CV_TO_G1_WORLD,
+                source_rotation,
+            )
+            reconstructed_position = palm + np.einsum(
+                "nij,nj->ni",
+                palm_rotation,
+                translations[:, side_index],
+            )
+            reconstructed_rotation = np.einsum(
+                "nij,jk->nik",
+                palm_rotation,
+                tcp_rotations[side_index],
+            )
+            np.testing.assert_allclose(grasp, expected_grasp, atol=1e-12)
+            np.testing.assert_allclose(
+                grasp_rotation,
+                expected_rotation,
+                atol=1e-12,
+            )
+            np.testing.assert_allclose(
+                reconstructed_position,
+                grasp,
+                atol=1e-12,
+            )
+            np.testing.assert_allclose(
+                reconstructed_rotation,
+                grasp_rotation,
+                atol=1e-12,
+            )
+
+    def test_rigid_palm_mapping_does_not_invent_fingertip_targets(
+        self,
+    ) -> None:
+        frame_count = 3
+        left_positions = np.array(
+            [
+                [-0.20, 0.10, 0.70],
+                [-0.18, 0.12, 0.72],
+                [-0.16, 0.14, 0.74],
+            ],
+            dtype=np.float64,
+        )
+        right_positions = -left_positions
+        left_rotations = Rotation.from_euler(
+            "xyz",
+            [[10.0, 5.0, 0.0], [15.0, 8.0, 4.0], [20.0, 9.0, 8.0]],
+            degrees=True,
+        ).as_matrix()
+        right_rotations = Rotation.from_euler(
+            "xyz",
+            [[-10.0, -5.0, 0.0], [-15.0, -8.0, 4.0], [-20.0, -9.0, 8.0]],
+            degrees=True,
+        ).as_matrix()
+        trajectory = SimpleNamespace(
+            frame_count=frame_count,
+            target_mode=RIGID_PALM_TARGET,
+            left_action_reference_camera=left_positions,
+            right_action_reference_camera=right_positions,
+            left_action_reference_rotations=left_rotations,
+            right_action_reference_rotations=right_rotations,
+        )
+        commands = np.zeros((frame_count, 2), dtype=np.float64)
+        translations, tcp_rotations = _hand_tcp_transforms(
+            self.model,
+            commands,
+        )
+        camera_origin = np.array([0.10, 0.0, 1.30])
+        scale = 0.84
+        (
+            left_grasp,
+            right_grasp,
+            left_grasp_rotation,
+            right_grasp_rotation,
+            left_palm,
+            right_palm,
+            left_palm_rotation,
+            right_palm_rotation,
+        ) = _map_action_targets(
+            trajectory,
+            scale,
+            camera_origin,
+            translations,
+            tcp_rotations,
+        )
+
+        for side_index, (
+            source_position,
+            source_rotation,
+            grasp,
+            grasp_rotation,
+            palm,
+            palm_rotation,
+        ) in enumerate(
+            (
+                (
+                    left_positions,
+                    left_rotations,
+                    left_grasp,
+                    left_grasp_rotation,
+                    left_palm,
+                    left_palm_rotation,
+                ),
+                (
+                    right_positions,
+                    right_rotations,
+                    right_grasp,
+                    right_grasp_rotation,
+                    right_palm,
+                    right_palm_rotation,
+                ),
+            )
+        ):
+            expected_palm = camera_origin + (
+                CV_TO_G1_WORLD @ (scale * source_position).T
+            ).T
+            expected_rotation = np.einsum(
+                "ij,njk->nik",
+                CV_TO_G1_WORLD,
+                source_rotation,
+            )
+            np.testing.assert_allclose(palm, expected_palm, atol=1e-12)
+            np.testing.assert_allclose(
+                palm_rotation,
+                expected_rotation,
+                atol=1e-12,
+            )
+            np.testing.assert_allclose(
+                grasp,
+                palm
+                + np.einsum(
+                    "nij,nj->ni",
+                    palm_rotation,
+                    translations[:, side_index],
+                ),
+                atol=1e-12,
+            )
+            np.testing.assert_allclose(
+                grasp_rotation,
+                np.einsum(
+                    "nij,jk->nik",
+                    palm_rotation,
+                    tcp_rotations[side_index],
+                ),
+                atol=1e-12,
+            )
+
+    def test_rigid_palm_keeps_both_robot_hands_exactly_open(self) -> None:
+        commands, states, targets, achieved, profiles = (
+            _fixed_open_hand_action(self.model, 5)
+        )
+
+        np.testing.assert_array_equal(commands, np.zeros((5, 2)))
+        np.testing.assert_array_equal(states, np.zeros((5, 2), dtype=np.uint8))
+        self.assertTrue(np.isnan(targets).all())
+        self.assertTrue(np.isfinite(achieved).all())
+        self.assertEqual(len(profiles), 2)
+        for profile in profiles:
+            self.assertEqual(profile["fixed_command"], 0.0)
 
     @unittest.skipUnless(
         (REPOSITORY / "dataset/basic_pick_place/0.hdf5").exists(),

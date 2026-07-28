@@ -1,14 +1,15 @@
 """Run human-to-robot visual alignment on pre-cut Nymeria clips.
 
-The activity SMPL files provide clip timing and body metadata, while the
+The activity narration CSV supplies clip timing and action text, while the
 original XSens segment tracks provide the head and wrist rigid transforms
 needed by the existing G1 retargeter.  A recording-level hand-eye solve
 registers the XSens head to the Project Aria head device.  The generated
 adapter HDF5 files are temporary inputs to ``human_to_robot.pipeline``.
 
-Nymeria's converted SMPL files in this dataset contain no articulated hand
-pose (``poses[:, 66:]`` is zero), so this adapter deliberately emits fixed
-open-hand fingertip landmarks and disables binary hand control.
+Nymeria's body tracks contain rigid hand/palm transforms but no articulated
+finger pose.  The adapter therefore declares rigid-palm targets explicitly;
+the shared retargeter keeps the robot hands open and uses its regular base
+search and 6D IK.
 """
 
 from __future__ import annotations
@@ -17,8 +18,8 @@ import argparse
 import csv
 import hashlib
 import json
-import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -34,6 +35,10 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 from tqdm import tqdm
 
+from human_to_robot.trajectory import (
+    HAND_TARGET_MODE_ATTRIBUTE,
+    RIGID_PALM_TARGET,
+)
 from human_to_robot.video_io import atomic_video_writer
 
 
@@ -45,8 +50,24 @@ CAMERA_TRAJECTORY_RELATIVE_PATH = Path(
 )
 BODY_RELATIVE_PATH = Path("body/xdata.npz")
 INTRINSICS_RELATIVE_PATH = Path("undistorted/camera_intrinsics.json")
+ACTIVITY_NARRATION_RELATIVE_PATH = Path(
+    "narration/activity_summarization.csv"
+)
+ACTIVITY_VIDEO_RELATIVE_PATH = Path(
+    "undistorted_384_activity_summarization_clips"
+)
 FULL_UNDISTORTED_VIDEO_NAME = "video_384_undistord.mp4"
 MAX_CLIP_BOUNDARY_DRIFT_SECONDS = 0.25
+VIDEO_ROTATION_CLOCKWISE_DEGREES = 90.0
+CAMERA_RGB_FROM_VIDEO_CAMERA = np.eye(4, dtype=np.float64)
+CAMERA_RGB_FROM_VIDEO_CAMERA[:3, :3] = np.array(
+    [
+        [0.0, 1.0, 0.0],
+        [-1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0],
+    ],
+    dtype=np.float64,
+)
 PART_NAMES = (
     "Pelvis",
     "L5",
@@ -73,14 +94,30 @@ PART_NAMES = (
     "L_Toe",
 )
 PART_INDEX = {name: index for index, name in enumerate(PART_NAMES)}
-KEYPOINT_NAMES = ("Hand", "ThumbTip", "IndexFingerTip", "MiddleFingerTip")
+
+
+@dataclass(frozen=True)
+class ActivityAnnotation:
+    row_index: int
+    original_start_time: float
+    original_end_time: float
+    body_start_time: float
+    body_end_time: float
+    action_text: str
+
+
+@dataclass(frozen=True)
+class ActivityNarration:
+    path: Path
+    timecode_offset_seconds: float
+    annotations: tuple[ActivityAnnotation, ...]
 
 
 @dataclass(frozen=True)
 class ClipPair:
     stem: str
-    smpl: Path
     video: Path
+    annotation: ActivityAnnotation
 
     @property
     def short_name(self) -> str:
@@ -92,7 +129,8 @@ class ClipPair:
 class CameraCalibration:
     intrinsic: np.ndarray
     resolution: tuple[int, int]
-    device_from_camera: np.ndarray
+    source_device_from_camera: np.ndarray
+    device_from_video_camera: np.ndarray
     source_model: str
     source_parameters: np.ndarray
     source_record_count: int
@@ -142,6 +180,14 @@ class BodyMotion:
 
 
 @dataclass(frozen=True)
+class SlamTrajectory:
+    timestamps_us: np.ndarray
+    translations: np.ndarray
+    quaternions_wxyz: np.ndarray
+    quality: np.ndarray
+
+
+@dataclass(frozen=True)
 class PreparedClip:
     pair: ClipPair
     normalized_video: Path
@@ -150,10 +196,14 @@ class PreparedClip:
     source_start_frame: int
     body_time_start: float
     body_time_end: float
-    smpl_start_offset_seconds: float
-    smpl_end_offset_seconds: float
+    annotation_start_offset_seconds: float
+    annotation_end_offset_seconds: float
     left_visible_fraction: float
     right_visible_fraction: float
+    maximum_slam_time_error_us: float
+    maximum_camera_translation_m: float
+    maximum_camera_rotation_degrees: float
+    maximum_hand_displacement_m: float
 
 
 def _format_duration(seconds: float) -> str:
@@ -166,45 +216,113 @@ def _format_duration(seconds: float) -> str:
 
 
 def _natural_key(value: str) -> list[object]:
-    import re
-
     return [
         int(part) if part.isdigit() else part.lower()
         for part in re.split(r"(\d+)", value)
     ]
 
 
+def load_activity_narration(path: str | Path) -> ActivityNarration:
+    path = Path(path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Activity narration CSV not found: {path}")
+    with path.open(newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle)
+        required = {"start_time", "end_time", "Describe my activity"}
+        missing = required - set(reader.fieldnames or ())
+        if missing:
+            raise ValueError(
+                f"{path} is missing narration columns: {sorted(missing)}"
+            )
+        rows = list(reader)
+    if not rows:
+        raise ValueError(f"Activity narration CSV is empty: {path}")
+
+    try:
+        starts = np.asarray(
+            [float(row["start_time"]) for row in rows],
+            dtype=np.float64,
+        )
+        ends = np.asarray(
+            [float(row["end_time"]) for row in rows],
+            dtype=np.float64,
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{path} contains an invalid clip timestamp") from error
+    if not np.isfinite(starts).all() or not np.isfinite(ends).all():
+        raise ValueError(f"{path} contains non-finite clip timestamps")
+    if np.any(ends <= starts):
+        invalid = int(np.flatnonzero(ends <= starts)[0])
+        raise ValueError(
+            f"{path} row {invalid} has end_time <= start_time"
+        )
+
+    timecode_offset = float(starts[0])
+    annotations = tuple(
+        ActivityAnnotation(
+            row_index=index,
+            original_start_time=float(start),
+            original_end_time=float(end),
+            body_start_time=float(start - timecode_offset),
+            body_end_time=float(end - timecode_offset),
+            action_text=str(row["Describe my activity"]).strip(),
+        )
+        for index, (row, start, end) in enumerate(zip(rows, starts, ends))
+    )
+    return ActivityNarration(
+        path=path,
+        timecode_offset_seconds=timecode_offset,
+        annotations=annotations,
+    )
+
+
 def discover_clip_pairs(
-    smpl_directory: str | Path,
     video_directory: str | Path,
+    narration: ActivityNarration,
     *,
     selected: Sequence[str] = (),
 ) -> list[ClipPair]:
-    smpl_directory = Path(smpl_directory).expanduser().resolve()
     video_directory = Path(video_directory).expanduser().resolve()
-    if not smpl_directory.is_dir():
-        raise NotADirectoryError(f"SMPL clip directory not found: {smpl_directory}")
     if not video_directory.is_dir():
         raise NotADirectoryError(f"Video clip directory not found: {video_directory}")
 
-    smpl = {path.stem: path for path in smpl_directory.glob("*.npz")}
     videos = {path.stem: path for path in video_directory.glob("*.mp4")}
-    missing_videos = sorted(set(smpl) - set(videos), key=_natural_key)
-    missing_smpl = sorted(set(videos) - set(smpl), key=_natural_key)
-    if missing_videos or missing_smpl:
+    by_index: dict[int, Path] = {}
+    for stem, path in videos.items():
+        match = re.search(r"_c(\d+)$", stem)
+        if match is None:
+            raise ValueError(
+                f"Activity clip stem must end in _cNNN: {path.name}"
+            )
+        index = int(match.group(1))
+        if index in by_index:
+            raise ValueError(
+                f"Multiple activity videos map to narration row {index}"
+            )
+        by_index[index] = path
+
+    expected = set(range(len(narration.annotations)))
+    actual = set(by_index)
+    missing_videos = sorted(expected - actual)
+    unexpected_videos = sorted(actual - expected)
+    if missing_videos or unexpected_videos:
         raise ValueError(
-            "SMPL/video clips are not one-to-one by stem; "
-            f"missing videos={missing_videos}, missing SMPL={missing_smpl}"
+            "Narration/video clips are not one-to-one by cNNN index; "
+            f"missing videos={missing_videos}, "
+            f"unexpected videos={unexpected_videos}"
         )
-    if not smpl:
+    if not videos:
         raise FileNotFoundError(
-            f"No same-stem NPZ/MP4 clips found in {smpl_directory} and "
-            f"{video_directory}"
+            f"No activity MP4 clips found in {video_directory}"
         )
 
     pairs = [
-        ClipPair(stem=stem, smpl=smpl[stem], video=videos[stem])
-        for stem in sorted(smpl, key=_natural_key)
+        ClipPair(
+            stem=by_index[index].stem,
+            video=by_index[index],
+            annotation=narration.annotations[index],
+        )
+        for index in range(len(narration.annotations))
     ]
     if selected:
         requested = set(selected)
@@ -431,10 +549,14 @@ def load_recording_camera(
         raise ValueError(f"Aria calibration is empty: {calibration_path}")
 
     intrinsic, resolution = load_intrinsic(intrinsics_path)
+    device_from_video_camera = (
+        reference_transform @ CAMERA_RGB_FROM_VIDEO_CAMERA
+    )
     return CameraCalibration(
         intrinsic=intrinsic,
         resolution=resolution,
-        device_from_camera=reference_transform,
+        source_device_from_camera=reference_transform,
+        device_from_video_camera=device_from_video_camera,
         source_model=reference_model,
         source_parameters=reference_parameters,
         source_record_count=record_count,
@@ -544,150 +666,83 @@ def solve_hand_eye(
     return transform, metrics
 
 
-def _nearest_slam_poses(
-    path: Path,
+def load_slam_trajectory(path: str | Path) -> SlamTrajectory:
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Aria closed-loop trajectory not found: {path}")
+    # Loading only the nine required numeric columns is substantially faster
+    # and smaller than materializing the 28-column CSV as Python dictionaries.
+    data = np.loadtxt(
+        path,
+        delimiter=",",
+        skiprows=1,
+        usecols=(1, 3, 4, 5, 9, 6, 7, 8, 19),
+        dtype=np.float64,
+    )
+    if data.ndim == 1:
+        data = data[None]
+    if data.shape[0] < 2 or data.shape[1] != 9:
+        raise ValueError(f"Invalid Aria closed-loop trajectory: {path}")
+    timestamps = data[:, 0].astype(np.int64)
+    if np.any(np.diff(timestamps) <= 0):
+        raise ValueError(f"Aria trajectory timestamps are not increasing: {path}")
+    quaternions = data[:, 4:8]
+    norms = np.linalg.norm(quaternions, axis=1)
+    if (
+        not np.isfinite(data).all()
+        or np.any(norms < 0.1)
+        or np.any(data[:, 8] < 0.0)
+    ):
+        raise ValueError(f"Aria trajectory contains invalid values: {path}")
+    quaternions /= norms[:, None]
+    return SlamTrajectory(
+        timestamps_us=timestamps,
+        translations=data[:, 1:4],
+        quaternions_wxyz=quaternions,
+        quality=data[:, 8],
+    )
+
+
+def nearest_slam_poses(
+    trajectory: SlamTrajectory,
     target_timestamps_us: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     targets = np.asarray(target_timestamps_us, dtype=np.float64)
     if targets.ndim != 1 or len(targets) == 0 or np.any(np.diff(targets) < 0):
         raise ValueError("SLAM target timestamps must be sorted")
-    selected_time: list[int] = []
-    selected_translation: list[np.ndarray] = []
-    selected_quaternion: list[np.ndarray] = []
-    selected_quality: list[float] = []
-    target_index = 0
-    previous: tuple[int, np.ndarray, np.ndarray, float] | None = None
-    with path.open("r", encoding="utf-8", newline="") as handle:
-        for row in csv.DictReader(handle):
-            timestamp = int(row["tracking_timestamp_us"])
-            current = (
-                timestamp,
-                np.asarray(
-                    [
-                        float(row["tx_world_device"]),
-                        float(row["ty_world_device"]),
-                        float(row["tz_world_device"]),
-                    ],
-                    dtype=np.float64,
-                ),
-                np.asarray(
-                    [
-                        float(row["qw_world_device"]),
-                        float(row["qx_world_device"]),
-                        float(row["qy_world_device"]),
-                        float(row["qz_world_device"]),
-                    ],
-                    dtype=np.float64,
-                ),
-                float(row["quality_score"]),
-            )
-            while (
-                target_index < len(targets)
-                and timestamp >= targets[target_index]
-            ):
-                chosen = current
-                if previous is not None and abs(
-                    previous[0] - targets[target_index]
-                ) <= abs(timestamp - targets[target_index]):
-                    chosen = previous
-                selected_time.append(chosen[0])
-                selected_translation.append(chosen[1])
-                selected_quaternion.append(chosen[2])
-                selected_quality.append(chosen[3])
-                target_index += 1
-            previous = current
-            if target_index == len(targets):
-                break
-    if target_index != len(targets):
+    timestamps = trajectory.timestamps_us
+    if targets[0] < timestamps[0] or targets[-1] > timestamps[-1]:
         raise ValueError(
-            f"SLAM trajectory {path} ends before "
-            f"{len(targets) - target_index} requested poses"
+            "Requested timestamps fall outside the Aria SLAM trajectory: "
+            f"{targets[0]:.0f}..{targets[-1]:.0f} vs "
+            f"{timestamps[0]}..{timestamps[-1]}"
         )
-    return (
-        np.asarray(selected_time, dtype=np.int64),
-        np.asarray(selected_translation, dtype=np.float64),
-        np.asarray(selected_quaternion, dtype=np.float64),
-        np.asarray(selected_quality, dtype=np.float64),
+    right = np.searchsorted(timestamps, targets, side="left")
+    right = np.clip(right, 1, len(timestamps) - 1)
+    left = right - 1
+    choose_left = (
+        np.abs(timestamps[left] - targets)
+        <= np.abs(timestamps[right] - targets)
     )
-
-
-def _clip_timing(path: Path) -> dict[str, Any]:
-    with np.load(path, allow_pickle=True) as archive:
-        required = (
-            "trans",
-            "root_orient",
-            "pose_body",
-            "poses",
-            "mocap_frame_rate",
-            "actual_start_time",
-            "actual_end_time",
-            "csv_original_start_time",
-            "csv_time_offset",
-        )
-        missing = [name for name in required if name not in archive]
-        if missing:
-            raise KeyError(f"{path} is missing SMPL fields: {missing}")
-        frame_count = int(archive["trans"].shape[0])
-        if any(
-            archive[name].shape[0] != frame_count
-            for name in ("root_orient", "pose_body", "poses")
-        ):
-            raise ValueError(f"SMPL dynamic array lengths disagree in {path}")
-        poses = np.asarray(archive["poses"], dtype=np.float64)
-        hand_pose_maximum = (
-            float(np.max(np.abs(poses[:, 66:])))
-            if poses.shape[1] > 66
-            else 0.0
-        )
-        camera_fields = sorted(
-            name
-            for name in archive.files
-            if any(
-                token in name.lower()
-                for token in ("camera", "intrinsic", "extrinsic", "calibration")
-            )
-        )
-        action_text = (
-            str(archive["action_text"].item())
-            if "action_text" in archive
-            else ""
-        )
-        return {
-            "frame_count": frame_count,
-            "fps": float(archive["mocap_frame_rate"]),
-            "actual_start_time": float(archive["actual_start_time"]),
-            "actual_end_time": float(archive["actual_end_time"]),
-            "csv_original_start_time": float(
-                archive["csv_original_start_time"]
-            ),
-            "csv_time_offset": float(archive["csv_time_offset"]),
-            "action_text": action_text,
-            "hand_pose_maximum": hand_pose_maximum,
-            "camera_fields": camera_fields,
-        }
+    selected = np.where(choose_left, left, right)
+    return (
+        timestamps[selected],
+        trajectory.translations[selected],
+        trajectory.quaternions_wxyz[selected],
+        trajectory.quality[selected],
+    )
 
 
 def estimate_hand_eye(
     *,
-    episode_root: Path,
     body: BodyMotion,
-    clip_pairs: Sequence[ClipPair],
+    slam: SlamTrajectory,
+    timecode_offset_seconds: float,
     sample_fps: float,
 ) -> HandEyeResult:
-    timings = [_clip_timing(pair.smpl) for pair in clip_pairs]
-    offsets = np.asarray(
-        [float(timing["csv_time_offset"]) for timing in timings],
-        dtype=np.float64,
-    )
-    if np.ptp(offsets) > 1e-6:
-        raise ValueError(
-            "SMPL clips disagree on csv_time_offset: "
-            f"{offsets.min():.9f}..{offsets.max():.9f}"
-        )
-    csv_time_offset = float(np.median(offsets))
     timecode_to_device_offset = (
         float(body.timestamps_us[0])
-        - csv_time_offset * 1.0e6
+        - float(timecode_offset_seconds) * 1.0e6
     )
     stride = max(1, int(round(240.0 / sample_fps)))
     sample_indices = np.arange(
@@ -699,17 +754,12 @@ def estimate_hand_eye(
     target_device_times = (
         body.timestamps_us[sample_indices] - timecode_to_device_offset
     )
-    trajectory_path = episode_root / CAMERA_TRAJECTORY_RELATIVE_PATH
-    if not trajectory_path.is_file():
-        raise FileNotFoundError(
-            f"Aria closed-loop trajectory not found: {trajectory_path}"
-        )
     (
         selected_times,
         device_translations,
         device_quaternions,
         qualities,
-    ) = _nearest_slam_poses(trajectory_path, target_device_times)
+    ) = nearest_slam_poses(slam, target_device_times)
     time_errors = np.abs(selected_times - target_device_times)
     valid = qualities >= 0.5
     if np.count_nonzero(valid) < 20:
@@ -764,16 +814,12 @@ def _frame_digest(frame_bgr: np.ndarray) -> bytes:
 
 def _decoded_frame_digests(
     path: Path,
-    *,
-    limit: int | None = None,
 ) -> list[bytes]:
     digests: list[bytes] = []
     with av.open(str(path)) as container:
         stream = container.streams.video[0]
         for frame in container.decode(stream):
             digests.append(_frame_digest(frame.to_ndarray(format="bgr24")))
-            if limit is not None and len(digests) >= limit:
-                break
     if not digests:
         raise ValueError(f"Video has no visible decoded frames: {path}")
     return digests
@@ -785,22 +831,47 @@ def _match_subsequence(
 ) -> int:
     if not clip_digests:
         raise ValueError("Cannot match an empty clip digest sequence")
-    candidates = [
-        index
-        for index, digest in enumerate(full_digests)
-        if digest == clip_digests[0]
-    ]
-    matches = [
-        index
-        for index in candidates
-        if list(full_digests[index : index + len(clip_digests)])
-        == list(clip_digests)
-    ]
-    if len(matches) != 1:
-        raise ValueError(
-            f"Expected one source-frame match, found {len(matches)}"
+    candidates = np.asarray(
+        [
+            index
+            for index, digest in enumerate(full_digests)
+            if digest == clip_digests[0]
+        ],
+        dtype=np.int64,
+    )
+    if candidates.size == 0:
+        raise ValueError("Clip first frame is absent from the full video")
+    probe_sizes = sorted(
+        {
+            min(len(clip_digests), size)
+            for size in (5, 15, 60, len(clip_digests))
+        }
+    )
+    for probe_size in probe_sizes:
+        candidates = np.asarray(
+            [
+                int(index)
+                for index in candidates
+                if list(
+                    full_digests[
+                        int(index) : int(index) + probe_size
+                    ]
+                )
+                == list(clip_digests[:probe_size])
+            ],
+            dtype=np.int64,
         )
-    return matches[0]
+        if candidates.size == 1:
+            return int(candidates[0])
+        if candidates.size == 0:
+            raise ValueError(
+                f"Clip frames do not form a source subsequence "
+                f"(probe={probe_size})"
+            )
+    raise ValueError(
+        "Clip is ambiguous in the full video even after matching all "
+        f"{len(clip_digests)} decoded frames; matches={candidates.tolist()}"
+    )
 
 
 def load_capture_timestamps(path: Path) -> np.ndarray:
@@ -942,7 +1013,9 @@ def camera_space_hands(
             "Expected [frame, head/left/right, 4, 4] XSens transforms"
         )
     xsens_head_from_world = np.linalg.inv(xsens_parts[:, 0])
-    device_from_camera_inverse = np.linalg.inv(camera.device_from_camera)
+    device_from_camera_inverse = np.linalg.inv(
+        camera.device_from_video_camera
+    )
     camera_from_xsens_head = (
         device_from_camera_inverse
         @ hand_eye.device_from_xsens_head
@@ -960,6 +1033,99 @@ def camera_space_hands(
     left = np.einsum("nij,njk->nik", camera_from_world, xsens_parts[:, 1])
     right = np.einsum("nij,njk->nik", camera_from_world, xsens_parts[:, 2])
     return left, right
+
+
+def world_space_hands(
+    xsens_parts: np.ndarray,
+    world_from_device: np.ndarray,
+    *,
+    camera: CameraCalibration,
+    hand_eye: HandEyeResult,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Register XSens hands and the RGB camera in one Aria world frame."""
+
+    if xsens_parts.ndim != 4 or xsens_parts.shape[1:] != (3, 4, 4):
+        raise ValueError(
+            "Expected [frame, head/left/right, 4, 4] XSens transforms"
+        )
+    if world_from_device.shape != (len(xsens_parts), 4, 4):
+        raise ValueError(
+            "Expected one [4, 4] Aria device pose for every XSens frame"
+        )
+    xsens_head_from_world = np.linalg.inv(xsens_parts[:, 0])
+    device_from_xsens_head = np.repeat(
+        hand_eye.device_from_xsens_head[None],
+        len(xsens_parts),
+        axis=0,
+    )
+    world_from_xsens_world = np.einsum(
+        "nij,njk,nkl->nil",
+        world_from_device,
+        device_from_xsens_head,
+        xsens_head_from_world,
+    )
+    left = np.einsum(
+        "nij,njk->nik",
+        world_from_xsens_world,
+        xsens_parts[:, 1],
+    )
+    right = np.einsum(
+        "nij,njk->nik",
+        world_from_xsens_world,
+        xsens_parts[:, 2],
+    )
+    camera_to_world = np.einsum(
+        "nij,jk->nik",
+        world_from_device,
+        camera.device_from_video_camera,
+    )
+    return left, right, camera_to_world
+
+
+def _fixed_base_motion_metrics(
+    *,
+    camera_to_world: np.ndarray,
+    left_hands: np.ndarray,
+    right_hands: np.ndarray,
+) -> dict[str, float]:
+    reference_world_to_camera = np.linalg.inv(camera_to_world[0])
+    camera_motion = np.einsum(
+        "ij,njk->nik",
+        reference_world_to_camera,
+        camera_to_world,
+    )
+    left_reference = np.einsum(
+        "ij,njk->nik",
+        reference_world_to_camera,
+        left_hands,
+    )
+    right_reference = np.einsum(
+        "ij,njk->nik",
+        reference_world_to_camera,
+        right_hands,
+    )
+    camera_translation = np.linalg.norm(
+        camera_motion[:, :3, 3],
+        axis=1,
+    )
+    camera_rotation = np.degrees(
+        Rotation.from_matrix(camera_motion[:, :3, :3]).magnitude()
+    )
+    left_displacement = np.linalg.norm(
+        left_reference[:, :3, 3] - left_reference[0, :3, 3],
+        axis=1,
+    )
+    right_displacement = np.linalg.norm(
+        right_reference[:, :3, 3] - right_reference[0, :3, 3],
+        axis=1,
+    )
+    return {
+        "maximum_camera_translation_m": float(np.max(camera_translation)),
+        "maximum_camera_rotation_degrees": float(np.max(camera_rotation)),
+        "maximum_hand_displacement_m": float(
+            max(np.max(left_displacement), np.max(right_displacement))
+        ),
+    }
 
 
 def _project(
@@ -998,34 +1164,25 @@ def _visibility(
     )
 
 
-def _tip_transform(
-    hands: np.ndarray,
-    local_offset: np.ndarray,
-) -> np.ndarray:
-    result = hands.copy()
-    result[:, :3, 3] += np.einsum(
-        "nij,j->ni", hands[:, :3, :3], local_offset
-    )
-    return result
-
-
 def write_adapter_hdf5(
     path: Path,
     *,
     pair: ClipPair,
+    narration_path: Path,
     camera: CameraCalibration,
+    camera_to_world: np.ndarray,
     left_hands: np.ndarray,
     right_hands: np.ndarray,
     left_confidence: np.ndarray,
     right_confidence: np.ndarray,
     body_times: np.ndarray,
     source_frame_indices: np.ndarray,
-    timing: dict[str, Any],
 ) -> None:
     frame_count = len(left_hands)
     if (
         right_hands.shape != left_hands.shape
         or left_hands.shape != (frame_count, 4, 4)
+        or camera_to_world.shape != (frame_count, 4, 4)
         or left_confidence.shape != (frame_count,)
         or right_confidence.shape != (frame_count,)
     ):
@@ -1040,29 +1197,12 @@ def write_adapter_hdf5(
     temporary = Path(temporary_name)
     try:
         with h5py.File(temporary, "w") as handle:
+            handle.attrs[HAND_TARGET_MODE_ATTRIBUTE] = RIGID_PALM_TARGET
             handle.create_dataset("camera/intrinsic", data=camera.intrinsic)
             handle.create_dataset(
                 "transforms/camera",
-                data=np.repeat(
-                    np.eye(4, dtype=np.float64)[None],
-                    frame_count,
-                    axis=0,
-                ),
+                data=camera_to_world,
             )
-            offsets = {
-                "ThumbTip": {
-                    "left": np.array([0.085, 0.035, 0.0]),
-                    "right": np.array([0.085, -0.035, 0.0]),
-                },
-                "IndexFingerTip": {
-                    "left": np.array([0.120, -0.025, 0.0]),
-                    "right": np.array([0.120, 0.025, 0.0]),
-                },
-                "MiddleFingerTip": {
-                    "left": np.array([0.125, 0.0, 0.0]),
-                    "right": np.array([0.125, 0.0, 0.0]),
-                },
-            }
             for side, hands, confidence in (
                 ("left", left_hands, left_confidence),
                 ("right", right_hands, right_confidence),
@@ -1071,36 +1211,32 @@ def write_adapter_hdf5(
                 handle.create_dataset(
                     f"confidences/{side}Hand", data=confidence
                 )
-                for name in KEYPOINT_NAMES[1:]:
-                    transforms = _tip_transform(
-                        hands, offsets[name][side]
-                    )
-                    handle.create_dataset(
-                        f"transforms/{side}{name}", data=transforms
-                    )
-                    handle.create_dataset(
-                        f"confidences/{side}{name}", data=confidence
-                    )
             metadata = handle.create_group("nymeria")
-            metadata.attrs["source_smpl"] = str(pair.smpl)
             metadata.attrs["source_video"] = str(pair.video)
+            metadata.attrs["source_narration"] = str(narration_path)
+            metadata.attrs["narration_row_index"] = pair.annotation.row_index
             metadata.attrs["hand_pose"] = (
-                "unavailable in source SMPL; synthetic fixed-open landmarks"
+                "XSens rigid hand/palm pose; articulated finger pose "
+                "unavailable"
             )
             metadata.attrs["camera_frame"] = (
-                "per-frame Aria RGB camera; transforms/camera is identity"
+                "Aria MPS world; transforms/camera is "
+                "T_World_CameraUpright(t)"
             )
-            metadata.attrs["action_text"] = str(timing["action_text"])
+            metadata.attrs["action_text"] = pair.annotation.action_text
+            metadata.attrs["annotation_original_start_time"] = (
+                pair.annotation.original_start_time
+            )
+            metadata.attrs["annotation_original_end_time"] = (
+                pair.annotation.original_end_time
+            )
             metadata.create_dataset("body_time_seconds", data=body_times)
             metadata.create_dataset(
                 "source_full_video_frame", data=source_frame_indices
             )
             metadata.create_dataset(
-                "smpl_source_frame",
-                data=(
-                    body_times - float(timing["actual_start_time"])
-                )
-                * float(timing["fps"]),
+                "annotation_relative_time_seconds",
+                data=body_times - pair.annotation.body_start_time,
             )
         os.replace(temporary, path)
     finally:
@@ -1130,29 +1266,36 @@ def _prepare_clip(
     adapter_root: Path,
     camera: CameraCalibration,
     body: BodyMotion,
+    slam: SlamTrajectory,
     hand_eye: HandEyeResult,
+    narration_path: Path,
+    timecode_offset_seconds: float,
     capture_timestamps: np.ndarray,
     full_digests: Sequence[bytes],
     hardware_encoding: bool,
     require_visible_hands: bool,
+    motion_filter: bool,
+    maximum_camera_translation_m: float,
+    maximum_camera_rotation_degrees: float,
+    maximum_hand_displacement_m: float,
 ) -> tuple[PreparedClip | None, dict[str, Any] | None]:
-    timing = _clip_timing(pair.smpl)
-    if float(timing["hand_pose_maximum"]) > 1e-8:
-        raise ValueError(
-            f"{pair.smpl} contains articulated hand pose; this fixed-open "
-            "adapter must not silently discard it"
-        )
-
     normalized_video = adapter_root / f"{pair.stem}.mp4"
     adapter_hdf5 = adapter_root / f"{pair.stem}.hdf5"
     try:
-        probe = _decoded_frame_digests(pair.video, limit=5)
-        source_start = _match_subsequence(full_digests, probe)
-        frame_count = _normalize_video(
-            pair.video,
-            normalized_video,
-            hardware_encoding=hardware_encoding,
-        )
+        with av.open(str(pair.video)) as container:
+            stream = container.streams.video[0]
+            source_resolution = (
+                int(stream.codec_context.width),
+                int(stream.codec_context.height),
+            )
+        if source_resolution != camera.resolution:
+            raise ValueError(
+                f"{pair.video} resolution {source_resolution} does not match "
+                f"intrinsics resolution {camera.resolution}"
+            )
+        clip_digests = _decoded_frame_digests(pair.video)
+        source_start = _match_subsequence(full_digests, clip_digests)
+        frame_count = len(clip_digests)
         if source_start + frame_count > len(full_digests):
             raise ValueError(
                 f"{pair.video} extends past the full undistorted video"
@@ -1169,24 +1312,55 @@ def _prepare_clip(
         tracking_seconds = (
             capture_timestamps[raw_frames].astype(np.float64) / 1.0e9
         )
-        body_times = (
-            tracking_seconds - float(timing["csv_time_offset"])
+        (
+            selected_slam_times,
+            device_translations,
+            device_quaternions,
+            device_quality,
+        ) = nearest_slam_poses(
+            slam,
+            capture_timestamps[raw_frames].astype(np.float64) / 1.0e3,
         )
-        smpl_start = float(timing["actual_start_time"])
-        smpl_end = float(timing["actual_end_time"])
-        start_offset = float(body_times[0] - smpl_start)
-        end_offset = float(body_times[-1] - smpl_end)
+        slam_time_errors = np.abs(
+            selected_slam_times
+            - capture_timestamps[raw_frames].astype(np.float64) / 1.0e3
+        )
+        if np.max(slam_time_errors) > 2_000.0:
+            raise ValueError(
+                f"{pair.video} has an Aria pose timestamp gap of "
+                f"{np.max(slam_time_errors):.1f} us"
+            )
+        if np.any(device_quality < 0.5):
+            raise ValueError(
+                f"{pair.video} contains unreliable Aria closed-loop poses"
+            )
+        world_from_device = np.repeat(
+            np.eye(4, dtype=np.float64)[None],
+            frame_count,
+            axis=0,
+        )
+        world_from_device[:, :3, :3] = Rotation.from_quat(
+            device_quaternions[:, [1, 2, 3, 0]]
+        ).as_matrix()
+        world_from_device[:, :3, 3] = device_translations
+        body_times = tracking_seconds - float(timecode_offset_seconds)
+        annotation_start = pair.annotation.body_start_time
+        annotation_end = pair.annotation.body_end_time
+        start_offset = float(body_times[0] - annotation_start)
+        end_offset = float(body_times[-1] - annotation_end)
         if (
             start_offset < -MAX_CLIP_BOUNDARY_DRIFT_SECONDS
             or end_offset > MAX_CLIP_BOUNDARY_DRIFT_SECONDS
-            or body_times[-1] < smpl_start
-            or body_times[0] > smpl_end
+            or body_times[-1] < annotation_start
+            or body_times[0] > annotation_end
         ):
             raise ValueError(
-                f"Video/body timing disagrees with {pair.smpl}: "
+                f"Video/body timing disagrees with narration row "
+                f"{pair.annotation.row_index} in {narration_path}: "
                 f"video body range={body_times[0]:.6f}.."
-                f"{body_times[-1]:.6f}, SMPL range={smpl_start:.6f}.."
-                f"{smpl_end:.6f}, allowed boundary drift="
+                f"{body_times[-1]:.6f}, annotation range="
+                f"{annotation_start:.6f}..{annotation_end:.6f}, "
+                "allowed boundary drift="
                 f"{MAX_CLIP_BOUNDARY_DRIFT_SECONDS:.3f}s"
             )
 
@@ -1200,21 +1374,54 @@ def _prepare_clip(
                 PART_INDEX["R_Hand"],
             ],
         )
-        left_hands, right_hands = camera_space_hands(
+        left_hands, right_hands, camera_to_world = world_space_hands(
             parts,
+            world_from_device,
             camera=camera,
             hand_eye=hand_eye,
         )
-        left_visible = _visibility(
+        world_to_camera = np.linalg.inv(camera_to_world)
+        left_observation = np.einsum(
+            "nij,njk->nik",
+            world_to_camera,
             left_hands,
+        )
+        right_observation = np.einsum(
+            "nij,njk->nik",
+            world_to_camera,
+            right_hands,
+        )
+        left_visible = _visibility(
+            left_observation,
             intrinsic=camera.intrinsic,
             resolution=camera.resolution,
         )
         right_visible = _visibility(
-            right_hands,
+            right_observation,
             intrinsic=camera.intrinsic,
             resolution=camera.resolution,
         )
+        motion = _fixed_base_motion_metrics(
+            camera_to_world=camera_to_world,
+            left_hands=left_hands,
+            right_hands=right_hands,
+        )
+        if motion_filter and (
+            motion["maximum_camera_translation_m"]
+            > maximum_camera_translation_m
+            or motion["maximum_camera_rotation_degrees"]
+            > maximum_camera_rotation_degrees
+            or motion["maximum_hand_displacement_m"]
+            > maximum_hand_displacement_m
+        ):
+            return None, {
+                "clip": pair.stem,
+                "reason": (
+                    "global wearer motion is incompatible with the current "
+                    "fixed-base G1 retargeter"
+                ),
+                **motion,
+            }
         if require_visible_hands and (
             np.count_nonzero(left_visible) < 2
             or np.count_nonzero(right_visible) < 2
@@ -1229,6 +1436,16 @@ def _prepare_clip(
                 "right_visible_frames": int(np.count_nonzero(right_visible)),
             }
 
+        normalized_count = _normalize_video(
+            pair.video,
+            normalized_video,
+            hardware_encoding=hardware_encoding,
+        )
+        if normalized_count != frame_count:
+            raise ValueError(
+                f"Visible frame count changed while normalizing {pair.video}: "
+                f"{frame_count} -> {normalized_count}"
+            )
         if require_visible_hands:
             left_confidence = left_visible.astype(np.float32)
             right_confidence = right_visible.astype(np.float32)
@@ -1238,14 +1455,15 @@ def _prepare_clip(
         write_adapter_hdf5(
             adapter_hdf5,
             pair=pair,
+            narration_path=narration_path,
             camera=camera,
+            camera_to_world=camera_to_world,
             left_hands=left_hands,
             right_hands=right_hands,
             left_confidence=left_confidence,
             right_confidence=right_confidence,
             body_times=body_times,
             source_frame_indices=source_frames,
-            timing=timing,
         )
         return (
             PreparedClip(
@@ -1256,10 +1474,20 @@ def _prepare_clip(
                 source_start_frame=source_start,
                 body_time_start=float(body_times[0]),
                 body_time_end=float(body_times[-1]),
-                smpl_start_offset_seconds=start_offset,
-                smpl_end_offset_seconds=end_offset,
+                annotation_start_offset_seconds=start_offset,
+                annotation_end_offset_seconds=end_offset,
                 left_visible_fraction=float(np.mean(left_visible)),
                 right_visible_fraction=float(np.mean(right_visible)),
+                maximum_slam_time_error_us=float(np.max(slam_time_errors)),
+                maximum_camera_translation_m=motion[
+                    "maximum_camera_translation_m"
+                ],
+                maximum_camera_rotation_degrees=motion[
+                    "maximum_camera_rotation_degrees"
+                ],
+                maximum_hand_displacement_m=motion[
+                    "maximum_hand_displacement_m"
+                ],
             ),
             None,
         )
@@ -1276,9 +1504,16 @@ def prepare_clips(
     adapter_root: Path,
     camera: CameraCalibration,
     body: BodyMotion,
+    slam: SlamTrajectory,
     hand_eye: HandEyeResult,
+    narration_path: Path,
+    timecode_offset_seconds: float,
     hardware_encoding: bool,
     require_visible_hands: bool,
+    motion_filter: bool,
+    maximum_camera_translation_m: float,
+    maximum_camera_rotation_degrees: float,
+    maximum_hand_displacement_m: float,
 ) -> tuple[
     list[PreparedClip],
     list[dict[str, Any]],
@@ -1318,11 +1553,22 @@ def prepare_clips(
                     adapter_root=adapter_root,
                     camera=camera,
                     body=body,
+                    slam=slam,
                     hand_eye=hand_eye,
+                    narration_path=narration_path,
+                    timecode_offset_seconds=timecode_offset_seconds,
                     capture_timestamps=capture_timestamps,
                     full_digests=full_digests,
                     hardware_encoding=hardware_encoding,
                     require_visible_hands=require_visible_hands,
+                    motion_filter=motion_filter,
+                    maximum_camera_translation_m=(
+                        maximum_camera_translation_m
+                    ),
+                    maximum_camera_rotation_degrees=(
+                        maximum_camera_rotation_degrees
+                    ),
+                    maximum_hand_displacement_m=maximum_hand_displacement_m,
                 )
             except KeyboardInterrupt:
                 tqdm.write(
@@ -1351,8 +1597,7 @@ def prepare_clips(
             if skipped_clip is not None:
                 skipped.append(skipped_clip)
                 tqdm.write(
-                    f"Skipped {pair.short_name}: wearer wrists are not "
-                    "visible in both hands"
+                    f"Skipped {pair.short_name}: {skipped_clip['reason']}"
                 )
                 progress.set_postfix_str(
                     f"last={pair.short_name} "
@@ -1384,7 +1629,6 @@ def _pipeline_command(
     *,
     adapter_root: Path,
     output: Path,
-    camera: CameraCalibration,
     args: argparse.Namespace,
 ) -> list[str]:
     command = [
@@ -1395,11 +1639,6 @@ def _pipeline_command(
         str(adapter_root),
         "--output",
         str(output),
-        "--width",
-        str(camera.resolution[0]),
-        "--height",
-        str(camera.resolution[1]),
-        "--no-binary-hands",
         "--arm-prompt",
         args.arm_prompt,
         "--sam-threshold",
@@ -1424,21 +1663,38 @@ def _pipeline_command(
 def _report_prepared_clip(clip: PreparedClip) -> dict[str, Any]:
     return {
         "clip": clip.pair.stem,
-        "source_smpl": str(clip.pair.smpl),
         "source_video": str(clip.pair.video),
+        "narration_row_index": clip.pair.annotation.row_index,
         "frame_count": clip.frame_count,
         "source_full_15fps_start_frame": clip.source_start_frame,
         "body_time_seconds": [
             clip.body_time_start,
             clip.body_time_end,
         ],
-        "visible_video_boundary_offset_from_smpl_seconds": {
-            "start": clip.smpl_start_offset_seconds,
-            "end": clip.smpl_end_offset_seconds,
+        "visible_video_boundary_offset_from_annotation_seconds": {
+            "start": clip.annotation_start_offset_seconds,
+            "end": clip.annotation_end_offset_seconds,
         },
         "left_visible_fraction": clip.left_visible_fraction,
         "right_visible_fraction": clip.right_visible_fraction,
-        "hand_action": "fixed open; source SMPL has no articulated hand pose",
+        "maximum_slam_pose_time_error_us": (
+            clip.maximum_slam_time_error_us
+        ),
+        "fixed_base_motion": {
+            "maximum_camera_translation_m": (
+                clip.maximum_camera_translation_m
+            ),
+            "maximum_camera_rotation_degrees": (
+                clip.maximum_camera_rotation_degrees
+            ),
+            "maximum_hand_displacement_m": (
+                clip.maximum_hand_displacement_m
+            ),
+        },
+        "hand_action": (
+            "rigid XSens hand/palm pose; robot fingers fixed open because "
+            "source body tracks have no articulated finger pose"
+        ),
     }
 
 
@@ -1446,21 +1702,28 @@ def run(args: argparse.Namespace) -> int:
     started = time.perf_counter()
     if not 0.0 < args.hand_eye_sample_fps <= 240.0:
         raise ValueError("--hand-eye-sample-fps must be in (0, 240]")
-    smpl_directory = Path(args.smpl_dir).expanduser().resolve()
-    video_directory = Path(args.video_dir).expanduser().resolve()
-    episode_root = (
-        Path(args.episode_root).expanduser().resolve()
-        if args.episode_root is not None
-        else smpl_directory.parent
+    for name in (
+        "maximum_camera_translation_m",
+        "maximum_camera_rotation_degrees",
+        "maximum_hand_displacement_m",
+    ):
+        if getattr(args, name) <= 0.0:
+            option = "--" + name.replace("_", "-")
+            raise ValueError(f"{option} must be positive")
+    episode_root = Path(args.episode_root).expanduser().resolve()
+    if not episode_root.is_dir():
+        raise NotADirectoryError(f"Nymeria episode not found: {episode_root}")
+    video_directory = (
+        Path(args.video_dir).expanduser().resolve()
+        if args.video_dir is not None
+        else episode_root / ACTIVITY_VIDEO_RELATIVE_PATH
     )
-    if smpl_directory.parent != episode_root:
-        raise ValueError(
-            f"--smpl-dir must belong directly to --episode-root: "
-            f"{smpl_directory} vs {episode_root}"
-        )
+    narration = load_activity_narration(
+        episode_root / ACTIVITY_NARRATION_RELATIVE_PATH
+    )
     pairs = discover_clip_pairs(
-        smpl_directory,
         video_directory,
+        narration,
         selected=args.clip,
     )
     if args.max_clips is not None:
@@ -1479,15 +1742,18 @@ def run(args: argparse.Namespace) -> int:
         intrinsics_path,
     )
     body = load_body_motion(episode_root / BODY_RELATIVE_PATH)
+    slam = load_slam_trajectory(
+        episode_root / CAMERA_TRAJECTORY_RELATIVE_PATH
+    )
     tqdm.write(
         f"Discovered {len(pairs)} Nymeria clip pair(s); "
         f"episode={episode_root.name}, resolution="
         f"{camera.resolution[0]}x{camera.resolution[1]}"
     )
     hand_eye = estimate_hand_eye(
-        episode_root=episode_root,
         body=body,
-        clip_pairs=pairs,
+        slam=slam,
+        timecode_offset_seconds=narration.timecode_offset_seconds,
         sample_fps=args.hand_eye_sample_fps,
     )
     tqdm.write(
@@ -1501,6 +1767,14 @@ def run(args: argparse.Namespace) -> int:
         if args.adapter_output is not None
         else None
     )
+    if kept_adapter is not None and (
+        kept_adapter == output
+        or kept_adapter.is_relative_to(output)
+        or output.is_relative_to(kept_adapter)
+    ):
+        raise ValueError(
+            "--adapter-output and --output must be disjoint directories"
+        )
     temporary_context: tempfile.TemporaryDirectory[str] | None = None
     if kept_adapter is None:
         temporary_context = tempfile.TemporaryDirectory(
@@ -1519,6 +1793,27 @@ def run(args: argparse.Namespace) -> int:
             f"--adapter-output episode directory must be empty: {adapter_root}"
         )
 
+    published_root = output / episode_root.name
+    report_path = published_root / "visual_alignment_report.json"
+    keep_report = args.debug or args.prepare_only
+    if not keep_report:
+        removed: list[Path] = []
+        if report_path.is_file() or report_path.is_symlink():
+            report_path.unlink()
+            removed.append(report_path)
+        previous_adapter = published_root / "adapter"
+        if previous_adapter.is_symlink() or previous_adapter.is_file():
+            previous_adapter.unlink()
+            removed.append(previous_adapter)
+        elif previous_adapter.is_dir():
+            shutil.rmtree(previous_adapter)
+            removed.append(previous_adapter)
+        if removed:
+            tqdm.write(
+                "Removed previous Nymeria debug/prepare outputs: "
+                + ", ".join(str(path) for path in removed)
+            )
+
     try:
         prepared, skipped, failed = prepare_clips(
             pairs=pairs,
@@ -1526,24 +1821,32 @@ def run(args: argparse.Namespace) -> int:
             adapter_root=adapter_root,
             camera=camera,
             body=body,
+            slam=slam,
             hand_eye=hand_eye,
+            narration_path=narration.path,
+            timecode_offset_seconds=narration.timecode_offset_seconds,
             hardware_encoding=args.hardware_encoding,
             require_visible_hands=args.require_visible_hands,
-        )
-        report_path = output / episode_root.name / "visual_alignment_report.json"
-        smpl_camera_fields = sorted(
-            {
-                field
-                for pair in pairs
-                for field in _clip_timing(pair.smpl)["camera_fields"]
-            }
+            motion_filter=args.motion_filter,
+            maximum_camera_translation_m=(
+                args.maximum_camera_translation_m
+            ),
+            maximum_camera_rotation_degrees=(
+                args.maximum_camera_rotation_degrees
+            ),
+            maximum_hand_displacement_m=args.maximum_hand_displacement_m,
         )
         report: dict[str, Any] = {
-            "schema_version": 1,
+            "schema_version": 3,
             "status": "prepared",
             "episode": episode_root.name,
-            "smpl_directory": str(smpl_directory),
             "video_directory": str(video_directory),
+            "activity_narration": {
+                "path": str(narration.path),
+                "timecode_offset_seconds": (
+                    narration.timecode_offset_seconds
+                ),
+            },
             "intrinsics": {
                 "path": str(intrinsics_path),
                 "resolution": list(camera.resolution),
@@ -1560,30 +1863,55 @@ def run(args: argparse.Namespace) -> int:
                 "source_projection_parameters": (
                     camera.source_parameters.tolist()
                 ),
-                "T_Device_Camera": camera.device_from_camera.tolist(),
+                "T_Device_Camera": (
+                    camera.source_device_from_camera.tolist()
+                ),
                 "trajectory": str(
                     episode_root / CAMERA_TRAJECTORY_RELATIVE_PATH
                 ),
             },
-            "smpl_camera_fields": smpl_camera_fields,
+            "video_camera": {
+                "orientation": "upright",
+                "source_image_rotation_clockwise_degrees": (
+                    VIDEO_ROTATION_CLOCKWISE_DEGREES
+                ),
+                "T_CameraRGB_CameraUpright": (
+                    CAMERA_RGB_FROM_VIDEO_CAMERA.tolist()
+                ),
+                "T_Device_CameraUpright": (
+                    camera.device_from_video_camera.tolist()
+                ),
+            },
             "camera_parameter_policy": (
-                "K comes from camera_intrinsics.json; T_Device_Camera comes "
-                "only from recording_head. SMPL camera fields are not applied."
+                "K describes the upright video. Raw T_Device_Camera comes "
+                "from recording_head; T_Device_CameraUpright composes the "
+                "Project Aria clockwise-90-degree video orientation."
             ),
+            "fixed_base_motion_filter": {
+                "enabled": args.motion_filter,
+                "maximum_camera_translation_m": (
+                    args.maximum_camera_translation_m
+                ),
+                "maximum_camera_rotation_degrees": (
+                    args.maximum_camera_rotation_degrees
+                ),
+                "maximum_hand_displacement_m": (
+                    args.maximum_hand_displacement_m
+                ),
+            },
             "hand_eye": hand_eye.as_dict(),
             "prepared": [_report_prepared_clip(clip) for clip in prepared],
             "skipped": skipped,
             "failed": failed,
             "elapsed_seconds": time.perf_counter() - started,
         }
-        keep_report = args.debug or args.prepare_only
         if keep_report:
             _atomic_write_json(report_path, report)
         if not prepared:
             reason = (
                 f"all {len(failed)} selected clip(s) failed"
                 if failed
-                else "no clip has both wearer wrists visible"
+                else "all selected clips were rejected by eligibility filters"
             )
             tqdm.write(f"No clips prepared ({reason}); nothing to synthesize")
             return 1
@@ -1610,7 +1938,6 @@ def run(args: argparse.Namespace) -> int:
         command = _pipeline_command(
             adapter_root=adapter_base,
             output=output,
-            camera=camera,
             args=args,
         )
         tqdm.write("Starting SAM3 / ProPainter / Pinocchio / Isaac pipeline")
@@ -1623,7 +1950,6 @@ def run(args: argparse.Namespace) -> int:
                 _atomic_write_json(report_path, report)
             return int(completed.returncode)
 
-        published_root = output / episode_root.name
         missing_outputs: list[str] = []
         for clip in prepared:
             published_video = published_root / f"{clip.pair.stem}.mp4"
@@ -1660,29 +1986,24 @@ def run(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Pair Nymeria activity SMPL/video clips, align XSens wrists to "
-            "the Aria RGB camera, and run the existing human-to-G1 visual "
-            "synthesis pipeline."
+            "Pair Nymeria activity narration/video clips, align XSens wrists "
+            "to the Aria RGB camera, and run the existing human-to-G1 visual "
+            "synthesis pipeline without activity SMPL files."
         )
     )
     parser.add_argument(
         "--episode-root",
         type=Path,
-        help=(
-            "Nymeria episode root; default is the parent of --smpl-dir"
-        ),
-    )
-    parser.add_argument(
-        "--smpl-dir",
-        type=Path,
         required=True,
-        help="Directory containing same-stem activity SMPL NPZ clips",
+        help="Nymeria episode root",
     )
     parser.add_argument(
         "--video-dir",
         type=Path,
-        required=True,
-        help="Directory containing same-stem 384x384 undistorted MP4 clips",
+        help=(
+            "Directory containing cNNN activity MP4 clips; default "
+            "<episode>/undistorted_384_activity_summarization_clips"
+        ),
     )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
@@ -1729,6 +2050,33 @@ def build_parser() -> argparse.ArgumentParser:
             "Skip clips unless each projected wearer wrist is visible in at "
             "least two frames (default: true)"
         ),
+    )
+    parser.add_argument(
+        "--motion-filter",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Skip global-motion clips that cannot be represented by the "
+            "current fixed-base G1 retargeter (default: true)"
+        ),
+    )
+    parser.add_argument(
+        "--maximum-camera-translation-m",
+        type=float,
+        default=0.25,
+        help="Fixed-base clip limit in meters (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--maximum-camera-rotation-degrees",
+        type=float,
+        default=45.0,
+        help="Fixed-base clip rotation limit (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--maximum-hand-displacement-m",
+        type=float,
+        default=0.75,
+        help="Fixed-base hand-target motion limit (default: %(default)s)",
     )
     parser.add_argument(
         "--hardware-encoding",

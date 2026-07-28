@@ -3,16 +3,25 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
 import numpy as np
 import pinocchio as pin
+from scipy.signal import savgol_filter
 from scipy.spatial.transform import Rotation
 
 from .hand_binary import HandBinaryResult, infer_binary_grasps_from_hdf5
-from .trajectory import HandTrajectory, load_hand_trajectory
+from .trajectory import (
+    FINGERTIP_GRASP_TARGET,
+    HAND_LANDMARK_NAMES,
+    RIGID_PALM_TARGET,
+    ArticulatedHandTrajectory,
+    HandTrajectory,
+    load_hand_trajectory,
+)
 from .video_io import video_metadata
 
 
@@ -62,6 +71,49 @@ HAND_JOINT_SUFFIXES = (
     "thumb_cmc_pitch",
     "thumb_ip",
 )
+O6_MOTOR_SUFFIXES = (
+    "thumb_cmc_yaw",
+    "thumb_cmc_pitch",
+    "index_mcp_pitch",
+    "middle_mcp_pitch",
+    "ring_mcp_pitch",
+    "pinky_mcp_pitch",
+)
+O6_DIGITS = ("thumb", "index", "middle", "ring", "pinky")
+O6_FLEX_DIGITS = ("index", "middle", "ring", "pinky")
+O6_MOTOR_COUNT = len(O6_MOTOR_SUFFIXES)
+ARTICULATED_DIGIT_CHAINS = {
+    "thumb": (
+        "ThumbKnuckle",
+        "ThumbIntermediateBase",
+        "ThumbIntermediateTip",
+        "ThumbTip",
+    ),
+    "index": (
+        "IndexFingerKnuckle",
+        "IndexFingerIntermediateBase",
+        "IndexFingerIntermediateTip",
+        "IndexFingerTip",
+    ),
+    "middle": (
+        "MiddleFingerKnuckle",
+        "MiddleFingerIntermediateBase",
+        "MiddleFingerIntermediateTip",
+        "MiddleFingerTip",
+    ),
+    "ring": (
+        "RingFingerKnuckle",
+        "RingFingerIntermediateBase",
+        "RingFingerIntermediateTip",
+        "RingFingerTip",
+    ),
+    "pinky": (
+        "LittleFingerKnuckle",
+        "LittleFingerIntermediateBase",
+        "LittleFingerIntermediateTip",
+        "LittleFingerTip",
+    ),
+}
 
 HAND_JOINTS = tuple(
     f"{side}_{suffix}"
@@ -73,10 +125,19 @@ HAND_TIP_LOCAL_OFFSETS = {
     "thumb": np.array([-0.00679, 0.0, 0.04790], dtype=np.float64),
     "index": np.array([0.01458, 0.0, 0.03707], dtype=np.float64),
     "middle": np.array([0.01458, 0.0, 0.03707], dtype=np.float64),
+    "ring": np.array([0.01458, 0.0, 0.03707], dtype=np.float64),
+    "pinky": np.array([0.01458, 0.0, 0.03707], dtype=np.float64),
 }
 PALM_FRAMES = ("left_palm", "right_palm")
 PALM_OFFSET_FROM_WRIST = np.array([0.08, 0.0, 0.0], dtype=np.float64)
-TRAJECTORY_SCHEMA_VERSION = 5
+ACTION_SCALE = 0.84
+BASE_GRID_POINTS_PER_AXIS = 5
+BASE_YAW_OFFSETS_RAD = np.deg2rad(
+    np.asarray([0.0, -30.0, 30.0, -60.0, 60.0], dtype=np.float64)
+)
+IK_FEASIBLE_POSITION_ERROR_M = 0.02
+IK_FEASIBLE_ORIENTATION_ERROR_RAD = np.deg2rad(15.0)
+TRAJECTORY_SCHEMA_VERSION = 9
 
 
 @dataclass(frozen=True)
@@ -97,6 +158,7 @@ class PinocchioRetargetResult:
     left_visible: np.ndarray
     right_visible: np.ndarray
     hand_closures: np.ndarray
+    hand_motor_commands: np.ndarray
     hand_binary_states: np.ndarray
     target_hand_widths: np.ndarray
     achieved_hand_widths: np.ndarray
@@ -106,12 +168,20 @@ class PinocchioRetargetResult:
     hand_tcp_translations: np.ndarray
     hand_tcp_rotations: np.ndarray
     base_position: np.ndarray
+    base_rotation: np.ndarray
+    base_search_keyframes: np.ndarray
+    base_search_centroid: np.ndarray
+    maximum_reach: float
     scale: float
-    search_results: list[dict[str, float | list[float]]]
+    search_results: list[dict[str, object]]
 
 
 def build_pinocchio_g1(urdf_path: str | Path) -> pin.Model:
-    model = pin.buildModelFromUrdf(str(Path(urdf_path).resolve()))
+    resolved_urdf = Path(urdf_path).resolve()
+    model = pin.buildModelFromUrdf(str(resolved_urdf))
+    model.vision_align_mimic_joints = _load_urdf_mimic_joints(
+        resolved_urdf
+    )
     for side in ("left", "right"):
         wrist_frame_id = model.getFrameId(f"{side}_wrist_yaw_link")
         if wrist_frame_id >= model.nframes:
@@ -141,36 +211,185 @@ def build_pinocchio_g1(urdf_path: str | Path) -> pin.Model:
     return model
 
 
+def _load_urdf_mimic_joints(
+    urdf_path: Path,
+) -> dict[str, tuple[str, float, float]]:
+    root = ET.parse(urdf_path).getroot()
+    result: dict[str, tuple[str, float, float]] = {}
+    for joint in root.findall("joint"):
+        name = joint.get("name")
+        mimic = joint.find("mimic")
+        if name is None or mimic is None or mimic.get("joint") is None:
+            continue
+        result[name] = (
+            str(mimic.get("joint")),
+            float(mimic.get("multiplier", "1")),
+            float(mimic.get("offset", "0")),
+        )
+    return result
+
+
+def _mimic_joints(
+    model: pin.Model,
+) -> dict[str, tuple[str, float, float]]:
+    loaded = getattr(model, "vision_align_mimic_joints", None)
+    if isinstance(loaded, dict):
+        return loaded
+    fallback: dict[str, tuple[str, float, float]] = {}
+    for side in ("left", "right"):
+        for digit in O6_FLEX_DIGITS:
+            fallback[f"{side}_{digit}_dip"] = (
+                f"{side}_{digit}_mcp_pitch",
+                0.89,
+                0.0,
+            )
+        fallback[f"{side}_thumb_ip"] = (
+            f"{side}_thumb_cmc_pitch",
+            2.29 if side == "left" else 1.86,
+            0.0,
+        )
+    return fallback
+
+
+def _o6_motor_limits(
+    model: pin.Model,
+    side: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    if side not in {"left", "right"}:
+        raise ValueError(f"Unknown hand side: {side}")
+    lower = np.empty(O6_MOTOR_COUNT, dtype=np.float64)
+    upper = np.empty(O6_MOTOR_COUNT, dtype=np.float64)
+    motor_index: dict[str, int] = {}
+    for index, suffix in enumerate(O6_MOTOR_SUFFIXES):
+        name = f"{side}_{suffix}"
+        joint_id = model.getJointId(name)
+        q_index = model.idx_qs[joint_id]
+        lower[index] = float(model.lowerPositionLimit[q_index])
+        upper[index] = float(model.upperPositionLimit[q_index])
+        motor_index[name] = index
+
+    for child, (master, multiplier, offset) in _mimic_joints(model).items():
+        if not child.startswith(f"{side}_") or master not in motor_index:
+            continue
+        if abs(multiplier) < 1e-12:
+            continue
+        child_id = model.getJointId(child)
+        child_q = model.idx_qs[child_id]
+        child_lower = float(model.lowerPositionLimit[child_q])
+        child_upper = float(model.upperPositionLimit[child_q])
+        bounds = sorted(
+            (
+                (child_lower - offset) / multiplier,
+                (child_upper - offset) / multiplier,
+            )
+        )
+        index = motor_index[master]
+        lower[index] = max(lower[index], bounds[0])
+        upper[index] = min(upper[index], bounds[1])
+    if np.any(upper <= lower):
+        raise RuntimeError(f"Invalid O6 motor limits for {side} hand")
+    return lower, upper
+
+
+def _set_hand_motor_configuration(
+    model: pin.Model,
+    q: np.ndarray,
+    motor_commands: np.ndarray,
+) -> None:
+    commands = np.asarray(motor_commands, dtype=np.float64)
+    expected = (2, O6_MOTOR_COUNT)
+    if commands.shape != expected or not np.isfinite(commands).all():
+        raise ValueError(
+            f"O6 motor commands must be finite with shape {expected}, "
+            f"got {commands.shape}"
+        )
+
+    command_by_joint: dict[str, float] = {}
+    for side_index, side in enumerate(("left", "right")):
+        lower, upper = _o6_motor_limits(model, side)
+        if np.any(commands[side_index] < lower - 1e-9) or np.any(
+            commands[side_index] > upper + 1e-9
+        ):
+            raise ValueError(
+                f"{side} O6 motor command exceeds limits: "
+                f"{commands[side_index]}"
+            )
+        for motor_index, suffix in enumerate(O6_MOTOR_SUFFIXES):
+            command_by_joint[f"{side}_{suffix}"] = float(
+                np.clip(
+                    commands[side_index, motor_index],
+                    lower[motor_index],
+                    upper[motor_index],
+                )
+            )
+
+    mimic = _mimic_joints(model)
+    for joint_name in HAND_JOINTS:
+        if joint_name in command_by_joint:
+            value = command_by_joint[joint_name]
+        elif joint_name in mimic:
+            master, multiplier, offset = mimic[joint_name]
+            value = multiplier * command_by_joint[master] + offset
+        else:
+            raise RuntimeError(
+                f"Hand joint {joint_name} is neither an O6 motor nor mimic"
+            )
+        joint_id = model.getJointId(joint_name)
+        q_index = model.idx_qs[joint_id]
+        q[q_index] = np.clip(
+            value,
+            model.lowerPositionLimit[q_index],
+            model.upperPositionLimit[q_index],
+        )
+
+
+def _closures_to_motor_commands(
+    model: pin.Model,
+    closures: np.ndarray,
+) -> np.ndarray:
+    action = np.asarray(closures, dtype=np.float64)
+    squeeze = action.ndim == 1
+    if squeeze:
+        action = action[None]
+    if (
+        action.ndim != 2
+        or action.shape[1] != 2
+        or not np.isfinite(action).all()
+        or np.any(action < 0.0)
+        or np.any(action > 1.0)
+    ):
+        raise ValueError(
+            "Continuous hand closure must have shape [N, 2], be finite, "
+            f"and remain within [0, 1], got {action}"
+        )
+    result = np.empty(
+        (len(action), 2, O6_MOTOR_COUNT),
+        dtype=np.float64,
+    )
+    for side_index, side in enumerate(("left", "right")):
+        lower, upper = _o6_motor_limits(model, side)
+        result[:, side_index] = lower + action[:, side_index, None] * (
+            upper - lower
+        )
+    return result[0] if squeeze else result
+
+
 def _closed_hand_joint_values(
     model: pin.Model,
     side: str,
 ) -> dict[str, float]:
-    values: dict[str, float] = {}
-    for suffix in HAND_JOINT_SUFFIXES:
-        joint_name = f"{side}_{suffix}"
-        joint_id = model.getJointId(joint_name)
-        q_index = model.idx_qs[joint_id]
-        values[suffix] = float(model.upperPositionLimit[q_index])
-
-    mimic_scale = {
-        "index_dip": 0.89,
-        "middle_dip": 0.89,
-        "pinky_dip": 0.89,
-        "ring_dip": 0.89,
+    q = pin.neutral(model)
+    commands = _closures_to_motor_commands(
+        model,
+        np.ones(2, dtype=np.float64),
+    )
+    _set_hand_motor_configuration(model, q, commands)
+    return {
+        suffix: float(
+            q[model.idx_qs[model.getJointId(f"{side}_{suffix}")]]
+        )
+        for suffix in HAND_JOINT_SUFFIXES
     }
-    for suffix, scale in mimic_scale.items():
-        master = suffix.replace("_dip", "_mcp_pitch")
-        values[suffix] = min(values[suffix], scale * values[master])
-    thumb_scale = 2.29 if side == "left" else 1.86
-    values["thumb_cmc_pitch"] = min(
-        values["thumb_cmc_pitch"],
-        values["thumb_ip"] / thumb_scale,
-    )
-    values["thumb_ip"] = min(
-        values["thumb_ip"],
-        thumb_scale * values["thumb_cmc_pitch"],
-    )
-    return values
 
 
 def _set_continuous_hand_configuration(
@@ -180,28 +399,11 @@ def _set_continuous_hand_configuration(
 ) -> None:
     """Map continuous ``[left, right]`` closure values into LinkerHand joints."""
 
-    action = np.asarray(closures, dtype=np.float64)
-    if (
-        action.shape != (2,)
-        or not np.isfinite(action).all()
-        or np.any(action < 0.0)
-        or np.any(action > 1.0)
-    ):
-        raise ValueError(
-            "Continuous hand closure must be finite [left, right] values "
-            f"within [0, 1], got {action}"
-        )
-    for side_index, side in enumerate(("left", "right")):
-        closure = float(action[side_index])
-        closed_values = _closed_hand_joint_values(model, side)
-        for suffix in HAND_JOINT_SUFFIXES:
-            joint_name = f"{side}_{suffix}"
-            joint_id = model.getJointId(joint_name)
-            q_index = model.idx_qs[joint_id]
-            lower = float(model.lowerPositionLimit[q_index])
-            q[q_index] = lower + closure * (
-                closed_values[suffix] - lower
-            )
+    _set_hand_motor_configuration(
+        model,
+        q,
+        _closures_to_motor_commands(model, closures),
+    )
 
 
 def _current_hand_jaw_width(
@@ -275,16 +477,24 @@ def _hand_tcp_transforms(
     """Compute state-dependent jaw centers with fixed semantic TCP bases."""
 
     commands = np.asarray(hand_commands, dtype=np.float64)
-    if commands.ndim != 2 or commands.shape[1] != 2:
+    if commands.ndim == 2 and commands.shape[1] == 2:
+        motor_commands = _closures_to_motor_commands(model, commands)
+    elif commands.ndim == 3 and commands.shape[1:] == (
+        2,
+        O6_MOTOR_COUNT,
+    ):
+        motor_commands = commands
+    else:
         raise ValueError(
-            f"Hand commands must have shape [N, 2], got {commands.shape}"
+            "Hand commands must have shape [N, 2] or [N, 2, 6], "
+            f"got {commands.shape}"
         )
     canonical_rotations = _canonical_tcp_rotations(model)
-    translations = np.empty((len(commands), 2, 3), dtype=np.float64)
+    translations = np.empty((len(motor_commands), 2, 3), dtype=np.float64)
     data = model.createData()
-    for frame_id, command in enumerate(commands):
+    for frame_id, command in enumerate(motor_commands):
         q = pin.neutral(model)
-        _set_continuous_hand_configuration(model, q, command)
+        _set_hand_motor_configuration(model, q, command)
         pin.forwardKinematics(model, data, q)
         pin.updateFramePlacements(model, data)
         for side_index, side in enumerate(("left", "right")):
@@ -344,7 +554,7 @@ def _retarget_hand_widths(
     np.ndarray,
     list[dict[str, float]],
 ]:
-    """Map the paper's continuous ``w_t`` to calibrated hand closure."""
+    """Map the continuous ``w_t`` to calibrated hand closure."""
 
     widths = np.asarray(human_widths, dtype=np.float64)
     if widths.ndim != 2 or widths.shape[1] != 2:
@@ -391,6 +601,557 @@ def _retarget_hand_widths(
                 _current_hand_jaw_width(model, data, side=side)
             )
     return closures, target_widths, achieved_widths, profiles
+
+
+def _open_hand_motor_commands(model: pin.Model) -> np.ndarray:
+    return np.stack(
+        [_o6_motor_limits(model, side)[0] for side in ("left", "right")],
+        axis=0,
+    )
+
+
+def _hand_anatomical_basis(
+    palm: np.ndarray,
+    index_base: np.ndarray,
+    middle_base: np.ndarray,
+    pinky_base: np.ndarray,
+) -> np.ndarray | None:
+    forward = np.asarray(middle_base, dtype=np.float64) - palm
+    forward_norm = float(np.linalg.norm(forward))
+    if not np.isfinite(forward_norm) or forward_norm < 1e-9:
+        return None
+    forward /= forward_norm
+    lateral = np.asarray(index_base, dtype=np.float64) - pinky_base
+    lateral -= forward * float(np.dot(forward, lateral))
+    lateral_norm = float(np.linalg.norm(lateral))
+    if not np.isfinite(lateral_norm) or lateral_norm < 1e-9:
+        return None
+    lateral /= lateral_norm
+    normal = np.cross(forward, lateral)
+    normal_norm = float(np.linalg.norm(normal))
+    if not np.isfinite(normal_norm) or normal_norm < 1e-9:
+        return None
+    normal /= normal_norm
+    return np.column_stack([forward, lateral, normal])
+
+
+def _robot_digit_feature(
+    model: pin.Model,
+    data: pin.Data,
+    *,
+    side: str,
+    digit: str,
+) -> np.ndarray:
+    palm = data.oMf[model.getFrameId(f"{side}_palm")].translation
+    bases = {
+        name: data.oMf[
+            model.getFrameId(
+                f"{side}_{name}_"
+                + (
+                    "metacarpals_base2"
+                    if name == "thumb"
+                    else "proximal"
+                )
+            )
+        ].translation
+        for name in O6_DIGITS
+    }
+    basis = _hand_anatomical_basis(
+        palm,
+        bases["index"],
+        bases["middle"],
+        bases["pinky"],
+    )
+    if basis is None:
+        raise RuntimeError(f"Degenerate {side} robot palm geometry")
+
+    distal = data.oMf[model.getFrameId(f"{side}_{digit}_distal")]
+    tip = (
+        distal.translation
+        + distal.rotation @ HAND_TIP_LOCAL_OFFSETS[digit]
+    )
+    if digit == "thumb":
+        nodes = (
+            bases[digit],
+            data.oMf[
+                model.getFrameId(f"{side}_thumb_metacarpals")
+            ].translation,
+            distal.translation,
+            tip,
+        )
+    else:
+        nodes = (bases[digit], distal.translation, tip)
+    chain_length = sum(
+        float(np.linalg.norm(following - previous))
+        for previous, following in zip(nodes[:-1], nodes[1:], strict=True)
+    )
+    vector = basis.T @ (tip - bases[digit])
+    terminal = basis.T @ (tip - distal.translation)
+    chord = float(np.linalg.norm(vector))
+    terminal_length = float(np.linalg.norm(terminal))
+    if (
+        chain_length < 1e-9
+        or chord < 1e-9
+        or terminal_length < 1e-9
+    ):
+        raise RuntimeError(f"Degenerate {side} {digit} robot geometry")
+    return np.concatenate(
+        [
+            vector / chord,
+            terminal / terminal_length,
+            np.asarray([chord / chain_length]),
+        ]
+    )
+
+
+def _articulated_source_features(
+    track: ArticulatedHandTrajectory,
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+    if track.names != HAND_LANDMARK_NAMES:
+        raise ValueError("Articulated hand landmarks use an unknown order")
+    points = np.asarray(track.points_palm, dtype=np.float64)
+    confidence = np.asarray(track.confidence, dtype=np.float64)
+    if points.shape != (track.frame_count, len(track.names), 3):
+        raise ValueError(
+            f"Invalid articulated hand point shape: {points.shape}"
+        )
+    if confidence.shape != points.shape[:2]:
+        raise ValueError(
+            f"Invalid articulated hand confidence shape: {confidence.shape}"
+        )
+    landmark_index = {
+        name: index for index, name in enumerate(track.names)
+    }
+    basis_names = (
+        "Hand",
+        "IndexFingerKnuckle",
+        "MiddleFingerKnuckle",
+        "LittleFingerKnuckle",
+    )
+    basis_indices = [landmark_index[name] for name in basis_names]
+    features = {
+        digit: np.full((track.frame_count, 7), np.nan, dtype=np.float64)
+        for digit in O6_DIGITS
+    }
+    valid = {
+        digit: np.zeros(track.frame_count, dtype=bool)
+        for digit in O6_DIGITS
+    }
+    for frame_id in range(track.frame_count):
+        basis_points = points[frame_id, basis_indices]
+        basis_confidence = confidence[frame_id, basis_indices]
+        if (
+            not np.isfinite(basis_points).all()
+            or not np.isfinite(basis_confidence).all()
+            or np.any(basis_confidence <= 0.0)
+        ):
+            continue
+        basis = _hand_anatomical_basis(*basis_points)
+        if basis is None:
+            continue
+        for digit, names in ARTICULATED_DIGIT_CHAINS.items():
+            indices = [landmark_index[name] for name in names]
+            chain = points[frame_id, indices]
+            chain_confidence = confidence[frame_id, indices]
+            if (
+                not np.isfinite(chain).all()
+                or not np.isfinite(chain_confidence).all()
+                or np.any(chain_confidence <= 0.0)
+            ):
+                continue
+            segment_lengths = np.linalg.norm(
+                np.diff(chain, axis=0),
+                axis=1,
+            )
+            chain_length = float(np.sum(segment_lengths))
+            vector = basis.T @ (chain[-1] - chain[0])
+            terminal = basis.T @ (chain[-1] - chain[-2])
+            chord = float(np.linalg.norm(vector))
+            terminal_length = float(np.linalg.norm(terminal))
+            if (
+                chain_length < 1e-9
+                or chord < 1e-9
+                or terminal_length < 1e-9
+            ):
+                continue
+            features[digit][frame_id] = np.concatenate(
+                [
+                    vector / chord,
+                    terminal / terminal_length,
+                    np.asarray([chord / chain_length]),
+                ]
+            )
+            valid[digit][frame_id] = True
+    return features, valid
+
+
+def _robot_feature_grid(
+    model: pin.Model,
+    *,
+    side: str,
+    digit: str,
+    samples: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    if digit not in O6_FLEX_DIGITS:
+        raise ValueError(f"Expected a flex digit, got {digit}")
+    motor_index = O6_MOTOR_SUFFIXES.index(f"{digit}_mcp_pitch")
+    lower, upper = _o6_motor_limits(model, side)
+    values = np.linspace(
+        lower[motor_index],
+        upper[motor_index],
+        samples,
+        dtype=np.float64,
+    )
+    features = np.empty((samples, 7), dtype=np.float64)
+    commands = _open_hand_motor_commands(model)
+    data = model.createData()
+    side_index = 0 if side == "left" else 1
+    for sample_id, value in enumerate(values):
+        sample_commands = commands.copy()
+        sample_commands[side_index, motor_index] = value
+        q = pin.neutral(model)
+        _set_hand_motor_configuration(model, q, sample_commands)
+        pin.forwardKinematics(model, data, q)
+        pin.updateFramePlacements(model, data)
+        features[sample_id] = _robot_digit_feature(
+            model,
+            data,
+            side=side,
+            digit=digit,
+        )
+    return values[:, None], features
+
+
+def _robot_thumb_feature_grid(
+    model: pin.Model,
+    *,
+    side: str,
+    samples_per_axis: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    lower, upper = _o6_motor_limits(model, side)
+    yaw = np.linspace(
+        lower[0],
+        upper[0],
+        samples_per_axis,
+        dtype=np.float64,
+    )
+    pitch = np.linspace(
+        lower[1],
+        upper[1],
+        samples_per_axis,
+        dtype=np.float64,
+    )
+    grid_commands = np.asarray(
+        [(yaw_value, pitch_value) for yaw_value in yaw for pitch_value in pitch],
+        dtype=np.float64,
+    )
+    features = np.empty((len(grid_commands), 7), dtype=np.float64)
+    commands = _open_hand_motor_commands(model)
+    data = model.createData()
+    side_index = 0 if side == "left" else 1
+    for sample_id, values in enumerate(grid_commands):
+        sample_commands = commands.copy()
+        sample_commands[side_index, :2] = values
+        q = pin.neutral(model)
+        _set_hand_motor_configuration(model, q, sample_commands)
+        pin.forwardKinematics(model, data, q)
+        pin.updateFramePlacements(model, data)
+        features[sample_id] = _robot_digit_feature(
+            model,
+            data,
+            side=side,
+            digit="thumb",
+        )
+    return grid_commands, features
+
+
+def _fill_and_smooth_motor_fit(
+    fitted: np.ndarray,
+    valid: np.ndarray,
+    fallback: np.ndarray,
+    *,
+    lower: np.ndarray,
+    upper: np.ndarray,
+) -> np.ndarray:
+    result = np.asarray(fitted, dtype=np.float64).copy()
+    valid = np.asarray(valid, dtype=bool)
+    fallback = np.asarray(fallback, dtype=np.float64)
+    if result.shape != fallback.shape:
+        raise ValueError("Fitted and fallback motor arrays differ in shape")
+    frame_ids = np.arange(len(result), dtype=np.float64)
+    for column in range(result.shape[1]):
+        finite = valid & np.isfinite(result[:, column])
+        if np.count_nonzero(finite) >= 2:
+            result[:, column] = np.interp(
+                frame_ids,
+                frame_ids[finite],
+                result[finite, column],
+            )
+        elif np.count_nonzero(finite) == 1:
+            result[:, column] = result[finite, column][0]
+        else:
+            result[:, column] = fallback[:, column]
+        if len(result) >= 5:
+            window = min(7, len(result) if len(result) % 2 else len(result) - 1)
+            if window >= 5:
+                result[:, column] = savgol_filter(
+                    result[:, column],
+                    window_length=window,
+                    polyorder=2,
+                    mode="interp",
+                )
+    return np.clip(result, lower, upper)
+
+
+def _fit_feature_grid(
+    source: np.ndarray,
+    valid: np.ndarray,
+    grid_commands: np.ndarray,
+    grid_features: np.ndarray,
+    fallback: np.ndarray,
+    *,
+    feature_weights: np.ndarray,
+    lower: np.ndarray,
+    upper: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    fitted = np.full_like(fallback, np.nan, dtype=np.float64)
+    errors = np.full(len(source), np.nan, dtype=np.float64)
+    previous: np.ndarray | None = None
+    command_range = np.maximum(upper - lower, 1e-9)
+    for frame_id in np.flatnonzero(valid):
+        residual = (grid_features - source[frame_id]) * feature_weights
+        costs = np.sum(np.square(residual), axis=1)
+        if previous is not None:
+            costs += 0.005 * np.sum(
+                np.square((grid_commands - previous) / command_range),
+                axis=1,
+            )
+        best = int(np.argmin(costs))
+        fitted[frame_id] = grid_commands[best]
+        errors[frame_id] = float(
+            np.linalg.norm(
+                (grid_features[best] - source[frame_id])
+                * feature_weights
+            )
+        )
+        previous = grid_commands[best]
+    return (
+        _fill_and_smooth_motor_fit(
+            fitted,
+            valid,
+            fallback,
+            lower=lower,
+            upper=upper,
+        ),
+        errors,
+    )
+
+
+def _achieved_hand_widths_from_motors(
+    model: pin.Model,
+    motor_commands: np.ndarray,
+) -> np.ndarray:
+    commands = np.asarray(motor_commands, dtype=np.float64)
+    if commands.ndim != 3 or commands.shape[1:] != (
+        2,
+        O6_MOTOR_COUNT,
+    ):
+        raise ValueError(
+            f"Expected O6 motor commands [N, 2, 6], got {commands.shape}"
+        )
+    achieved = np.empty((len(commands), 2), dtype=np.float64)
+    data = model.createData()
+    for frame_id, command in enumerate(commands):
+        q = pin.neutral(model)
+        _set_hand_motor_configuration(model, q, command)
+        pin.forwardKinematics(model, data, q)
+        pin.updateFramePlacements(model, data)
+        for side_index, side in enumerate(("left", "right")):
+            achieved[frame_id, side_index] = _current_hand_jaw_width(
+                model,
+                data,
+                side=side,
+            )
+    return achieved
+
+
+def _motor_closure_summary(
+    model: pin.Model,
+    motor_commands: np.ndarray,
+) -> np.ndarray:
+    result = np.empty((len(motor_commands), 2), dtype=np.float64)
+    for side_index, side in enumerate(("left", "right")):
+        lower, upper = _o6_motor_limits(model, side)
+        normalized = (
+            motor_commands[:, side_index] - lower
+        ) / np.maximum(upper - lower, 1e-9)
+        result[:, side_index] = np.mean(normalized, axis=1)
+    return np.clip(result, 0.0, 1.0)
+
+
+def _retarget_articulated_hands(
+    model: pin.Model,
+    trajectory: HandTrajectory,
+    human_widths: np.ndarray,
+    *,
+    scale: float,
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    list[dict[str, object]],
+    dict[str, dict[str, object]],
+]:
+    (
+        fallback_closures,
+        target_widths,
+        _,
+        fallback_profiles,
+    ) = _retarget_hand_widths(model, human_widths, scale=scale)
+    motor_commands = _closures_to_motor_commands(
+        model,
+        fallback_closures,
+    )
+    tracks = (
+        trajectory.left_articulated_hand,
+        trajectory.right_articulated_hand,
+    )
+    profiles: list[dict[str, object]] = []
+    diagnostics: dict[str, dict[str, object]] = {}
+    for side_index, side in enumerate(("left", "right")):
+        track = tracks[side_index]
+        side_profile: dict[str, object] = {
+            "motor_order": list(O6_MOTOR_SUFFIXES),
+            "fallback_aperture_profile": fallback_profiles[side_index],
+        }
+        digit_diagnostics: dict[str, object] = {}
+        if track is None:
+            side_profile["source"] = "continuous_width_fallback"
+            side_profile["fallback_reason"] = (
+                "complete 25-landmark hand track unavailable"
+            )
+            profiles.append(side_profile)
+            diagnostics[side] = {
+                "source": "continuous_width_fallback",
+                "digits": digit_diagnostics,
+            }
+            continue
+
+        source_features, source_valid = _articulated_source_features(track)
+        lower, upper = _o6_motor_limits(model, side)
+        thumb_grid, thumb_features = _robot_thumb_feature_grid(
+            model,
+            side=side,
+            samples_per_axis=65,
+        )
+        fitted_thumb, thumb_errors = _fit_feature_grid(
+            source_features["thumb"],
+            source_valid["thumb"],
+            thumb_grid,
+            thumb_features,
+            motor_commands[:, side_index, :2],
+            feature_weights=np.asarray(
+                [
+                    np.sqrt(0.5),
+                    np.sqrt(0.5),
+                    np.sqrt(0.5),
+                    np.sqrt(0.4),
+                    np.sqrt(0.4),
+                    np.sqrt(0.4),
+                    np.sqrt(0.1),
+                ]
+            ),
+            lower=lower[:2],
+            upper=upper[:2],
+        )
+        motor_commands[:, side_index, :2] = fitted_thumb
+        finite_thumb_error = thumb_errors[np.isfinite(thumb_errors)]
+        digit_diagnostics["thumb"] = {
+            "valid_fraction": float(np.mean(source_valid["thumb"])),
+            "mean_feature_error": (
+                float(np.mean(finite_thumb_error))
+                if finite_thumb_error.size
+                else None
+            ),
+            "max_feature_error": (
+                float(np.max(finite_thumb_error))
+                if finite_thumb_error.size
+                else None
+            ),
+        }
+
+        for digit in O6_FLEX_DIGITS:
+            motor_index = O6_MOTOR_SUFFIXES.index(f"{digit}_mcp_pitch")
+            grid, grid_features = _robot_feature_grid(
+                model,
+                side=side,
+                digit=digit,
+                samples=257,
+            )
+            fitted, errors = _fit_feature_grid(
+                source_features[digit],
+                source_valid[digit],
+                grid,
+                grid_features,
+                motor_commands[:, side_index, motor_index : motor_index + 1],
+                feature_weights=np.asarray(
+                    [
+                        np.sqrt(0.5),
+                        0.0,
+                        np.sqrt(0.5),
+                        np.sqrt(0.4),
+                        0.0,
+                        np.sqrt(0.4),
+                        np.sqrt(0.1),
+                    ]
+                ),
+                lower=lower[motor_index : motor_index + 1],
+                upper=upper[motor_index : motor_index + 1],
+            )
+            motor_commands[:, side_index, motor_index] = fitted[:, 0]
+            finite_error = errors[np.isfinite(errors)]
+            digit_diagnostics[digit] = {
+                "valid_fraction": float(np.mean(source_valid[digit])),
+                "mean_feature_error": (
+                    float(np.mean(finite_error))
+                    if finite_error.size
+                    else None
+                ),
+                "max_feature_error": (
+                    float(np.max(finite_error))
+                    if finite_error.size
+                    else None
+                ),
+            }
+        side_profile.update(
+            {
+                "source": "25-landmark palm-local hand geometry",
+                "motor_limits_rad": {
+                    suffix: [float(lower[index]), float(upper[index])]
+                    for index, suffix in enumerate(O6_MOTOR_SUFFIXES)
+                },
+                "fit": digit_diagnostics,
+            }
+        )
+        profiles.append(side_profile)
+        diagnostics[side] = {
+            "source": "articulated_hand_geometry",
+            "digits": digit_diagnostics,
+        }
+
+    achieved_widths = _achieved_hand_widths_from_motors(
+        model,
+        motor_commands,
+    )
+    return (
+        _motor_closure_summary(model, motor_commands),
+        motor_commands,
+        target_widths,
+        achieved_widths,
+        profiles,
+        diagnostics,
+    )
 
 
 def _retarget_binary_hands(
@@ -519,6 +1280,45 @@ def _retarget_binary_hands(
     )
 
 
+def _fixed_open_hand_action(
+    model: pin.Model,
+    frame_count: int,
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    list[dict[str, object]],
+]:
+    """Return an explicit fixed-open action when fingers are unobserved."""
+
+    commands = np.zeros((frame_count, 2), dtype=np.float64)
+    states = np.zeros((frame_count, 2), dtype=np.uint8)
+    target_widths = np.full((frame_count, 2), np.nan, dtype=np.float64)
+    open_q = pin.neutral(model)
+    _set_continuous_hand_configuration(model, open_q, commands[0])
+    data = model.createData()
+    pin.forwardKinematics(model, data, open_q)
+    pin.updateFramePlacements(model, data)
+    open_widths = np.asarray(
+        [
+            _current_hand_jaw_width(model, data, side=side)
+            for side in ("left", "right")
+        ],
+        dtype=np.float64,
+    )
+    achieved_widths = np.repeat(open_widths[None], frame_count, axis=0)
+    profiles = [
+        {
+            "open_width_m": float(open_widths[side_index]),
+            "fixed_command": 0.0,
+            "source": "finger articulation unavailable",
+        }
+        for side_index in range(2)
+    ]
+    return commands, states, target_widths, achieved_widths, profiles
+
+
 def _visible(
     pixels: np.ndarray,
     confidence: np.ndarray,
@@ -539,36 +1339,6 @@ def _tracked(points: np.ndarray, confidence: np.ndarray) -> np.ndarray:
     return np.isfinite(points).all(axis=1) & (confidence >= 0.5)
 
 
-def _map_targets(
-    trajectory: HandTrajectory,
-    scale: float,
-    camera_origin: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    left = camera_origin + (
-        CV_TO_G1_WORLD @ (scale * trajectory.left_reference_camera).T
-    ).T
-    right = camera_origin + (
-        CV_TO_G1_WORLD @ (scale * trajectory.right_reference_camera).T
-    ).T
-    return left, right
-
-
-def _map_target_rotations(
-    trajectory: HandTrajectory,
-    left_calibration: np.ndarray,
-    right_calibration: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    targets: list[np.ndarray] = []
-    for source, calibration in (
-        (trajectory.left_reference_rotations, left_calibration),
-        (trajectory.right_reference_rotations, right_calibration),
-    ):
-        mapped = np.einsum("ij,njk->nik", CV_TO_G1_WORLD, source)
-        hand_to_palm = mapped[0].T @ calibration
-        targets.append(np.einsum("nij,jk->nik", mapped, hand_to_palm))
-    return targets[0], targets[1]
-
-
 def _map_action_targets(
     trajectory: HandTrajectory,
     scale: float,
@@ -585,7 +1355,7 @@ def _map_action_targets(
     np.ndarray,
     np.ndarray,
 ]:
-    """Map paper ``(p, R)`` targets and convert them to palm IK targets."""
+    """Map the declared action frame to the shared palm IK targets."""
 
     if tcp_translations.shape != (trajectory.frame_count, 2, 3):
         raise ValueError(
@@ -597,6 +1367,13 @@ def _map_action_targets(
             f"TCP rotations must have shape (2, 3, 3), got {tcp_rotations.shape}"
         )
 
+    target_mode = getattr(
+        trajectory,
+        "target_mode",
+        FINGERTIP_GRASP_TARGET,
+    )
+    if target_mode not in {FINGERTIP_GRASP_TARGET, RIGID_PALM_TARGET}:
+        raise ValueError(f"Unsupported hand target mode: {target_mode!r}")
     grasp_positions: list[np.ndarray] = []
     grasp_rotations: list[np.ndarray] = []
     palm_positions: list[np.ndarray] = []
@@ -613,27 +1390,45 @@ def _map_action_targets(
             ),
         )
     ):
-        grasp_position = camera_origin + (
+        action_position = camera_origin + (
             CV_TO_G1_WORLD @ (scale * positions).T
         ).T
-        grasp_rotation = np.einsum(
+        action_rotation = np.einsum(
             "ij,njk->nik",
             CV_TO_G1_WORLD,
             rotations,
         )
-        palm_rotation = np.einsum(
-            "nij,jk->nik",
-            grasp_rotation,
-            tcp_rotations[side_index].T,
-        )
-        offset_world = np.einsum(
-            "nij,nj->ni",
-            palm_rotation,
-            tcp_translations[:, side_index],
-        )
+        if target_mode == RIGID_PALM_TARGET:
+            palm_position = action_position
+            palm_rotation = action_rotation
+            offset_world = np.einsum(
+                "nij,nj->ni",
+                palm_rotation,
+                tcp_translations[:, side_index],
+            )
+            grasp_position = palm_position + offset_world
+            grasp_rotation = np.einsum(
+                "nij,jk->nik",
+                palm_rotation,
+                tcp_rotations[side_index],
+            )
+        else:
+            grasp_position = action_position
+            grasp_rotation = action_rotation
+            palm_rotation = np.einsum(
+                "nij,jk->nik",
+                grasp_rotation,
+                tcp_rotations[side_index].T,
+            )
+            offset_world = np.einsum(
+                "nij,nj->ni",
+                palm_rotation,
+                tcp_translations[:, side_index],
+            )
+            palm_position = grasp_position - offset_world
         grasp_positions.append(grasp_position)
         grasp_rotations.append(grasp_rotation)
-        palm_positions.append(grasp_position - offset_world)
+        palm_positions.append(palm_position)
         palm_rotations.append(palm_rotation)
     return (
         grasp_positions[0],
@@ -673,12 +1468,182 @@ def _camera_poses(
     )
 
 
-def _base_candidates() -> Iterable[tuple[np.ndarray, float]]:
-    scale = 0.84
-    for x in (-0.12, 0.0, 0.12):
-        for y in (-0.10, 0.0, 0.10):
-            for z in (0.70, 0.793, 0.88):
-                yield np.array([x, y, z], dtype=np.float64), scale
+def _representative_keyframes(
+    left_targets: np.ndarray,
+    right_targets: np.ndarray,
+    left_tracked: np.ndarray,
+    right_tracked: np.ndarray,
+) -> np.ndarray:
+    """Select the frame set K from per-hand spatial trajectory extremes."""
+
+    frame_ids: set[int] = set()
+    for targets, tracked in (
+        (left_targets, left_tracked),
+        (right_targets, right_tracked),
+    ):
+        valid_ids = np.flatnonzero(
+            tracked & np.isfinite(targets).all(axis=1)
+        )
+        if valid_ids.size == 0:
+            continue
+        valid_targets = targets[valid_ids]
+        for axis in range(3):
+            frame_ids.add(
+                int(valid_ids[int(np.argmin(valid_targets[:, axis]))])
+            )
+            frame_ids.add(
+                int(valid_ids[int(np.argmax(valid_targets[:, axis]))])
+            )
+    if not frame_ids:
+        raise ValueError("No tracked end-effector poses for base search")
+    return np.asarray(sorted(frame_ids), dtype=np.int64)
+
+
+def _keyframe_target_positions(
+    keyframes: np.ndarray,
+    left_targets: np.ndarray,
+    right_targets: np.ndarray,
+    left_tracked: np.ndarray,
+    right_tracked: np.ndarray,
+) -> np.ndarray:
+    positions = [
+        targets[frame_id]
+        for frame_id in keyframes
+        for targets, tracked in (
+            (left_targets, left_tracked),
+            (right_targets, right_tracked),
+        )
+        if tracked[frame_id]
+    ]
+    if not positions:
+        raise ValueError("Representative keyframes contain no active targets")
+    return np.asarray(positions, dtype=np.float64)
+
+
+def _trajectory_centroid(
+    left_targets: np.ndarray,
+    right_targets: np.ndarray,
+    left_tracked: np.ndarray,
+    right_tracked: np.ndarray,
+) -> np.ndarray:
+    """Average per-frame active-EEF centers over the complete trajectory."""
+
+    centers: list[np.ndarray] = []
+    for frame_id in range(left_targets.shape[0]):
+        active = [
+            targets[frame_id]
+            for targets, tracked in (
+                (left_targets, left_tracked),
+                (right_targets, right_tracked),
+            )
+            if tracked[frame_id]
+            and np.isfinite(targets[frame_id]).all()
+        ]
+        if active:
+            centers.append(np.mean(active, axis=0))
+    if not centers:
+        raise ValueError("No tracked end-effector poses for trajectory centroid")
+    return np.mean(centers, axis=0)
+
+
+def _robot_maximum_reach(model: pin.Model) -> float:
+    """Return the morphology-specific base-to-palm kinematic reach bound."""
+
+    reaches: list[float] = []
+    for frame_name in PALM_FRAMES:
+        frame = model.frames[model.getFrameId(frame_name)]
+        joint_id = frame.parent
+        reach = float(np.linalg.norm(frame.placement.translation))
+        while joint_id > 0:
+            reach += float(
+                np.linalg.norm(
+                    model.jointPlacements[joint_id].translation
+                )
+            )
+            joint_id = model.parents[joint_id]
+        reaches.append(reach)
+    if not reaches or not np.isfinite(reaches).all():
+        raise ValueError("Could not derive a finite robot kinematic reach")
+    return float(max(reaches))
+
+
+def _yaw_rotation(yaw: float) -> np.ndarray:
+    return Rotation.from_euler("z", yaw).as_matrix()
+
+
+def _base_candidates(
+    keyframe_target_positions: np.ndarray,
+    *,
+    trajectory_centroid: np.ndarray,
+    r_max: float,
+) -> Iterable[tuple[np.ndarray, np.ndarray]]:
+    """Grid base translations around the trajectory centroid within r_max."""
+
+    if (
+        keyframe_target_positions.ndim != 2
+        or keyframe_target_positions.shape[1] != 3
+    ):
+        raise ValueError("keyframe_target_positions must have shape [N, 3]")
+    if not np.isfinite(keyframe_target_positions).all():
+        raise ValueError("keyframe_target_positions must be finite")
+    if trajectory_centroid.shape != (3,) or not np.isfinite(
+        trajectory_centroid
+    ).all():
+        raise ValueError("trajectory_centroid must be a finite 3-vector")
+    if not np.isfinite(r_max) or r_max <= 0.0:
+        raise ValueError("r_max must be positive and finite")
+
+    centroid = trajectory_centroid
+    lower = np.max(keyframe_target_positions - r_max, axis=0)
+    upper = np.min(keyframe_target_positions + r_max, axis=0)
+    if np.any(lower > upper):
+        raise RuntimeError(
+            "No base placement can cover all representative trajectory "
+            f"extremes within r_max={r_max:.4f} m"
+        )
+
+    axes: list[np.ndarray] = []
+    for axis in range(3):
+        values = np.linspace(
+            lower[axis],
+            upper[axis],
+            BASE_GRID_POINTS_PER_AXIS,
+            dtype=np.float64,
+        )
+        values = np.unique(
+            np.append(values, np.clip(centroid[axis], lower[axis], upper[axis]))
+        )
+        axes.append(
+            values[
+                np.argsort(
+                    np.abs(values - centroid[axis]),
+                    kind="stable",
+                )
+            ]
+        )
+
+    for x in axes[0]:
+        for y in axes[1]:
+            for z in axes[2]:
+                position = np.asarray([x, y, z], dtype=np.float64)
+                if np.any(
+                    np.linalg.norm(
+                        keyframe_target_positions - position,
+                        axis=1,
+                    )
+                    > r_max + 1e-9
+                ):
+                    continue
+                direction = centroid[:2] - position[:2]
+                facing_yaw = (
+                    float(np.arctan2(direction[1], direction[0]))
+                    if np.linalg.norm(direction) > 1e-9
+                    else 0.0
+                )
+                for yaw_offset in BASE_YAW_OFFSETS_RAD:
+                    yield position.copy(), _yaw_rotation(
+                        facing_yaw + float(yaw_offset)
+                    )
 
 
 def _active_velocity_indices(
@@ -733,6 +1698,7 @@ def _solve_frame(
     q: np.ndarray,
     *,
     base_position: np.ndarray,
+    base_rotation: np.ndarray,
     left_target: np.ndarray,
     right_target: np.ndarray,
     left_rotation: np.ndarray | None,
@@ -758,6 +1724,9 @@ def _solve_frame(
             if not active:
                 continue
             placement = data.oMf[frame_id]
+            target_in_base = base_rotation.T @ (
+                target - base_position
+            )
             jacobian = pin.computeFrameJacobian(
                 model,
                 data,
@@ -765,15 +1734,14 @@ def _solve_frame(
                 frame_id,
                 pin.ReferenceFrame.LOCAL_WORLD_ALIGNED,
             )[:, active_indices]
-            position_error = (
-                target - base_position - placement.translation
-            )
+            position_error = target_in_base - placement.translation
             if target_rotation is None:
                 jacobians.append(jacobian[:3])
                 errors.append(position_error)
             else:
+                rotation_in_base = base_rotation.T @ target_rotation
                 orientation_error = Rotation.from_matrix(
-                    target_rotation @ placement.rotation.T
+                    rotation_in_base @ placement.rotation.T
                 ).as_rotvec()
                 jacobians.append(
                     np.vstack(
@@ -826,10 +1794,11 @@ def _solve_frame(
         (frame_ids[1], right_target, right_rotation, right_active),
     ):
         placement = data.oMf[frame_id]
+        target_in_base = base_rotation.T @ (target - base_position)
         metrics.append(
             float(
                 np.linalg.norm(
-                    placement.translation - (target - base_position)
+                    placement.translation - target_in_base
                 )
             )
             if active
@@ -838,7 +1807,8 @@ def _solve_frame(
         metrics.append(
             float(
                 Rotation.from_matrix(
-                    placement.rotation.T @ target_rotation
+                    placement.rotation.T
+                    @ (base_rotation.T @ target_rotation)
                 ).magnitude()
             )
             if active and target_rotation is not None
@@ -849,75 +1819,101 @@ def _solve_frame(
 
 def _evaluate_candidate(
     model: pin.Model,
-    trajectory: HandTrajectory,
+    keyframes: np.ndarray,
     base_position: np.ndarray,
-    scale: float,
-    camera_origin: np.ndarray,
+    base_rotation: np.ndarray,
     left_targets: np.ndarray,
     right_targets: np.ndarray,
+    left_rotations: np.ndarray,
+    right_rotations: np.ndarray,
     left_tracked: np.ndarray,
     right_tracked: np.ndarray,
-) -> dict[str, float | list[float]]:
-    q = pin.neutral(model)
+) -> dict[str, object]:
     data = model.createData()
-    active_indices = _active_velocity_indices(model, position_only=True)
-    sample_ids = np.unique(
-        np.concatenate(
-            [
-                np.arange(0, trajectory.frame_count, 12),
-                np.flatnonzero(
-                    np.diff(
-                        right_tracked.astype(np.int8),
-                        prepend=0,
-                    )
-                    != 0
-                ),
-            ]
+    position_indices = _active_velocity_indices(model, position_only=True)
+    pose_indices = _active_velocity_indices(model, position_only=False)
+    position_errors: list[float] = []
+    orientation_errors: list[float] = []
+    feasible_keyframes = 0
+    evaluated_keyframes = 0
+    for frame_id in keyframes:
+        left_active = bool(left_tracked[frame_id])
+        right_active = bool(right_tracked[frame_id])
+        if not left_active and not right_active:
+            continue
+        evaluated_keyframes += 1
+        q, _ = _solve_frame(
+            model,
+            data,
+            pin.neutral(model),
+            base_position=base_position,
+            base_rotation=base_rotation,
+            left_target=left_targets[frame_id],
+            right_target=right_targets[frame_id],
+            left_rotation=None,
+            right_rotation=None,
+            left_active=left_active,
+            right_active=right_active,
+            active_indices=position_indices,
+            iterations=60,
         )
-    )
-    sample_ids = sample_ids[
-        (sample_ids >= 0) & (sample_ids < trajectory.frame_count)
-    ]
-    errors: list[float] = []
-    feasible = 0
-    target_count = 0
-    for frame_id in sample_ids:
         q, metrics = _solve_frame(
             model,
             data,
             q,
             base_position=base_position,
+            base_rotation=base_rotation,
             left_target=left_targets[frame_id],
             right_target=right_targets[frame_id],
-            left_rotation=None,
-            right_rotation=None,
-            left_active=bool(left_tracked[frame_id]),
-            right_active=bool(right_tracked[frame_id]),
-            active_indices=active_indices,
-            iterations=45,
+            left_rotation=left_rotations[frame_id],
+            right_rotation=right_rotations[frame_id],
+            left_active=left_active,
+            right_active=right_active,
+            active_indices=pose_indices,
+            iterations=100,
         )
-        for active, error in (
-            (left_tracked[frame_id], metrics[0]),
-            (right_tracked[frame_id], metrics[1]),
+        frame_feasible = True
+        for active, position_error, orientation_error in (
+            (left_active, metrics[0], metrics[2]),
+            (right_active, metrics[1], metrics[3]),
         ):
             if active:
-                target_count += 1
-                errors.append(error)
-                feasible += int(error < 0.035)
-    mean_error = float(np.mean(errors)) if errors else float("inf")
-    feasible_fraction = feasible / max(target_count, 1)
-    base_prior = float(
-        np.linalg.norm(
-            (base_position - np.array([0.0, 0.0, 0.793])) / 0.2
-        )
+                position_errors.append(position_error)
+                orientation_errors.append(orientation_error)
+                frame_feasible = frame_feasible and (
+                    position_error <= IK_FEASIBLE_POSITION_ERROR_M
+                    and orientation_error
+                    <= IK_FEASIBLE_ORIENTATION_ERROR_RAD
+                )
+        feasible_keyframes += int(frame_feasible)
+    if evaluated_keyframes == 0:
+        raise ValueError("No active representative keyframes to evaluate")
+    feasible_fraction = feasible_keyframes / evaluated_keyframes
+    yaw = float(
+        np.arctan2(base_rotation[1, 0], base_rotation[0, 0])
     )
-    score = 10.0 * feasible_fraction - mean_error - 0.005 * base_prior
+    mean_position_error = (
+        float(np.mean(position_errors))
+        if position_errors
+        else float("inf")
+    )
+    mean_orientation_error = (
+        float(np.mean(orientation_errors))
+        if orientation_errors
+        else float("inf")
+    )
     return {
         "base_position": base_position.tolist(),
-        "scale": float(scale),
+        "base_rotation": base_rotation.tolist(),
+        "base_yaw_rad": yaw,
+        "feasible_keyframes": float(feasible_keyframes),
+        "keyframe_count": float(evaluated_keyframes),
         "feasible_fraction": float(feasible_fraction),
-        "mean_error_m": mean_error,
-        "score": float(score),
+        "mean_position_error_m": mean_position_error,
+        "mean_orientation_error_rad": mean_orientation_error,
+        # Eq. (3) optimizes only this feasibility average. Residuals above
+        # are deterministic tie-break diagnostics, not additional terms.
+        "score": float(feasible_fraction),
     }
 
 
@@ -956,15 +1952,29 @@ def retarget_with_pinocchio(
         [trajectory.left_widths, trajectory.right_widths],
         axis=1,
     )
-    candidates = list(_base_candidates())
-    candidate_scales = {float(scale) for _, scale in candidates}
-    if len(candidate_scales) != 1:
-        raise RuntimeError(
-            "State-dependent TCP mapping requires one shared base-search scale"
-        )
-    scale = candidate_scales.pop()
+    scale = ACTION_SCALE
 
-    if hand_binary is not None:
+    rigid_palm_mode = trajectory.target_mode == RIGID_PALM_TARGET
+    if rigid_palm_mode:
+        if hand_binary is not None:
+            raise ValueError(
+                "Binary finger actions are incompatible with rigid-palm "
+                "targets"
+            )
+        (
+            hand_closures,
+            hand_binary_states,
+            target_hand_widths,
+            achieved_hand_widths,
+            hand_aperture_profiles,
+        ) = _fixed_open_hand_action(model, trajectory.frame_count)
+        hand_motor_commands = _closures_to_motor_commands(
+            model,
+            hand_closures,
+        )
+        hand_action_mode = "rigid_palm_fixed_open"
+        hand_action_diagnostics = {}
+    elif hand_binary is not None:
         (
             hand_closures,
             hand_binary_states,
@@ -978,27 +1988,33 @@ def retarget_with_pinocchio(
             human_widths,
             scale=scale,
         )
-        hand_action_mode = "binary_o6_power_grasp"
-        hand_tcp_translations, hand_tcp_rotations = _hand_tcp_transforms(
+        hand_motor_commands = _closures_to_motor_commands(
             model,
             hand_closures,
         )
+        hand_action_mode = "binary_o6_power_grasp"
+    elif (
+        trajectory.left_articulated_hand is not None
+        or trajectory.right_articulated_hand is not None
+    ):
         (
-            left_targets,
-            right_targets,
-            left_rotations,
-            right_rotations,
-            left_palm_targets,
-            right_palm_targets,
-            left_palm_rotations,
-            right_palm_rotations,
-        ) = _map_action_targets(
+            hand_closures,
+            hand_motor_commands,
+            target_hand_widths,
+            achieved_hand_widths,
+            hand_aperture_profiles,
+            hand_action_diagnostics,
+        ) = _retarget_articulated_hands(
+            model,
             trajectory,
-            scale,
-            camera_origin,
-            hand_tcp_translations,
-            hand_tcp_rotations,
+            human_widths,
+            scale=scale,
         )
+        hand_binary_states = np.zeros_like(
+            hand_closures,
+            dtype=np.uint8,
+        )
+        hand_action_mode = "articulated_o6"
     else:
         (
             hand_closures,
@@ -1010,54 +2026,112 @@ def retarget_with_pinocchio(
             human_widths,
             scale=scale,
         )
+        hand_motor_commands = _closures_to_motor_commands(
+            model,
+            hand_closures,
+        )
         hand_binary_states = np.zeros_like(
             hand_closures,
             dtype=np.uint8,
         )
         hand_action_mode = "continuous_width_fallback"
-        hand_action_diagnostics = {}
-        hand_tcp_translations = np.zeros(
-            (trajectory.frame_count, 2, 3),
-            dtype=np.float64,
-        )
-        hand_tcp_rotations = np.repeat(
-            np.eye(3, dtype=np.float64)[None],
-            2,
-            axis=0,
-        )
-        left_targets, right_targets = _map_targets(
-            trajectory,
-            scale,
-            camera_origin,
-        )
-        left_palm_targets = left_targets
-        right_palm_targets = right_targets
-        left_rotations = np.empty(
-            (trajectory.frame_count, 3, 3),
-            dtype=np.float64,
-        )
-        right_rotations = np.empty_like(left_rotations)
-        left_palm_rotations = left_rotations
-        right_palm_rotations = right_rotations
+        hand_action_diagnostics = {
+            side: {
+                "source": "continuous_width_fallback",
+                "reason": "complete 25-landmark hand track unavailable",
+            }
+            for side in ("left", "right")
+        }
 
+    # All input modes produce the same palm target arrays consumed by the same
+    # base search and 6D IK. Fingertip actions are converted through the robot
+    # TCP; explicit rigid-palm inputs map directly to the palm frame.
+    hand_tcp_translations, hand_tcp_rotations = _hand_tcp_transforms(
+        model,
+        hand_motor_commands,
+    )
+    (
+        left_targets,
+        right_targets,
+        left_rotations,
+        right_rotations,
+        left_palm_targets,
+        right_palm_targets,
+        left_palm_rotations,
+        right_palm_rotations,
+    ) = _map_action_targets(
+        trajectory,
+        scale,
+        camera_origin,
+        hand_tcp_translations,
+        hand_tcp_rotations,
+    )
+
+    keyframes = _representative_keyframes(
+        left_targets,
+        right_targets,
+        left_tracked,
+        right_tracked,
+    )
+    keyframe_positions = _keyframe_target_positions(
+        keyframes,
+        left_targets,
+        right_targets,
+        left_tracked,
+        right_tracked,
+    )
+    centroid = _trajectory_centroid(
+        left_targets,
+        right_targets,
+        left_tracked,
+        right_tracked,
+    )
+    r_max = _robot_maximum_reach(model)
+    if not rigid_palm_mode:
+        r_max += float(
+            np.max(
+                np.linalg.norm(
+                    hand_tcp_translations,
+                    axis=2,
+                )
+            )
+        )
+    candidates = list(
+        _base_candidates(
+            keyframe_positions,
+            trajectory_centroid=centroid,
+            r_max=r_max,
+        )
+    )
+    if not candidates:
+        raise RuntimeError(
+            "Base grid contains no candidate within the robot reach"
+        )
     search_results = [
         _evaluate_candidate(
             model,
-            trajectory,
+            keyframes,
             base_position,
-            candidate_scale,
-            camera_origin,
+            base_rotation,
             left_palm_targets,
             right_palm_targets,
+            left_palm_rotations,
+            right_palm_rotations,
             left_tracked,
             right_tracked,
         )
-        for base_position, candidate_scale in candidates
+        for base_position, base_rotation in candidates
     ]
-    search_results.sort(key=lambda item: float(item["score"]), reverse=True)
+    search_results.sort(
+        key=lambda item: (
+            -float(item["feasible_fraction"]),
+            float(item["mean_position_error_m"]),
+            float(item["mean_orientation_error_rad"]),
+        )
+    )
     best = search_results[0]
     base_position = np.asarray(best["base_position"], dtype=np.float64)
-    scale = float(best["scale"])
+    base_rotation = np.asarray(best["base_rotation"], dtype=np.float64)
 
     q = pin.neutral(model)
     data = model.createData()
@@ -1067,6 +2141,7 @@ def retarget_with_pinocchio(
         data,
         q,
         base_position=base_position,
+        base_rotation=base_rotation,
         left_target=left_palm_targets[0],
         right_target=right_palm_targets[0],
         left_rotation=None,
@@ -1076,23 +2151,6 @@ def retarget_with_pinocchio(
         active_indices=position_indices,
         iterations=100,
     )
-    pin.forwardKinematics(model, data, q)
-    pin.updateFramePlacements(model, data)
-    if hand_binary is None:
-        left_calibration = data.oMf[
-            model.getFrameId("left_palm")
-        ].rotation.copy()
-        right_calibration = data.oMf[
-            model.getFrameId("right_palm")
-        ].rotation.copy()
-        left_rotations, right_rotations = _map_target_rotations(
-            trajectory,
-            left_calibration,
-            right_calibration,
-        )
-        left_palm_rotations = left_rotations
-        right_palm_rotations = right_rotations
-
     active_indices = _active_velocity_indices(model, position_only=False)
     qpos = np.zeros((trajectory.frame_count, model.nq), dtype=np.float64)
     left_errors = np.full(trajectory.frame_count, np.nan)
@@ -1105,6 +2163,7 @@ def retarget_with_pinocchio(
             data,
             q,
             base_position=base_position,
+            base_rotation=base_rotation,
             left_target=left_palm_targets[frame_id],
             right_target=right_palm_targets[frame_id],
             left_rotation=left_palm_rotations[frame_id],
@@ -1114,100 +2173,90 @@ def retarget_with_pinocchio(
             active_indices=active_indices,
             iterations=60 if frame_id == 0 else 20,
         )
-        finite_position_errors = np.asarray(metrics[:2], dtype=np.float64)
-        if (
-            np.isfinite(finite_position_errors).any()
-            and np.nanmax(finite_position_errors) > 0.005
-        ):
-            q, _ = _solve_frame(
-                model,
-                data,
-                q,
-                base_position=base_position,
-                left_target=left_palm_targets[frame_id],
-                right_target=right_palm_targets[frame_id],
-                left_rotation=None,
-                right_rotation=None,
-                left_active=bool(left_tracked[frame_id]),
-                right_active=bool(right_tracked[frame_id]),
-                active_indices=position_indices,
-                iterations=20,
-            )
-            q, metrics = _solve_frame(
-                model,
-                data,
-                q,
-                base_position=base_position,
-                left_target=left_palm_targets[frame_id],
-                right_target=right_palm_targets[frame_id],
-                left_rotation=left_palm_rotations[frame_id],
-                right_rotation=right_palm_rotations[frame_id],
-                left_active=bool(left_tracked[frame_id]),
-                right_active=bool(right_tracked[frame_id]),
-                active_indices=active_indices,
-                iterations=0,
-            )
-        _set_continuous_hand_configuration(
+        _set_hand_motor_configuration(
             model,
             q,
-            hand_closures[frame_id],
+            hand_motor_commands[frame_id],
         )
         qpos[frame_id] = q
-        if hand_binary is not None:
-            pin.forwardKinematics(model, data, q)
-            pin.updateFramePlacements(model, data)
-            tcp_metrics: list[float] = []
-            for side_index, (
-                side,
-                target,
-                target_rotation,
-                active,
-            ) in enumerate(
+        pin.forwardKinematics(model, data, q)
+        pin.updateFramePlacements(model, data)
+        tcp_metrics: list[float] = []
+        for side_index, (
+            side,
+            target,
+            target_rotation,
+            active,
+        ) in enumerate(
+            (
                 (
-                    (
-                        "left",
-                        left_targets[frame_id],
-                        left_rotations[frame_id],
-                        left_tracked[frame_id],
-                    ),
-                    (
-                        "right",
-                        right_targets[frame_id],
-                        right_rotations[frame_id],
-                        right_tracked[frame_id],
-                    ),
-                )
-            ):
-                palm = data.oMf[model.getFrameId(f"{side}_palm")]
+                    "left",
+                    left_targets[frame_id],
+                    left_rotations[frame_id],
+                    left_tracked[frame_id],
+                ),
+                (
+                    "right",
+                    right_targets[frame_id],
+                    right_rotations[frame_id],
+                    right_tracked[frame_id],
+                ),
+            )
+        ):
+            palm = data.oMf[model.getFrameId(f"{side}_palm")]
+            if rigid_palm_mode:
                 actual_position = (
                     base_position
-                    + palm.translation
-                    + palm.rotation
-                    @ hand_tcp_translations[frame_id, side_index]
+                    + base_rotation @ palm.translation
+                )
+                actual_rotation = base_rotation @ palm.rotation
+                metric_target = (
+                    left_palm_targets[frame_id]
+                    if side == "left"
+                    else right_palm_targets[frame_id]
+                )
+                metric_rotation = (
+                    left_palm_rotations[frame_id]
+                    if side == "left"
+                    else right_palm_rotations[frame_id]
+                )
+            else:
+                actual_position = (
+                    base_position
+                    + base_rotation
+                    @ (
+                        palm.translation
+                        + palm.rotation
+                        @ hand_tcp_translations[frame_id, side_index]
+                    )
                 )
                 actual_rotation = (
-                    palm.rotation @ hand_tcp_rotations[side_index]
+                    base_rotation
+                    @ palm.rotation
+                    @ hand_tcp_rotations[side_index]
                 )
-                tcp_metrics.append(
-                    float(np.linalg.norm(actual_position - target))
-                    if active
-                    else float("nan")
-                )
-                tcp_metrics.append(
-                    float(
-                        Rotation.from_matrix(
-                            actual_rotation.T @ target_rotation
-                        ).magnitude()
-                    )
-                    if active
-                    else float("nan")
-                )
-            metrics = (
-                tcp_metrics[0],
-                tcp_metrics[2],
-                tcp_metrics[1],
-                tcp_metrics[3],
+                metric_target = target
+                metric_rotation = target_rotation
+            tcp_metrics.append(
+                float(np.linalg.norm(actual_position - metric_target))
+                if active
+                else float("nan")
             )
+            tcp_metrics.append(
+                float(
+                    Rotation.from_matrix(
+                        actual_rotation.T @ metric_rotation
+                    ).magnitude()
+                )
+                if active
+                else float("nan")
+            )
+        metrics = (
+            tcp_metrics[0],
+            tcp_metrics[2],
+            tcp_metrics[1],
+            tcp_metrics[3],
+        )
         (
             left_errors[frame_id],
             right_errors[frame_id],
@@ -1231,6 +2280,7 @@ def retarget_with_pinocchio(
         left_visible=left_visible,
         right_visible=right_visible,
         hand_closures=hand_closures,
+        hand_motor_commands=hand_motor_commands,
         hand_binary_states=hand_binary_states,
         target_hand_widths=target_hand_widths,
         achieved_hand_widths=achieved_hand_widths,
@@ -1240,6 +2290,10 @@ def retarget_with_pinocchio(
         hand_tcp_translations=hand_tcp_translations,
         hand_tcp_rotations=hand_tcp_rotations,
         base_position=base_position,
+        base_rotation=base_rotation,
+        base_search_keyframes=keyframes,
+        base_search_centroid=centroid,
+        maximum_reach=r_max,
         scale=scale,
         search_results=search_results,
     )
@@ -1315,123 +2369,230 @@ def save_pinocchio_trajectory(
             "max_step_rad": float(np.max(steps)) if steps.size else 0.0,
         }
     binary_mode = result.hand_action_mode == "binary_o6_power_grasp"
-    ik_target_source = (
-        "paper fingertip p,R with state-dependent LinkerHand O6 jaw/TCP"
-        if binary_mode
-        else "HDF5 leftHand/rightHand rigid-body tracks"
-    )
-    hand_action_source = (
-        "stateless per-frame binary action from HDF5 fingertip geometry"
-        if binary_mode
-        else "continuous HDF5 fingertip width"
-    )
-    hand_action_report: dict[str, object] = {
-        "type": result.hand_action_mode,
-        "shape": [trajectory.frame_count, 2],
-        "order": ["left", "right"],
-        "formula": (
-            "p=0.5*(thumb+0.7*index+0.3*middle); "
-            "r=||thumb-(0.7*index+0.3*middle)||/"
-            "||(0.7*index+0.3*middle)-Hand||; "
-            "binary=(active && visible && valid && r<=3/8)"
-            if binary_mode
-            else "w=||thumb-(0.7*index+0.3*middle)||_2"
-        ),
-        "closure_semantics": (
-            "binary state and O6 command are identical: "
-            "0=open, 1=power-fist preset; no temporal blending"
+    rigid_palm_mode = result.hand_action_mode == "rigid_palm_fixed_open"
+    articulated_mode = result.hand_action_mode == "articulated_o6"
+    achieved_width_range = {
+        side: [
+            float(np.min(result.achieved_hand_widths[:, side_index])),
+            float(np.max(result.achieved_hand_widths[:, side_index])),
+        ]
+        for side_index, side in enumerate(("left", "right"))
+    }
+    command_range = {
+        side: [
+            float(np.min(result.hand_closures[:, side_index])),
+            float(np.max(result.hand_closures[:, side_index])),
+        ]
+        for side_index, side in enumerate(("left", "right"))
+    }
+    motor_command_range = {
+        side: {
+            suffix: [
+                float(
+                    np.min(
+                        result.hand_motor_commands[
+                            :, side_index, motor_index
+                        ]
+                    )
+                ),
+                float(
+                    np.max(
+                        result.hand_motor_commands[
+                            :, side_index, motor_index
+                        ]
+                    )
+                ),
+            ]
+            for motor_index, suffix in enumerate(O6_MOTOR_SUFFIXES)
+        }
+        for side_index, side in enumerate(("left", "right"))
+    }
+    if rigid_palm_mode:
+        ik_target_source = (
+            "HDF5 leftHand/rightHand rigid pose mapped directly to G1 palm"
+        )
+        hand_action_source = (
+            "fixed-open robot hands; source finger articulation unavailable"
+        )
+        hand_action_report: dict[str, object] = {
+            "type": result.hand_action_mode,
+            "shape": [trajectory.frame_count, 2],
+            "order": ["left", "right"],
+            "formula": (
+                "source rigid Hand position and orientation map directly to "
+                "the robot palm target"
+            ),
+            "closure_semantics": (
+                "both LinkerHand O6 commands remain exactly 0=open"
+            ),
+            "source": list(trajectory.hand_sources),
+            "human_width_range_m": None,
+            "target_width_range_m": None,
+            "achieved_width_range_m": achieved_width_range,
+            "command_range": command_range,
+            "motor_command_range_rad": motor_command_range,
+            "motor_order": list(O6_MOTOR_SUFFIXES),
+            "aperture_profiles": {
+                side: result.hand_aperture_profiles[side_index]
+                for side_index, side in enumerate(("left", "right"))
+            },
+            "tcp_mapping": (
+                "not used to construct IK targets; the open-hand TCP pose is "
+                "derived from the solved palm only for trajectory metadata"
+            ),
+        }
+    else:
+        ik_target_source = (
+            "fingertip p,R with state-dependent LinkerHand O6 jaw/TCP"
+        )
+        hand_action_source = (
+            "stateless per-frame binary action from HDF5 fingertip geometry"
             if binary_mode
             else (
-                "0=open; increasing values close the hand along the "
-                "calibrated monotonic aperture branch"
+                "25-landmark palm-local geometry retargeted to independent "
+                "LinkerHand O6 motors"
+                if articulated_mode
+                else "continuous fingertip p,R,w width fallback"
             )
-        ),
-        "source": list(trajectory.hand_sources),
-        "human_width_range_m": {
-            side: [
-                float(np.min(widths)),
-                float(np.max(widths)),
-            ]
-            for side, widths in (
-                ("left", trajectory.left_widths),
-                ("right", trajectory.right_widths),
-            )
-        },
-        "achieved_width_range_m": {
-            side: [
-                float(np.min(result.achieved_hand_widths[:, side_index])),
-                float(np.max(result.achieved_hand_widths[:, side_index])),
-            ]
-            for side_index, side in enumerate(("left", "right"))
-        },
-        "command_range": {
-            side: [
-                float(np.min(result.hand_closures[:, side_index])),
-                float(np.max(result.hand_closures[:, side_index])),
-            ]
-            for side_index, side in enumerate(("left", "right"))
-        },
-        "aperture_profiles": {
-            side: result.hand_aperture_profiles[side_index]
-            for side_index, side in enumerate(("left", "right"))
-        },
-    }
-    if binary_mode:
-        hand_action_report.update(
-            {
-                "scaled_human_width_range_m": {
-                    side: [
-                        float(
-                            np.min(
-                                result.target_hand_widths[:, side_index]
-                            )
-                        ),
-                        float(
-                            np.max(
-                                result.target_hand_widths[:, side_index]
-                            )
-                        ),
-                    ]
-                    for side_index, side in enumerate(("left", "right"))
-                },
-                "width_role": (
-                    "diagnostic only; binary state, not width, selects the "
-                    "O6 preset"
-                ),
-                "binary_closed_frames": {
-                    side: int(
-                        np.count_nonzero(
-                            result.hand_binary_states[:, side_index]
-                        )
-                    )
-                    for side_index, side in enumerate(("left", "right"))
-                },
-                "diagnostics": result.hand_action_diagnostics,
-                "tcp_mapping": (
-                    "TCP origin follows the current O6 thumb/virtual-finger "
-                    "midpoint; orientation uses the fixed open-hand canonical "
-                    "gripper basis to avoid a curled-finger frame flip"
-                ),
-            }
         )
-    else:
-        hand_action_report["target_width_range_m"] = {
-            side: [
-                float(np.min(result.target_hand_widths[:, side_index])),
-                float(np.max(result.target_hand_widths[:, side_index])),
-            ]
-            for side_index, side in enumerate(("left", "right"))
+        hand_action_report = {
+            "type": result.hand_action_mode,
+            "shape": (
+                [trajectory.frame_count, 2, O6_MOTOR_COUNT]
+                if articulated_mode
+                else [trajectory.frame_count, 2]
+            ),
+            "order": ["left", "right"],
+            "motor_order": list(O6_MOTOR_SUFFIXES),
+            "formula": (
+                "p=0.5*(thumb+0.7*index+0.3*middle); "
+                "r=||thumb-(0.7*index+0.3*middle)||/"
+                "||(0.7*index+0.3*middle)-Hand||; "
+                "binary=(active && visible && valid && "
+                "r<=configured threshold)"
+                if binary_mode
+                else (
+                    "p,R retain the fingertip-derived grasp TCP; each hand's "
+                    "25 landmarks are converted to a palm-anatomical frame; "
+                    "thumb fits yaw+pitch and index/middle/ring/pinky fit "
+                    "independent flexion through O6 forward-kinematics LUTs"
+                    if articulated_mode
+                    else
+                    "p=0.5*(thumb+0.7*index+0.3*middle); "
+                    "R=[x y z] from the jaw/wrist axes; "
+                    "w=||thumb-(0.7*index+0.3*middle)||_2"
+                )
+            ),
+            "closure_semantics": (
+                "binary state and O6 command are identical: "
+                "0=open, 1=power-fist preset; no temporal blending"
+                if binary_mode
+                else (
+                    "six independent motor angles per hand in radians; "
+                    "URDF mimic joints are expanded after fitting"
+                    if articulated_mode
+                    else
+                    "0=open; increasing values close the hand along the "
+                    "calibrated monotonic aperture branch"
+                )
+            ),
+            "source": list(trajectory.hand_sources),
+            "human_width_range_m": {
+                side: [
+                    float(np.min(widths)),
+                    float(np.max(widths)),
+                ]
+                for side, widths in (
+                    ("left", trajectory.left_widths),
+                    ("right", trajectory.right_widths),
+                )
+            },
+            "achieved_width_range_m": achieved_width_range,
+            "command_range": command_range,
+            "motor_command_range_rad": motor_command_range,
+            "aperture_profiles": {
+                side: result.hand_aperture_profiles[side_index]
+                for side_index, side in enumerate(("left", "right"))
+            },
+            "tcp_mapping": (
+                "p,R define the robot grasp TCP target; the TCP origin "
+                "follows the current O6 thumb/virtual-finger midpoint, and "
+                "its orientation uses the fixed open-hand canonical gripper "
+                "basis"
+            ),
         }
+        if binary_mode:
+            hand_action_report.update(
+                {
+                    "scaled_human_width_range_m": {
+                        side: [
+                            float(
+                                np.min(
+                                    result.target_hand_widths[:, side_index]
+                                )
+                            ),
+                            float(
+                                np.max(
+                                    result.target_hand_widths[:, side_index]
+                                )
+                            ),
+                        ]
+                        for side_index, side in enumerate(("left", "right"))
+                    },
+                    "width_role": (
+                        "diagnostic only; binary state, not width, selects "
+                        "the O6 preset"
+                    ),
+                    "binary_closed_frames": {
+                        side: int(
+                            np.count_nonzero(
+                                result.hand_binary_states[:, side_index]
+                            )
+                        )
+                        for side_index, side in enumerate(("left", "right"))
+                    },
+                    "diagnostics": result.hand_action_diagnostics,
+                }
+            )
+        else:
+            hand_action_report["target_width_range_m"] = {
+                side: [
+                    float(
+                        np.min(result.target_hand_widths[:, side_index])
+                    ),
+                    float(
+                        np.max(result.target_hand_widths[:, side_index])
+                    ),
+                ]
+                for side_index, side in enumerate(("left", "right"))
+            }
+            hand_action_report["width_role"] = (
+                "diagnostic only; articulated O6 motors come from full "
+                "hand geometry"
+                if articulated_mode
+                else "continuous scalar actuator target"
+            )
+            hand_action_report["diagnostics"] = (
+                result.hand_action_diagnostics
+            )
     report: dict[str, object] = {
         "trajectory_schema_version": TRAJECTORY_SCHEMA_VERSION,
         "ik_solver": f"Pinocchio {pin.__version__}",
         "ik_target_source": ik_target_source,
+        "hand_target_mode": trajectory.target_mode,
         "hand_action_source": hand_action_source,
         "frame_count": trajectory.frame_count,
         "joint_count": model.nq,
         "joint_names": list(model.names[1:]),
         "link_count": len(link_names),
         "base_position": result.base_position.tolist(),
+        "base_rotation": result.base_rotation.tolist(),
+        "base_yaw_rad": float(
+            np.arctan2(
+                result.base_rotation[1, 0],
+                result.base_rotation[0, 0],
+            )
+        ),
         "scale": result.scale,
         "left_mean_error_m": float(np.nanmean(result.left_errors)),
         "left_max_error_m": float(np.nanmax(result.left_errors)),
@@ -1458,6 +2619,26 @@ def save_pinocchio_trajectory(
         ),
         "wrist_motion": wrist_motion,
         "hand_action": hand_action_report,
+        "base_search": {
+            "objective": (
+                "Eq. (3): mean representative-keyframe indicator that all "
+                "active 6D end-effector IK targets are feasible"
+            ),
+            "representative_keyframes": (
+                result.base_search_keyframes.tolist()
+            ),
+            "trajectory_centroid": result.base_search_centroid.tolist(),
+            "maximum_reach_m": result.maximum_reach,
+            "candidate_count": len(result.search_results),
+            "position_tolerance_m": IK_FEASIBLE_POSITION_ERROR_M,
+            "orientation_tolerance_deg": float(
+                np.degrees(IK_FEASIBLE_ORIENTATION_ERROR_RAD)
+            ),
+            "grid_points_per_axis": BASE_GRID_POINTS_PER_AXIS,
+            "yaw_offsets_deg": np.degrees(
+                BASE_YAW_OFFSETS_RAD
+            ).tolist(),
+        },
         "top_base_search_results": result.search_results[:10],
     }
     (output_root / "ik_report.json").write_text(
@@ -1472,6 +2653,7 @@ def save_pinocchio_trajectory(
         ),
         kinematics=np.asarray("pinocchio"),
         ik_target_source=np.asarray(ik_target_source),
+        hand_target_mode=np.asarray(trajectory.target_mode),
         hand_action_source=np.asarray(hand_action_source),
         hand_action_mode=np.asarray(result.hand_action_mode),
         joint_names=np.asarray(model.names[1:]),
@@ -1494,16 +2676,30 @@ def save_pinocchio_trajectory(
         left_visible=result.left_visible,
         right_visible=result.right_visible,
         hand_closures=result.hand_closures,
+        hand_motor_commands=result.hand_motor_commands,
+        hand_motor_order=np.asarray(O6_MOTOR_SUFFIXES),
         hand_binary_states=result.hand_binary_states,
         hand_closure_order=np.asarray(["left", "right"]),
         hand_closure_semantics=np.asarray(
             (
-                "binary state and hand_closures are identical exact commands: "
-                "0=open and 1=power-fist preset; no temporal blending"
-                if binary_mode
+                "both LinkerHand O6 commands remain exactly 0=open because "
+                "source finger articulation is unavailable"
+                if rigid_palm_mode
                 else (
-                    "0=open; increasing closes along the calibrated "
-                    "monotonic aperture branch"
+                    "binary state and hand_closures are identical exact "
+                    "commands: 0=open and 1=power-fist preset; no temporal "
+                    "blending"
+                    if binary_mode
+                    else (
+                        "mean normalized value of the six independent O6 "
+                        "motors; inspect hand_motor_commands for actuator "
+                        "angles"
+                        if articulated_mode
+                        else (
+                            "0=open; increasing closes along the calibrated "
+                            "monotonic aperture branch"
+                        )
+                    )
                 )
             )
         ),
@@ -1513,9 +2709,13 @@ def save_pinocchio_trajectory(
         hand_scaled_human_widths=result.target_hand_widths,
         hand_width_role=np.asarray(
             (
-                "diagnostic_only_not_actuator_target"
-                if binary_mode
-                else "continuous_actuator_target"
+                "unavailable_fixed_open"
+                if rigid_palm_mode
+                else (
+                    "diagnostic_only_not_actuator_target"
+                    if binary_mode or articulated_mode
+                    else "continuous_actuator_target"
+                )
             )
         ),
         hand_achieved_widths=result.achieved_hand_widths,
@@ -1532,6 +2732,7 @@ def save_pinocchio_trajectory(
         ),
         left_observation_camera=trajectory.left_observation_camera,
         right_observation_camera=trajectory.right_observation_camera,
+        intrinsic=trajectory.intrinsic,
         left_action_reference_camera=(
             trajectory.left_action_reference_camera
         ),
@@ -1545,6 +2746,10 @@ def save_pinocchio_trajectory(
             trajectory.right_action_reference_rotations
         ),
         base_position=result.base_position,
+        base_rotation=result.base_rotation,
+        base_search_keyframes=result.base_search_keyframes,
+        base_search_centroid=result.base_search_centroid,
+        maximum_reach=result.maximum_reach,
         scale=result.scale,
         camera_positions=camera_positions,
         camera_cv_rotations=camera_cv_rotations,
@@ -1567,7 +2772,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help=(
             "Threshold each visible HDF5 hand frame directly and map its "
-            "exact 0/1 state to O6 presets (default: true)"
+            "exact 0/1 state to O6 presets; disabling retargets a complete "
+            "25-landmark hand track to six independent O6 motors and falls "
+            "back to continuous fingertip width when unavailable "
+            "(default: true)"
         ),
     )
     return parser
@@ -1581,10 +2789,13 @@ def main() -> None:
         raise ValueError(
             f"HDF5 has {trajectory.frame_count} frames; video has "
             f"{frame_count}"
-        )
+    )
     model = build_pinocchio_g1(args.urdf)
     hand_binary: dict[str, HandBinaryResult] | None = None
-    if args.binary_hands:
+    if (
+        args.binary_hands
+        and trajectory.target_mode == FINGERTIP_GRASP_TARGET
+    ):
         try:
             hand_binary = infer_binary_grasps_from_hdf5(
                 args.hdf5,
@@ -1593,7 +2804,7 @@ def main() -> None:
         except (KeyError, ValueError) as error:
             print(
                 "Binary O6 action inference unavailable; falling back to "
-                f"continuous fingertip width: {error}",
+                f"articulated O6/continuous width mode: {error}",
                 file=sys.stderr,
             )
     result = retarget_with_pinocchio(

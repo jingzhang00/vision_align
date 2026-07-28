@@ -15,16 +15,89 @@ HAND_KEYPOINT_NAMES = (
     "IndexFingerTip",
     "MiddleFingerTip",
 )
+HAND_LANDMARK_NAMES = (
+    "Hand",
+    "ThumbKnuckle",
+    "ThumbIntermediateBase",
+    "ThumbIntermediateTip",
+    "ThumbTip",
+    "IndexFingerMetacarpal",
+    "IndexFingerKnuckle",
+    "IndexFingerIntermediateBase",
+    "IndexFingerIntermediateTip",
+    "IndexFingerTip",
+    "MiddleFingerMetacarpal",
+    "MiddleFingerKnuckle",
+    "MiddleFingerIntermediateBase",
+    "MiddleFingerIntermediateTip",
+    "MiddleFingerTip",
+    "RingFingerMetacarpal",
+    "RingFingerKnuckle",
+    "RingFingerIntermediateBase",
+    "RingFingerIntermediateTip",
+    "RingFingerTip",
+    "LittleFingerMetacarpal",
+    "LittleFingerKnuckle",
+    "LittleFingerIntermediateBase",
+    "LittleFingerIntermediateTip",
+    "LittleFingerTip",
+)
+HAND_TARGET_MODE_ATTRIBUTE = "human_to_robot_hand_target_mode"
+FINGERTIP_GRASP_TARGET = "fingertip_grasp"
+RIGID_PALM_TARGET = "rigid_palm"
+HAND_TARGET_MODES = frozenset(
+    {
+        FINGERTIP_GRASP_TARGET,
+        RIGID_PALM_TARGET,
+    }
+)
+
+
+@dataclass(frozen=True)
+class ArticulatedHandTrajectory:
+    """Complete articulated hand track in two useful coordinate systems.
+
+    Both transform arrays have shape ``[N, 25, 4, 4]`` and use
+    :data:`HAND_LANDMARK_NAMES` order. ``transforms_reference_camera`` is
+    expressed in the first video camera frame. ``transforms_palm`` is
+    expressed in the corresponding frame's tracked ``Hand`` transform, so it
+    contains articulation without global hand or camera motion. Confidence has
+    shape ``[N, 25]`` and is preserved without smoothing or thresholding.
+    """
+
+    names: tuple[str, ...]
+    transforms_reference_camera: np.ndarray
+    transforms_palm: np.ndarray
+    confidence: np.ndarray
+
+    @property
+    def points_reference_camera(self) -> np.ndarray:
+        return self.transforms_reference_camera[..., :3, 3]
+
+    @property
+    def rotations_reference_camera(self) -> np.ndarray:
+        return self.transforms_reference_camera[..., :3, :3]
+
+    @property
+    def points_palm(self) -> np.ndarray:
+        return self.transforms_palm[..., :3, 3]
+
+    @property
+    def rotations_palm(self) -> np.ndarray:
+        return self.transforms_palm[..., :3, :3]
+
+    @property
+    def frame_count(self) -> int:
+        return int(self.transforms_reference_camera.shape[0])
 
 
 @dataclass(frozen=True)
 class HandTrajectory:
-    """Wrist tracks and paper action targets in the first camera frame.
+    """Hand tracks and declared action targets in the first camera frame.
 
-    The stable ``*Hand`` rigid-body tracks remain available for visibility and
-    tracking confidence.  ``*_action_reference_*`` stores the paper's
-    fingertip-derived grasp frame ``(p, R)`` and is the operational target used
-    when a dexterous hand supplies a matching jaw/TCP frame.
+    ``fingertip_grasp`` inputs place ``*_action_reference_*`` at the
+    fingertip-derived grasp frame. Explicit ``rigid_palm`` inputs instead use
+    the measured ``*Hand`` pose directly and leave finger width unavailable.
     """
 
     left_reference_camera: np.ndarray
@@ -39,6 +112,7 @@ class HandTrajectory:
     right_widths: np.ndarray
     left_normalized_widths: np.ndarray
     right_normalized_widths: np.ndarray
+    target_mode: str
     hand_sources: tuple[str, str]
     left_observation_camera: np.ndarray
     right_observation_camera: np.ndarray
@@ -49,6 +123,8 @@ class HandTrajectory:
     intrinsic: np.ndarray
     camera_to_world: np.ndarray
     camera_motion: np.ndarray
+    left_articulated_hand: ArticulatedHandTrajectory | None = None
+    right_articulated_hand: ArticulatedHandTrajectory | None = None
 
     @property
     def frame_count(self) -> int:
@@ -238,7 +314,7 @@ def align_hand_action(
     orientation_smooth_window: int = 15,
     polynomial_order: int = 2,
 ) -> _AlignedHand:
-    """Construct the paper's continuous ``(p, R, w)`` hand action."""
+    """Construct the continuous ``(p, R, w)`` hand action."""
 
     if side not in {"left", "right"}:
         raise ValueError(f"Unknown hand side: {side}")
@@ -349,8 +425,103 @@ def _hdf5_hand_keys(side: str) -> tuple[str, ...]:
     )
 
 
+def _hdf5_hand_landmark_keys(side: str) -> tuple[str, ...]:
+    return tuple(
+        f"{root}/{side}{name}"
+        for name in HAND_LANDMARK_NAMES
+        for root in ("transforms", "confidences")
+    )
+
+
+def _hdf5_hand_landmarks_reference_camera(
+    handle: h5py.File,
+    *,
+    side: str,
+    reference_world_to_camera: np.ndarray,
+    frame_count: int,
+) -> ArticulatedHandTrajectory | None:
+    """Load a complete articulated track when all 25 landmarks are present."""
+
+    if not all(
+        key in handle for key in _hdf5_hand_landmark_keys(side)
+    ):
+        return None
+
+    for name in HAND_LANDMARK_NAMES:
+        transform = handle[f"transforms/{side}{name}"]
+        confidence = handle[f"confidences/{side}{name}"]
+        if transform.shape != (frame_count, 4, 4):
+            raise ValueError(
+                f"transforms/{side}{name} must have shape "
+                f"{(frame_count, 4, 4)}, got {transform.shape}"
+            )
+        if confidence.shape != (frame_count,):
+            raise ValueError(
+                f"confidences/{side}{name} must have shape "
+                f"{(frame_count,)}, got {confidence.shape}"
+            )
+
+    transforms_world = np.stack(
+        [
+            np.asarray(
+                handle[f"transforms/{side}{name}"],
+                dtype=np.float64,
+            )
+            for name in HAND_LANDMARK_NAMES
+        ],
+        axis=1,
+    )
+    confidence = np.stack(
+        [
+            np.asarray(
+                handle[f"confidences/{side}{name}"],
+                dtype=np.float64,
+            )
+            for name in HAND_LANDMARK_NAMES
+        ],
+        axis=1,
+    )
+    transforms_reference_camera = np.matmul(
+        reference_world_to_camera[None, None],
+        transforms_world,
+    )
+
+    hand_index = HAND_LANDMARK_NAMES.index("Hand")
+    hand_transforms = transforms_reference_camera[:, hand_index]
+    valid_hand = np.isfinite(hand_transforms).all(axis=(1, 2))
+    determinants = np.full(frame_count, np.nan, dtype=np.float64)
+    determinants[valid_hand] = np.linalg.det(
+        hand_transforms[valid_hand, :3, :3]
+    )
+    valid_hand &= np.isfinite(determinants)
+    valid_hand &= np.abs(determinants) > 1e-12
+
+    reference_to_palm = np.full(
+        (frame_count, 4, 4),
+        np.nan,
+        dtype=np.float64,
+    )
+    reference_to_palm[valid_hand] = np.linalg.inv(
+        hand_transforms[valid_hand]
+    )
+    transforms_palm = np.einsum(
+        "nij,nkjl->nkil",
+        reference_to_palm,
+        transforms_reference_camera,
+    )
+    return ArticulatedHandTrajectory(
+        names=HAND_LANDMARK_NAMES,
+        transforms_reference_camera=transforms_reference_camera,
+        transforms_palm=transforms_palm,
+        confidence=confidence,
+    )
+
+
 def _hdf5_hand_usable(handle: h5py.File, *, side: str) -> bool:
-    if not all(key in handle for key in _hdf5_hand_keys(side)):
+    if (
+        "transforms/camera" not in handle
+        or not all(key in handle for key in _hdf5_hand_keys(side))
+    ):
         return False
     frame_count = int(handle["transforms/camera"].shape[0])
     valid = np.ones(frame_count, dtype=bool)
@@ -366,6 +537,69 @@ def _hdf5_hand_usable(handle: h5py.File, *, side: str) -> bool:
         valid &= np.isfinite(confidence_values)
         valid &= confidence_values > 0.0
     return int(valid.sum()) >= 2
+
+
+def _hdf5_rigid_palm_usable(handle: h5py.File, *, side: str) -> bool:
+    transform_key = f"transforms/{side}Hand"
+    confidence_key = f"confidences/{side}Hand"
+    if (
+        "transforms/camera" not in handle
+        or transform_key not in handle
+        or confidence_key not in handle
+    ):
+        return False
+    frame_count = int(handle["transforms/camera"].shape[0])
+    transform = handle[transform_key]
+    confidence = handle[confidence_key]
+    if transform.shape != (frame_count, 4, 4) or confidence.shape != (
+        frame_count,
+    ):
+        return False
+    transform_values = np.asarray(transform, dtype=np.float64)
+    confidence_values = np.asarray(confidence, dtype=np.float64)
+    valid = (
+        np.isfinite(transform_values[:, :3, :]).all(axis=(1, 2))
+        & np.isfinite(confidence_values)
+        & (confidence_values > 0.0)
+    )
+    return int(valid.sum()) >= 2
+
+
+def _hdf5_hand_target_mode(handle: h5py.File) -> str:
+    raw_mode = handle.attrs.get(
+        HAND_TARGET_MODE_ATTRIBUTE,
+        FINGERTIP_GRASP_TARGET,
+    )
+    if isinstance(raw_mode, bytes):
+        raw_mode = raw_mode.decode("utf-8")
+    mode = str(raw_mode)
+    if mode not in HAND_TARGET_MODES:
+        raise ValueError(
+            f"Unsupported {HAND_TARGET_MODE_ATTRIBUTE}={mode!r}; "
+            f"expected one of {sorted(HAND_TARGET_MODES)}"
+        )
+    return mode
+
+
+def hdf5_hand_target_mode(hdf5_path: str | Path) -> str:
+    with h5py.File(hdf5_path, "r") as handle:
+        return _hdf5_hand_target_mode(handle)
+
+
+def hdf5_hand_target_availability(
+    hdf5_path: str | Path,
+) -> dict[str, bool]:
+    with h5py.File(hdf5_path, "r") as handle:
+        mode = _hdf5_hand_target_mode(handle)
+        availability = (
+            _hdf5_rigid_palm_usable
+            if mode == RIGID_PALM_TARGET
+            else _hdf5_hand_usable
+        )
+        return {
+            side: availability(handle, side=side)
+            for side in ("left", "right")
+        }
 
 
 def hdf5_action_keypoint_availability(
@@ -424,7 +658,7 @@ def load_hand_trajectory(
     orientation_smooth_window: int = 15,
     polynomial_order: int = 2,
 ) -> HandTrajectory:
-    """Load wrist IK targets and independently infer continuous hand widths."""
+    """Load fingertip-grasp or explicitly declared rigid-palm targets."""
 
     path = Path(hdf5_path)
     with h5py.File(path, "r") as handle:
@@ -445,14 +679,27 @@ def load_hand_trajectory(
         camera_motion = np.einsum(
             "ij,njk->nik", reference_world_to_camera, camera_to_world
         )
+        target_mode = _hdf5_hand_target_mode(handle)
+        target_availability = (
+            _hdf5_rigid_palm_usable
+            if target_mode == RIGID_PALM_TARGET
+            else _hdf5_hand_usable
+        )
         availability = {
-            side: _hdf5_hand_usable(handle, side=side)
+            side: target_availability(handle, side=side)
             for side in ("left", "right")
         }
         missing_sides = [
             side for side, usable in availability.items() if not usable
         ]
         if missing_sides:
+            if target_mode == RIGID_PALM_TARGET:
+                raise ValueError(
+                    f"{path} lacks usable rigid palm transforms for "
+                    f"{', '.join(missing_sides)} hand(s). Required "
+                    "leftHand/rightHand transforms and confidences with at "
+                    "least two valid frames."
+                )
             required_names = ", ".join(HAND_KEYPOINT_NAMES)
             raise ValueError(
                 f"{path} lacks usable annotated keypoints for "
@@ -460,14 +707,18 @@ def load_hand_trajectory(
                 f"and confidences: {required_names}, with at least two "
                 "valid frames."
             )
-        keypoints = {
-            side: _hdf5_keypoints_reference_camera(
-                handle,
-                side=side,
-                reference_world_to_camera=reference_world_to_camera,
-            )
-            for side in ("left", "right")
-        }
+        keypoints = (
+            {
+                side: _hdf5_keypoints_reference_camera(
+                    handle,
+                    side=side,
+                    reference_world_to_camera=reference_world_to_camera,
+                )
+                for side in ("left", "right")
+            }
+            if target_mode == FINGERTIP_GRASP_TARGET
+            else None
+        )
         rigid_body_tracks = {
             side: (
                 np.asarray(
@@ -481,19 +732,30 @@ def load_hand_trajectory(
             )
             for side in ("left", "right")
         }
+        hand_landmark_tracks = {
+            side: _hdf5_hand_landmarks_reference_camera(
+                handle,
+                side=side,
+                reference_world_to_camera=reference_world_to_camera,
+                frame_count=frame_count,
+            )
+            for side in ("left", "right")
+        }
 
-    aligned = {
-        side: align_hand_action(
-            *keypoints[side],
-            side=side,
-            smooth_window=smooth_window,
-            orientation_smooth_window=orientation_smooth_window,
-            polynomial_order=polynomial_order,
-        )
-        for side in ("left", "right")
-    }
-    left = aligned["left"]
-    right = aligned["right"]
+    aligned = (
+        {
+            side: align_hand_action(
+                *keypoints[side],
+                side=side,
+                smooth_window=smooth_window,
+                orientation_smooth_window=orientation_smooth_window,
+                polynomial_order=polynomial_order,
+            )
+            for side in ("left", "right")
+        }
+        if keypoints is not None
+        else None
+    )
     ik_targets: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
     repeated_reference_transform = np.repeat(
         reference_world_to_camera[None],
@@ -547,20 +809,43 @@ def load_hand_trajectory(
     right_observation_camera = _transform_points(
         current_from_reference, right_position
     )
+    if aligned is None:
+        left_action_position = left_position
+        right_action_position = right_position
+        left_action_rotation = left_rotation
+        right_action_rotation = right_rotation
+        left_width = np.full(frame_count, np.nan, dtype=np.float64)
+        right_width = np.full(frame_count, np.nan, dtype=np.float64)
+        left_normalized_width = left_width.copy()
+        right_normalized_width = right_width.copy()
+        hand_sources = ("hdf5_rigid_palm", "hdf5_rigid_palm")
+    else:
+        left = aligned["left"]
+        right = aligned["right"]
+        left_action_position = left.position
+        right_action_position = right.position
+        left_action_rotation = left.rotation
+        right_action_rotation = right.rotation
+        left_width = left.width
+        right_width = right.width
+        left_normalized_width = left.normalized_width
+        right_normalized_width = right.normalized_width
+        hand_sources = ("hdf5_keypoints", "hdf5_keypoints")
     return HandTrajectory(
         left_reference_camera=left_position,
         right_reference_camera=right_position,
         left_reference_rotations=left_rotation,
         right_reference_rotations=right_rotation,
-        left_action_reference_camera=left.position,
-        right_action_reference_camera=right.position,
-        left_action_reference_rotations=left.rotation,
-        right_action_reference_rotations=right.rotation,
-        left_widths=left.width,
-        right_widths=right.width,
-        left_normalized_widths=left.normalized_width,
-        right_normalized_widths=right.normalized_width,
-        hand_sources=("hdf5", "hdf5"),
+        left_action_reference_camera=left_action_position,
+        right_action_reference_camera=right_action_position,
+        left_action_reference_rotations=left_action_rotation,
+        right_action_reference_rotations=right_action_rotation,
+        left_widths=left_width,
+        right_widths=right_width,
+        left_normalized_widths=left_normalized_width,
+        right_normalized_widths=right_normalized_width,
+        target_mode=target_mode,
+        hand_sources=hand_sources,
         left_observation_camera=left_observation_camera,
         right_observation_camera=right_observation_camera,
         left_pixels=_project(left_observation_camera, intrinsic),
@@ -570,4 +855,6 @@ def load_hand_trajectory(
         intrinsic=intrinsic,
         camera_to_world=camera_to_world,
         camera_motion=camera_motion,
+        left_articulated_hand=hand_landmark_tracks["left"],
+        right_articulated_hand=hand_landmark_tracks["right"],
     )

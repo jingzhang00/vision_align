@@ -24,7 +24,12 @@ from .lighting_profile import (
     aggregate_task_lighting_profiles,
     estimate_lighting_profile,
 )
-from .trajectory import hdf5_action_keypoint_availability
+from .propainter_chunked import DEFAULT_MAX_CHUNK_PIXEL_FRAMES
+from .trajectory import (
+    FINGERTIP_GRASP_TARGET,
+    hdf5_hand_target_availability,
+    hdf5_hand_target_mode,
+)
 from .video_io import video_metadata
 
 
@@ -195,6 +200,27 @@ def _file_fingerprint(path: Path, *, content_hash: bool = False) -> dict[str, ob
     return fingerprint
 
 
+def _python_tree_fingerprint(root: Path) -> dict[str, object]:
+    files = sorted(path for path in root.rglob("*.py") if path.is_file())
+    if not files:
+        raise FileNotFoundError(f"No Python source files found in {root}")
+    digest = hashlib.sha256()
+    total_size = 0
+    for path in files:
+        relative = path.relative_to(root).as_posix().encode("utf-8")
+        content = path.read_bytes()
+        digest.update(relative)
+        digest.update(b"\0")
+        digest.update(content)
+        total_size += len(content)
+    return {
+        "path": str(root.resolve()),
+        "file_count": len(files),
+        "size": total_size,
+        "sha256": digest.hexdigest(),
+    }
+
+
 def _load_pipeline_state(path: Path) -> dict[str, Any]:
     if not path.is_file():
         return {"state_version": 1, "stages": {}}
@@ -234,12 +260,17 @@ def _signatures_match(
     expected: dict[str, object],
     *,
     ignored_inputs: frozenset[str] = frozenset(),
+    ignored_top_level: frozenset[str] = frozenset(),
 ) -> bool:
     if not isinstance(recorded, dict):
         return False
 
     def normalized(signature: dict[str, object]) -> dict[str, object]:
-        result = dict(signature)
+        result = {
+            key: value
+            for key, value in signature.items()
+            if key not in ignored_top_level
+        }
         inputs = signature.get("inputs")
         if isinstance(inputs, dict):
             result["inputs"] = {
@@ -249,10 +280,7 @@ def _signatures_match(
             }
         parameters = signature.get("parameters")
         if isinstance(parameters, dict):
-            stable_parameters = dict(parameters)
-            if stable_parameters.get("backend") == "isaacsim":
-                stable_parameters.pop("backend")
-            result["parameters"] = stable_parameters
+            result["parameters"] = dict(parameters)
         task_profile = signature.get("task_profile")
         if isinstance(task_profile, dict) and "sha256" in task_profile:
             stable_profile = dict(task_profile)
@@ -508,7 +536,7 @@ def _prepare_stage_signature(
     urdf: Path,
     propainter: Path,
     prompt_frame: int,
-    object_prompt_frame: int | None,
+    source_size: tuple[int, int],
 ) -> dict[str, object]:
     input_paths: dict[str, Path] = {
         "video": episode.video,
@@ -521,38 +549,62 @@ def _prepare_stage_signature(
         "video_io_code": repo / "human_to_robot/video_io.py",
         "segment_code": repo / "human_to_robot/segment_sam3.py",
         "lighting_code": repo / "human_to_robot/lighting_profile.py",
-        "propainter_code": propainter / "inference_propainter.py",
+        "propainter_engine_code": (
+            propainter
+            / "web-demos/hugging_face/inpainter/base_inpainter.py"
+        ),
         "chunked_propainter_code": (
             repo / "human_to_robot/propainter_chunked.py"
+        ),
+        "propainter_worker_code": (
+            repo / "human_to_robot/propainter_worker.py"
         ),
         "urdf": urdf,
         "retarget_code": repo / "human_to_robot/retarget_g1_pinocchio.py",
         "trajectory_code": repo / "human_to_robot/trajectory.py",
         "hand_binary_code": repo / "human_to_robot/hand_binary.py",
+        "scene_depth_code": repo / "human_to_robot/scene_depth_da3.py",
+        "da3_config": repo / "models/DA3METRIC-LARGE/config.json",
+        "da3_weights": (
+            repo / "models/DA3METRIC-LARGE/model.safetensors"
+        ),
+        "da3_model_code": (
+            repo
+            / "Depth-Anything-3/src/depth_anything_3/model/da3.py"
+        ),
+        "da3_input_processor_code": (
+            repo
+            / "Depth-Anything-3/src/depth_anything_3/utils/io/"
+            "input_processor.py"
+        ),
     }
+    inputs = {
+        name: _file_fingerprint(path)
+        for name, path in input_paths.items()
+    }
+    inputs["da3_source_tree"] = _python_tree_fingerprint(
+        repo / "Depth-Anything-3/src/depth_anything_3"
+    )
     return {
-        "signature_version": 1,
-        "inputs": {
-            name: _file_fingerprint(path)
-            for name, path in input_paths.items()
-        },
+        "signature_version": 2,
+        "inputs": inputs,
         "parameters": {
             "python": str(Path(sys.executable).resolve()),
             "debug_artifacts": args.debug,
             "hardware_encoding": args.hardware_encoding,
             "binary_hands": args.binary_hands,
-            "width": args.width,
-            "height": args.height,
+            "source_resolution": list(source_size),
             "propainter_subvideo_length": args.propainter_subvideo_length,
             "propainter_context_frames": args.propainter_context_frames,
             "propainter_roi_margin": args.propainter_roi_margin,
+            "propainter_max_chunk_pixel_frames": (
+                args.propainter_max_chunk_pixel_frames
+            ),
             "propainter_max_clip_frames": args.propainter_max_clip_frames,
             "propainter_transition_frames": args.propainter_transition_frames,
             "sam_threshold": args.sam_threshold,
             "arm_prompt": args.arm_prompt,
             "arm_prompt_frame": prompt_frame,
-            "object_prompt": args.object_prompt,
-            "object_prompt_frame": object_prompt_frame,
             "lighting_sample_count": args.lighting_sample_count,
             "lighting_max_dimension": args.lighting_max_dimension,
         },
@@ -564,6 +616,7 @@ def _finish_stage_signature(
     *,
     args: argparse.Namespace,
     repo: Path,
+    urdf: Path,
     task_profile_path: Path,
 ) -> dict[str, object]:
     input_paths = {
@@ -571,13 +624,18 @@ def _finish_stage_signature(
         "hdf5": prepared.episode.hdf5,
         "inpaint_video": prepared.inpaint_video,
         "trajectory": prepared.g1_root / "g1_trajectory.npz",
+        "urdf": urdf,
+        "scene_depth_report": (
+            prepared.episode.output_root
+            / "depth_anything3/scene_depth_report.json"
+        ),
         "composite_code": repo / "human_to_robot/composite.py",
         "pipeline_code": Path(__file__),
         "video_io_code": repo / "human_to_robot/video_io.py",
         "isaac_renderer_code": repo / "human_to_robot/render_isaacsim.py",
     }
     return {
-        "signature_version": 1,
+        "signature_version": 2,
         "prepare_generation": prepared.prepare_generation,
         "inputs": {
             name: _file_fingerprint(path)
@@ -589,7 +647,7 @@ def _finish_stage_signature(
         "parameters": {
             "debug_artifacts": args.debug,
             "hardware_encoding": args.hardware_encoding,
-            "object_prompt_enabled": args.object_prompt is not None,
+            "visualize": args.visualize,
         },
     }
 
@@ -615,6 +673,60 @@ def _image_sequence_complete(
         if image is None or image.shape[1::-1] != expected_size:
             return False
     return True
+
+
+def _scene_depth_complete(
+    directory: Path,
+    report_path: Path,
+    expected_count: int,
+    *,
+    expected_size: tuple[int, int],
+    scene_video: Path,
+) -> bool:
+    if expected_count <= 0 or not directory.is_dir() or not report_path.is_file():
+        return False
+    paths = sorted(directory.glob("*.png"))
+    expected_names = [
+        f"{frame_id:05d}.png" for frame_id in range(expected_count)
+    ]
+    if [path.name for path in paths] != expected_names:
+        return False
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        scene_stat = scene_video.stat()
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not (
+        report.get("schema_version") == 2
+        and report.get("model") == "DA3METRIC-LARGE"
+        and report.get("native_metric") is True
+        and report.get("frame_count") == expected_count
+        and report.get("source_resolution") == list(expected_size)
+        and report.get("scene_video") == str(scene_video.resolve())
+        and report.get("scene_video_fingerprint")
+        == {
+            "size": scene_stat.st_size,
+            "mtime_ns": scene_stat.st_mtime_ns,
+        }
+    ):
+        return False
+    width, height = expected_size
+    digest = hashlib.sha256()
+    for path in paths:
+        image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+        if (
+            image is None
+            or image.dtype != np.uint16
+            or image.shape != (height, width)
+        ):
+            return False
+        digest.update(path.name.encode("ascii"))
+        digest.update(b"\0")
+        try:
+            digest.update(path.read_bytes())
+        except OSError:
+            return False
+    return digest.hexdigest() == report.get("depth_png_sha256")
 
 
 def _video_complete(
@@ -898,18 +1010,26 @@ def _prepare_episode(
     output.mkdir(parents=True, exist_ok=True)
     log_path = output / "pipeline.log"
     _running_episode_report(episode)
-    _, _, frame_count, _ = video_metadata(episode.video)
-    if frame_count <= 0:
-        raise ValueError(f"Episode has no video frames: {episode.video}")
-    hand_keypoints = hdf5_action_keypoint_availability(episode.hdf5)
+    source_width, source_height, frame_count, source_fps = video_metadata(
+        episode.video
+    )
+    if min(source_width, source_height, frame_count) <= 0 or source_fps <= 0:
+        raise ValueError(f"Invalid source video metadata: {episode.video}")
+    source_size = (source_width, source_height)
+    hand_target_mode = hdf5_hand_target_mode(episode.hdf5)
+    hand_targets = hdf5_hand_target_availability(episode.hdf5)
     missing_hands = [
-        side for side, usable in hand_keypoints.items() if not usable
+        side for side, usable in hand_targets.items() if not usable
     ]
     if missing_hands:
+        required = (
+            "annotated wrist/thumb/index/middle 3D keypoints"
+            if hand_target_mode == FINGERTIP_GRASP_TARGET
+            else "explicit leftHand/rightHand rigid palm poses"
+        )
         raise ValueError(
-            f"Episode requires annotated wrist/thumb/index/middle 3D "
-            f"keypoints for both hands; unusable: {', '.join(missing_hands)} "
-            f"({episode.hdf5})"
+            f"Episode requires {required} for both hands; unusable: "
+            f"{', '.join(missing_hands)} ({episode.hdf5})"
         )
     episode_label = _episode_label(episode)
 
@@ -927,15 +1047,6 @@ def _prepare_episode(
             f"Arm prompt frame {prompt_frame} is outside episode "
             f"{episode.task_name}/{episode.name}"
         )
-    object_prompt_frame = (
-        None
-        if args.object_prompt is None
-        else (
-            args.object_prompt_frame
-            if args.object_prompt_frame is not None
-            else prompt_frame
-        )
-    )
     state_path = output / "pipeline_state.json"
     prepare_signature = _prepare_stage_signature(
         episode,
@@ -945,7 +1056,7 @@ def _prepare_episode(
         urdf=urdf,
         propainter=propainter,
         prompt_frame=prompt_frame,
-        object_prompt_frame=object_prompt_frame,
+        source_size=source_size,
     )
     pipeline_state = _load_pipeline_state(state_path)
     previous_prepare = pipeline_state.get("stages", {}).get("prepare", {})
@@ -978,14 +1089,9 @@ def _prepare_episode(
     arm_masks_ready = _image_sequence_complete(
         sam_root / "arm_masks", frame_count
     )
-    object_masks_ready = (
-        args.object_prompt is None
-        or _image_sequence_complete(sam_root / "object_masks", frame_count)
-    )
     reuse_sam = (
         reuse_existing_prepare
         and arm_masks_ready
-        and object_masks_ready
         and _signature_subset_matches(
             previous_signature,
             prepare_signature,
@@ -999,8 +1105,6 @@ def _prepare_episode(
                     "sam_threshold",
                     "arm_prompt",
                     "arm_prompt_frame",
-                    "object_prompt",
-                    "object_prompt_frame",
                 }
             ),
         )
@@ -1030,17 +1134,6 @@ def _prepare_episode(
                 else "--no-hardware-encoding"
             ),
         ]
-        if args.object_prompt is not None:
-            if object_prompt_frame is None:
-                raise RuntimeError("Object prompt frame was not resolved")
-            sam_command.extend(
-                [
-                    "--object-prompt",
-                    args.object_prompt,
-                    "--object-prompt-frame",
-                    str(object_prompt_frame),
-                ]
-            )
         if args.debug:
             sam_command.append("--debug-artifacts")
         _run_logged(
@@ -1054,16 +1147,16 @@ def _prepare_episode(
         )
         if not _image_sequence_complete(sam_root / "arm_masks", frame_count):
             raise RuntimeError(f"SAM3 arm masks are incomplete: {sam_root}")
-        if args.object_prompt is not None and not _image_sequence_complete(
-            sam_root / "object_masks", frame_count
-        ):
-            raise RuntimeError(f"SAM3 object masks are incomplete: {sam_root}")
 
     inpaint_video = propainter_root / episode.video.stem / "inpaint_out.mp4"
     reuse_inpaint = (
         reuse_existing_prepare
         and not sam_changed
-        and _video_complete(inpaint_video, frame_count)
+        and _video_complete(
+            inpaint_video,
+            frame_count,
+            expected_size=source_size,
+        )
         and _signature_subset_matches(
             previous_signature,
             prepare_signature,
@@ -1074,19 +1167,20 @@ def _prepare_episode(
                     "flow_weight",
                     "propainter_weight",
                     "video_io_code",
-                    "propainter_code",
+                    "propainter_engine_code",
                     "chunked_propainter_code",
+                    "propainter_worker_code",
                 }
             ),
             parameter_names=frozenset(
                 {
                     "python",
                     "hardware_encoding",
-                    "width",
-                    "height",
+                    "source_resolution",
                     "propainter_subvideo_length",
                     "propainter_context_frames",
                     "propainter_roi_margin",
+                    "propainter_max_chunk_pixel_frames",
                     "propainter_max_clip_frames",
                     "propainter_transition_frames",
                 }
@@ -1111,16 +1205,14 @@ def _prepare_episode(
                 str(propainter_root),
                 "--propainter-root",
                 str(propainter),
-                "--width",
-                str(args.width),
-                "--height",
-                str(args.height),
                 "--subvideo-length",
                 str(args.propainter_subvideo_length),
                 "--context-frames",
                 str(args.propainter_context_frames),
                 "--roi-margin",
                 str(args.propainter_roi_margin),
+                "--max-chunk-pixel-frames",
+                str(args.propainter_max_chunk_pixel_frames),
                 "--max-clip-frames",
                 str(args.propainter_max_clip_frames),
                 "--transition-frames",
@@ -1139,16 +1231,27 @@ def _prepare_episode(
             episode_started=started,
             stage_label="prepare",
         )
-        if not _video_complete(inpaint_video, frame_count):
+        if not _video_complete(
+            inpaint_video,
+            frame_count,
+            expected_size=source_size,
+        ):
             raise RuntimeError(
                 f"ProPainter output is incomplete: {inpaint_video}"
             )
 
-    _, _, inpaint_count, _ = video_metadata(inpaint_video)
-    if inpaint_count != frame_count:
+    inpaint_width, inpaint_height, inpaint_count, _ = video_metadata(
+        inpaint_video
+    )
+    if (inpaint_width, inpaint_height, inpaint_count) != (
+        source_width,
+        source_height,
+        frame_count,
+    ):
         raise ValueError(
-            f"ProPainter frame count changed for {episode.video}: "
-            f"{frame_count} -> {inpaint_count}"
+            f"ProPainter changed source video geometry for {episode.video}: "
+            f"{(source_width, source_height, frame_count)} -> "
+            f"{(inpaint_width, inpaint_height, inpaint_count)}"
         )
     trajectory_ready = _trajectory_complete(
         g1_root / "g1_trajectory.npz", frame_count
@@ -1205,6 +1308,81 @@ def _prepare_episode(
         ):
             raise RuntimeError(f"G1 trajectory is incomplete: {g1_root}")
 
+    scene_depth_root = output / "depth_anything3"
+    scene_depth_frames = scene_depth_root / "scene_depth_mm"
+    scene_depth_report = scene_depth_root / "scene_depth_report.json"
+    scene_depth_ready = _scene_depth_complete(
+        scene_depth_frames,
+        scene_depth_report,
+        frame_count,
+        expected_size=source_size,
+        scene_video=inpaint_video,
+    )
+    scene_depth_signature_inputs = trajectory_signature_inputs | {
+        "scene_depth_code",
+        "da3_config",
+        "da3_weights",
+        "da3_model_code",
+        "da3_input_processor_code",
+        "da3_source_tree",
+    }
+    reuse_scene_depth = (
+        reuse_existing_prepare
+        and reuse_inpaint
+        and reuse_trajectory
+        and scene_depth_ready
+        and _signature_subset_matches(
+            previous_signature,
+            prepare_signature,
+            input_names=frozenset(scene_depth_signature_inputs),
+            parameter_names=frozenset(
+                {
+                    "python",
+                    "binary_hands",
+                    "source_resolution",
+                }
+            ),
+        )
+    )
+    if not reuse_scene_depth:
+        prepare_changed = True
+        environment = os.environ.copy()
+        environment["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+        _run_logged(
+            [
+                python,
+                "-m",
+                "human_to_robot.scene_depth_da3",
+                "--video",
+                str(inpaint_video),
+                "--trajectory",
+                str(g1_root / "g1_trajectory.npz"),
+                "--output",
+                str(scene_depth_root),
+            ],
+            cwd=repo,
+            environment=environment,
+            log_path=log_path,
+            progress=progress,
+            current_episode=episode_label,
+            episode_started=started,
+            stage_label="prepare",
+            frame_progress_pattern=(
+                r"Depth Anything 3 processed (\d+)/(\d+)"
+            ),
+            frame_progress_label="depth",
+        )
+        if not _scene_depth_complete(
+            scene_depth_frames,
+            scene_depth_report,
+            frame_count,
+            expected_size=source_size,
+            scene_video=inpaint_video,
+        ):
+            raise RuntimeError(
+                f"Depth Anything 3 output is incomplete: {scene_depth_root}"
+            )
+
     observation = estimate_lighting_profile(
         inpaint_video=inpaint_video,
         reliability_mask_root=sam_root / "arm_masks",
@@ -1256,10 +1434,28 @@ def _render_episode(
     episode = prepared.episode
     log_path = episode.output_root / "pipeline.log"
     episode_label = _episode_label(episode)
-    render_width, render_height, _, _ = video_metadata(prepared.inpaint_video)
+    render_width, render_height, source_count, _ = video_metadata(
+        episode.video
+    )
+    inpaint_width, inpaint_height, inpaint_count, _ = video_metadata(
+        prepared.inpaint_video
+    )
+    if (inpaint_width, inpaint_height, inpaint_count) != (
+        render_width,
+        render_height,
+        source_count,
+    ):
+        raise ValueError(
+            "Inpaint video must preserve the source resolution and frame "
+            f"count: source={(render_width, render_height, source_count)}, "
+            f"inpaint={(inpaint_width, inpaint_height, inpaint_count)}"
+        )
     render_size = (render_width, render_height)
     render_root = episode.output_root / "g1_isaacsim"
     trajectory_path = prepared.g1_root / "g1_trajectory.npz"
+    scene_depth_frames = (
+        episode.output_root / "depth_anything3/scene_depth_mm"
+    )
     final_root = episode.output_root / "final"
     final_video = final_root / "synthetic_g1.mp4"
     composite_report = final_root / "composite_report.json"
@@ -1267,6 +1463,7 @@ def _render_episode(
         prepared,
         args=args,
         repo=repo,
+        urdf=urdf,
         task_profile_path=task_profile_path,
     )
     finish_stage = "finish"
@@ -1307,7 +1504,8 @@ def _render_episode(
         render_sequences_complete if args.debug else final_complete
     )
     reuse_render = (
-        args.debug
+        not args.visualize
+        and args.debug
         and render_sequences_complete
         and isaac_report.is_file()
         and _signatures_match(
@@ -1318,12 +1516,20 @@ def _render_episode(
             ),
             finish_signature,
             ignored_inputs=frozenset(
-                {"composite_code", "pipeline_code", "video_io_code"}
+                {
+                    "composite_code",
+                    "inpaint_video",
+                    "pipeline_code",
+                    "video_io_code",
+                    "scene_depth_report",
+                }
             ),
+            ignored_top_level=frozenset({"prepare_generation"}),
         )
     )
     reuse_finish = (
-        args.reuse
+        not args.visualize
+        and args.reuse
         and _stage_complete(pipeline_state, finish_stage, finish_signature)
         and render_complete
         and final_complete
@@ -1339,14 +1545,6 @@ def _render_episode(
             status="running",
             signature=finish_signature,
             started_at_ns=stage_started_at_ns,
-        )
-        object_masks = prepared.sam_root / "object_masks"
-        object_masks_available = (
-            args.object_prompt is not None
-            and _image_sequence_complete(
-                object_masks,
-                prepared.frame_count,
-            )
         )
         if not reuse_render:
             if isaac_runtime is None:
@@ -1365,12 +1563,10 @@ def _render_episode(
                 str(episode.hdf5),
                 "--lighting-profile",
                 str(task_profile_path),
+                "--scene-depths",
+                str(scene_depth_frames),
                 "--output",
                 str(render_root),
-                "--width",
-                str(render_width),
-                "--height",
-                str(render_height),
                 (
                     "--hardware-encoding"
                     if args.hardware_encoding
@@ -1388,10 +1584,8 @@ def _render_episode(
                         str(final_root),
                     ]
                 )
-                if object_masks_available:
-                    isaac_command.extend(
-                        ["--object-masks", str(object_masks)]
-                    )
+            if args.visualize:
+                isaac_command.append("--no-headless")
             _run_logged(
                 isaac_command,
                 cwd=repo,
@@ -1449,6 +1643,8 @@ def _render_episode(
                 str(render_root),
                 "--trajectory",
                 str(trajectory_path),
+                "--scene-depths",
+                str(scene_depth_frames),
                 "--lighting-profile",
                 str(task_profile_path),
                 "--output",
@@ -1460,10 +1656,6 @@ def _render_episode(
                 ),
                 "--debug-artifacts",
             ]
-            if object_masks_available:
-                composite_command.extend(
-                    ["--object-masks", str(object_masks)]
-                )
             _run_logged(
                 composite_command,
                 cwd=repo,
@@ -1524,17 +1716,29 @@ def _render_episode(
         "source_hdf5": str(episode.hdf5),
         "hdf5": str(published_hdf5),
         "renderer": "isaacsim",
-        "task_lighting_profile": str(task_profile_path),
         "synthetic_video": str(published_video),
-        "comparison_video": (
-            str(final_root / "comparison_original_inpaint_g1.mp4")
-            if args.debug
-            else None
-        ),
-        "inpaint_video": str(prepared.inpaint_video),
-        "trajectory": str(prepared.g1_root / "g1_trajectory.npz"),
         "elapsed_seconds": prepared.prepare_seconds + elapsed,
     }
+    if args.debug:
+        artifacts.update(
+            {
+                "task_lighting_profile": str(task_profile_path),
+                "comparison_video": str(
+                    final_root / "comparison_original_inpaint_g1.mp4"
+                ),
+                "inpaint_video": str(prepared.inpaint_video),
+                "trajectory": str(
+                    prepared.g1_root / "g1_trajectory.npz"
+                ),
+                "scene_depth_report": str(
+                    episode.output_root
+                    / "depth_anything3/scene_depth_report.json"
+                ),
+                "scene_depth_frames": str(
+                    episode.output_root / "depth_anything3/scene_depth_mm"
+                ),
+            }
+        )
     _write_json(episode.output_root / "episode_report.json", artifacts)
     return artifacts, elapsed
 
@@ -1559,6 +1763,57 @@ def _episode_error_report(
     }
     _write_json(episode.output_root / "episode_report.json", report)
     return report
+
+
+def _persist_failure_diagnostics(
+    episode: Episode,
+    *,
+    output: Path,
+    report: dict[str, object],
+) -> dict[str, object]:
+    failure_root = (
+        _task_output_root(output.resolve(), episode)
+        / ".failures"
+        / episode.name
+    )
+    failure_root.mkdir(parents=True, exist_ok=True)
+    source_log = episode.output_root / "pipeline.log"
+    published_log = failure_root / "pipeline.log"
+    if source_log.is_file():
+        _atomic_copy(source_log, published_log)
+    else:
+        published_log.write_text(
+            f"{report.get('error', 'Episode failed')}\n",
+            encoding="utf-8",
+        )
+    persisted = dict(report)
+    persisted["log"] = str(published_log)
+    report_path = failure_root / "episode_report.json"
+    _write_json(report_path, persisted)
+    tqdm.write(f"Failure diagnostics saved: {report_path}")
+    return persisted
+
+
+def _record_episode_error(
+    episode: Episode,
+    *,
+    elapsed_seconds: float,
+    error: BaseException,
+    output: Path,
+    debug: bool,
+) -> dict[str, object]:
+    report = _episode_error_report(
+        episode,
+        elapsed_seconds=elapsed_seconds,
+        error=error,
+    )
+    if debug:
+        return report
+    return _persist_failure_diagnostics(
+        episode,
+        output=output,
+        report=report,
+    )
 
 
 def _discard_episode_workspace(episode: Episode, *, debug: bool) -> None:
@@ -1588,14 +1843,15 @@ def _print_episode_error(
     )
 
 
-def _make_task_report(
+def _make_batch_report(
     *,
-    task_episodes: list[Episode],
+    folder: Path,
+    output: Path,
+    discovered_episode_count: int,
+    discovered_task_count: int,
     episode_reports: list[dict[str, object]],
     elapsed_seconds: float,
-    lighting_profile_path: Path | None,
-    lighting_profile: dict[str, Any] | None,
-    status: str | None = None,
+    status: str,
     error: BaseException | None = None,
 ) -> dict[str, object]:
     completed = sum(
@@ -1605,67 +1861,12 @@ def _make_task_report(
         report.get("status") in {"failed", "interrupted"}
         for report in episode_reports
     )
-    pending = max(0, len(task_episodes) - completed - failed)
-    if status is None:
-        status = "completed" if failed == 0 and pending == 0 else "failed"
-    profile_summary: dict[str, object] | None = None
-    if lighting_profile is not None:
-        profile_summary = {
-            "episode_count": lighting_profile["episode_count"],
-            "confidence": lighting_profile["confidence"],
-            "warnings": lighting_profile["warnings"],
-            "isaac": lighting_profile["isaac"],
-        }
-    report: dict[str, object] = {
-        "task": task_episodes[0].task_name,
-        "task_relative": task_episodes[0].task_relative.as_posix(),
-        "source_directory": str(task_episodes[0].task_dir),
-        "status": status,
-        "renderer": "isaacsim",
-        "episode_count": len(task_episodes),
-        "completed_episode_count": completed,
-        "failed_episode_count": failed,
-        "pending_episode_count": pending,
-        "elapsed_seconds": elapsed_seconds,
-        "episode_active_seconds": float(
-            sum(float(item["elapsed_seconds"]) for item in episode_reports)
-        ),
-        "lighting_profile": (
-            str(lighting_profile_path)
-            if lighting_profile_path is not None
-            and lighting_profile is not None
-            else None
-        ),
-        "lighting_profile_summary": profile_summary,
-        "episodes": episode_reports,
-    }
-    if error is not None:
-        report["error"] = f"{type(error).__name__}: {error}"
-    return report
-
-
-def _make_batch_report(
-    *,
-    folder: Path,
-    output: Path,
-    discovered_episode_count: int,
-    discovered_task_count: int,
-    task_reports: list[dict[str, object]],
-    elapsed_seconds: float,
-    status: str,
-    error: BaseException | None = None,
-) -> dict[str, object]:
-    completed = sum(
-        int(report["completed_episode_count"]) for report in task_reports
-    )
-    failed = sum(int(report["failed_episode_count"]) for report in task_reports)
     report: dict[str, object] = {
         "input_folder": str(folder),
         "output_root": str(output),
         "status": status,
         "renderer": "isaacsim",
         "task_count": discovered_task_count,
-        "reported_task_count": len(task_reports),
         "episode_count": discovered_episode_count,
         "completed_episode_count": completed,
         "failed_episode_count": failed,
@@ -1673,7 +1874,7 @@ def _make_batch_report(
             0, discovered_episode_count - completed - failed
         ),
         "elapsed_seconds": elapsed_seconds,
-        "tasks": task_reports,
+        "episodes": episode_reports,
     }
     if error is not None:
         report["error"] = f"{type(error).__name__}: {error}"
@@ -1695,6 +1896,8 @@ def _run_pipeline(
         / "assets/unitree_description/urdf/g1/main_with_hand_new.urdf"
     ).resolve()
     propainter = (repo / "ProPainter").resolve()
+    da3_model = (repo / "models/DA3METRIC-LARGE").resolve()
+    da3_source = (repo / "Depth-Anything-3/src/depth_anything_3").resolve()
     isaac_runtime: IsaacRuntime | None = None
     episodes: list[Episode] = []
     task_groups: dict[Path, list[Episode]] = {}
@@ -1705,7 +1908,7 @@ def _run_pipeline(
             output=output,
             discovered_episode_count=0,
             discovered_task_count=0,
-            task_reports=[],
+            episode_reports=[],
             elapsed_seconds=0.0,
             status="running",
         ),
@@ -1713,14 +1916,29 @@ def _run_pipeline(
     try:
         _validate_file(sam_checkpoint, "SAM3 checkpoint", 3_000_000_000)
         _validate_file(urdf, "G1 URDF")
+        _validate_file(
+            da3_model / "config.json",
+            "DA3METRIC-LARGE config",
+        )
+        _validate_file(
+            da3_model / "model.safetensors",
+            "DA3METRIC-LARGE weights",
+            1_000_000_000,
+        )
+        if not da3_source.is_dir():
+            raise FileNotFoundError(
+                f"Depth Anything 3 submodule source not found: {da3_source}"
+            )
         isaac_runtime = _resolve_isaacsim_runtime(args, repo=repo)
         tqdm.write(f"Isaac runtime: {isaac_runtime.description}")
-        if args.width <= 0 or args.height <= 0:
-            raise ValueError("--width and --height must be positive")
         if args.propainter_subvideo_length < 20:
             raise ValueError("--propainter-subvideo-length must be at least 20")
         if args.propainter_context_frames < 0:
             raise ValueError("--propainter-context-frames cannot be negative")
+        if args.propainter_max_chunk_pixel_frames <= 0:
+            raise ValueError(
+                "--propainter-max-chunk-pixel-frames must be positive"
+            )
         if args.propainter_roi_margin < 0:
             raise ValueError("--propainter-roi-margin cannot be negative")
         if args.propainter_roi_margin < 4:
@@ -1754,7 +1972,7 @@ def _run_pipeline(
             output=output,
             discovered_episode_count=len(episodes),
             discovered_task_count=len(task_groups),
-            task_reports=[],
+            episode_reports=[],
             elapsed_seconds=time.perf_counter() - batch_started,
             status=(
                 "interrupted"
@@ -1772,27 +1990,18 @@ def _run_pipeline(
         f"Discovered {len(episodes)} episodes in {len(task_groups)} task(s); "
         "renderer=isaacsim"
     )
-    task_reports: list[dict[str, object]] = []
+    batch_episode_reports: dict[
+        tuple[Path, str],
+        dict[str, object],
+    ] = {}
     try:
-        for task_relative, task_episodes in task_groups.items():
+        for task_episodes in task_groups.values():
             task_started = time.perf_counter()
             task_label = _task_label(task_episodes[0])
             task_root = _task_output_root(workspace_output, task_episodes[0])
             task_episode_reports: dict[str, dict[str, object]] = {}
             prepared_episodes: list[PreparedEpisode] = []
             task_profile_path: Path | None = None
-            task_profile: dict[str, Any] | None = None
-            _write_json(
-                task_root / "task_report.json",
-                _make_task_report(
-                    task_episodes=task_episodes,
-                    episode_reports=[],
-                    elapsed_seconds=0.0,
-                    lighting_profile_path=None,
-                    lighting_profile=None,
-                    status="running",
-                ),
-            )
             try:
                 with tqdm(
                     total=len(task_episodes),
@@ -1847,10 +2056,12 @@ def _run_pipeline(
                                 elapsed_seconds=duration,
                             )
                             task_episode_reports[episode.name] = (
-                                _episode_error_report(
+                                _record_episode_error(
                                     episode,
                                     elapsed_seconds=duration,
                                     error=error,
+                                    output=args.output,
+                                    debug=args.debug,
                                 )
                             )
                             _print_episode_error(
@@ -1873,7 +2084,7 @@ def _run_pipeline(
                 if prepared_episodes:
                     task_profile_path = task_root / "lighting_profile.json"
                     try:
-                        task_profile = aggregate_task_lighting_profiles(
+                        aggregate_task_lighting_profiles(
                             task_name=task_label,
                             episode_profiles=[
                                 prepared.lighting_observation
@@ -1885,10 +2096,12 @@ def _run_pipeline(
                         for prepared in prepared_episodes:
                             episode = prepared.episode
                             task_episode_reports[episode.name] = (
-                                _episode_error_report(
+                                _record_episode_error(
                                     episode,
                                     elapsed_seconds=prepared.prepare_seconds,
                                     error=error,
+                                    output=args.output,
+                                    debug=args.debug,
                                 )
                             )
                             _print_episode_error(
@@ -1985,10 +2198,12 @@ def _run_pipeline(
                                     ),
                                 )
                                 task_episode_reports[episode.name] = (
-                                    _episode_error_report(
+                                    _record_episode_error(
                                         episode,
                                         elapsed_seconds=duration,
                                         error=error,
+                                        output=args.output,
+                                        debug=args.debug,
                                     )
                                 )
                                 _print_episode_error(
@@ -2010,26 +2225,11 @@ def _run_pipeline(
                                 refresh=True,
                             )
             except BaseException as error:
-                ordered_reports = [
-                    task_episode_reports[episode.name]
-                    for episode in task_episodes
-                    if episode.name in task_episode_reports
-                ]
-                task_report = _make_task_report(
-                    task_episodes=task_episodes,
-                    episode_reports=ordered_reports,
-                    elapsed_seconds=time.perf_counter() - task_started,
-                    lighting_profile_path=task_profile_path,
-                    lighting_profile=task_profile,
-                    status=(
-                        "interrupted"
-                        if _is_interruption(error)
-                        else "failed"
-                    ),
-                    error=error,
-                )
-                _write_json(task_root / "task_report.json", task_report)
-                task_reports.append(task_report)
+                for episode in task_episodes:
+                    if episode.name in task_episode_reports:
+                        batch_episode_reports[
+                            (episode.task_relative, episode.name)
+                        ] = task_episode_reports[episode.name]
                 raise
 
             ordered_reports = [
@@ -2037,30 +2237,60 @@ def _run_pipeline(
                 for episode in task_episodes
                 if episode.name in task_episode_reports
             ]
+            for episode in task_episodes:
+                if episode.name in task_episode_reports:
+                    batch_episode_reports[
+                        (episode.task_relative, episode.name)
+                    ] = task_episode_reports[episode.name]
             task_seconds = time.perf_counter() - task_started
-            task_report = _make_task_report(
-                task_episodes=task_episodes,
-                episode_reports=ordered_reports,
-                elapsed_seconds=task_seconds,
-                lighting_profile_path=task_profile_path,
-                lighting_profile=task_profile,
+            task_completed = sum(
+                report.get("status") == "completed"
+                for report in ordered_reports
             )
-            _write_json(task_root / "task_report.json", task_report)
-            task_reports.append(task_report)
+            task_status = (
+                "completed"
+                if task_completed == len(task_episodes)
+                else "failed"
+            )
             tqdm.write(
-                f"Task {task_label} {task_report['status']}: "
-                f"{task_report['completed_episode_count']}/"
-                f"{task_report['episode_count']} episodes, "
+                f"Task {task_label} {task_status}: "
+                f"{task_completed}/{len(task_episodes)} episodes, "
                 f"elapsed {_format_duration(task_seconds)}"
+            )
+            partial_batch_reports = [
+                batch_episode_reports[
+                    (episode.task_relative, episode.name)
+                ]
+                for episode in episodes
+                if (episode.task_relative, episode.name)
+                in batch_episode_reports
+            ]
+            _write_json(
+                workspace_output / "batch_report.json",
+                _make_batch_report(
+                    folder=folder,
+                    output=output,
+                    discovered_episode_count=len(episodes),
+                    discovered_task_count=len(task_groups),
+                    episode_reports=partial_batch_reports,
+                    elapsed_seconds=time.perf_counter() - batch_started,
+                    status="running",
+                ),
             )
     except BaseException as error:
         batch_seconds = time.perf_counter() - batch_started
+        ordered_batch_reports = [
+            batch_episode_reports[(episode.task_relative, episode.name)]
+            for episode in episodes
+            if (episode.task_relative, episode.name)
+            in batch_episode_reports
+        ]
         batch_report = _make_batch_report(
             folder=folder,
             output=output,
             discovered_episode_count=len(episodes),
             discovered_task_count=len(task_groups),
-            task_reports=task_reports,
+            episode_reports=ordered_batch_reports,
             elapsed_seconds=batch_seconds,
             status=(
                 "interrupted" if _is_interruption(error) else "failed"
@@ -2071,9 +2301,18 @@ def _run_pipeline(
         raise
 
     batch_seconds = time.perf_counter() - batch_started
+    ordered_batch_reports = [
+        batch_episode_reports[(episode.task_relative, episode.name)]
+        for episode in episodes
+        if (episode.task_relative, episode.name) in batch_episode_reports
+    ]
     batch_status = (
         "completed"
-        if all(report["status"] == "completed" for report in task_reports)
+        if len(ordered_batch_reports) == len(episodes)
+        and all(
+            report.get("status") == "completed"
+            for report in ordered_batch_reports
+        )
         else "failed"
     )
     batch_report = _make_batch_report(
@@ -2081,7 +2320,7 @@ def _run_pipeline(
         output=output,
         discovered_episode_count=len(episodes),
         discovered_task_count=len(task_groups),
-        task_reports=task_reports,
+        episode_reports=ordered_batch_reports,
         elapsed_seconds=batch_seconds,
         status=batch_status,
     )
@@ -2089,7 +2328,7 @@ def _run_pipeline(
     tqdm.write(
         f"Batch {batch_status}: "
         f"{batch_report['completed_episode_count']}/{len(episodes)} episodes, "
-        f"{len(task_reports)}/{len(task_groups)} tasks, "
+        f"{len(task_groups)} tasks, "
         f"elapsed {_format_duration(batch_seconds)}"
     )
     return batch_report
@@ -2120,7 +2359,9 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, object]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Folder-based paper §2.3 human-to-G1 synthesis"
+        description=(
+            "Synthesize G1-aligned videos from paired MP4 and HDF5 episodes"
+        )
     )
     parser.add_argument(
         "--folder",
@@ -2133,19 +2374,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
-        "--backend",
-        dest="_legacy_backend",
-        choices=("isaacsim",),
-        default=argparse.SUPPRESS,
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
         "--debug",
         action="store_true",
         help=(
             "Keep masks, inpainted video, render frames, logs, and JSON "
-            "reports; by default only each synthetic MP4 and augmented HDF5 "
-            "remain"
+            "reports; by default only each synthetic MP4 and the unchanged "
+            "source HDF5 copy remain"
+        ),
+    )
+    parser.add_argument(
+        "--visualize",
+        action="store_true",
+        help=(
+            "Open the Isaac Sim window while rendering; always executes the "
+            "render stage instead of reusing cached output"
         ),
     )
     parser.add_argument(
@@ -2156,8 +2398,6 @@ def build_parser() -> argparse.ArgumentParser:
             "checks ISAACSIM_ROOT, ~/isaacsim, then the active Python package"
         ),
     )
-    parser.add_argument("--width", type=int, default=1280)
-    parser.add_argument("--height", type=int, default=720)
     parser.add_argument(
         "--hardware-encoding",
         action=argparse.BooleanOptionalAction,
@@ -2174,22 +2414,21 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Threshold each visible HDF5 hand frame directly and drive the "
             "LinkerHand O6 power-fist presets with the exact 0/1 state "
-            "(default: true)"
+            "when enabled; disabling retargets a complete 25-landmark hand "
+            "track to six independent O6 motors and falls back to continuous "
+            "fingertip width when unavailable (default: true)"
         ),
     )
     parser.add_argument(
         "--propainter-subvideo-length",
         type=int,
         default=80,
-        help=(
-            "Internal ProPainter window and 1280x720-equivalent chunk "
-            "pixel budget"
-        ),
+        help="Internal ProPainter memory-efficient inference window",
     )
     parser.add_argument(
         "--propainter-context-frames",
         type=int,
-        default=20,
+        default=10,
         help="Temporal context kept on each side of an inpaint chunk",
     )
     parser.add_argument(
@@ -2197,6 +2436,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=64,
         help="Target-canvas pixels added around each chunk's mask union",
+    )
+    parser.add_argument(
+        "--propainter-max-chunk-pixel-frames",
+        type=int,
+        default=DEFAULT_MAX_CHUNK_PIXEL_FRAMES,
+        help=(
+            "Maximum clip-frame count multiplied by cropped ROI pixels; "
+            "source and ROI resolution are accounted directly"
+        ),
     )
     parser.add_argument(
         "--propainter-max-clip-frames",
@@ -2217,8 +2465,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="Optional fixed frame for every episode; default selects from HDF5",
     )
-    parser.add_argument("--object-prompt")
-    parser.add_argument("--object-prompt-frame", type=int)
+
     parser.add_argument("--lighting-sample-count", type=int, default=16)
     parser.add_argument("--lighting-max-dimension", type=int, default=384)
     parser.add_argument(

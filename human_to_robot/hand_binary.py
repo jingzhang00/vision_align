@@ -4,7 +4,7 @@ There is deliberately no interpolation, smoothing, hysteresis, event
 detection, or state latch in this module.  Frame ``t`` depends only on MANO
 landmarks and visibility at frame ``t``.
 
-The geometry follows the action-alignment paper:
+The geometry follows the action-alignment:
 
 ``virtual_finger = 0.7 * index_tip + 0.3 * middle_tip``
 
@@ -19,22 +19,22 @@ split by a small aperture change.  It is never calibrated from the episode.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
-import re
 from typing import Mapping
 
 import h5py
 import numpy as np
 
 
-PAPER_HAND_LANDMARKS = (
+HAND_LANDMARKS = (
     "Hand",
     "ThumbTip",
     "IndexFingerTip",
     "MiddleFingerTip",
 )
-REQUIRED_LANDMARKS = PAPER_HAND_LANDMARKS
+REQUIRED_LANDMARKS = HAND_LANDMARKS
 CLOSE_RATIO_THRESHOLD = 3.0 / 8.0
 VIRTUAL_INDEX_WEIGHT = 0.7
 VIRTUAL_MIDDLE_WEIGHT = 0.3
@@ -122,10 +122,10 @@ def _validate_tracks(
     confidences: Mapping[str, np.ndarray],
 ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], int]:
     missing_positions = [
-        name for name in PAPER_HAND_LANDMARKS if name not in positions
+        name for name in HAND_LANDMARKS if name not in positions
     ]
     missing_confidences = [
-        name for name in PAPER_HAND_LANDMARKS if name not in confidences
+        name for name in HAND_LANDMARKS if name not in confidences
     ]
     if missing_positions or missing_confidences:
         missing = sorted(set(missing_positions + missing_confidences))
@@ -140,7 +140,7 @@ def _validate_tracks(
 
     clean_positions: dict[str, np.ndarray] = {}
     clean_confidences: dict[str, np.ndarray] = {}
-    for name in PAPER_HAND_LANDMARKS:
+    for name in HAND_LANDMARKS:
         point = np.asarray(positions[name], dtype=np.float64)
         confidence = np.asarray(confidences[name], dtype=np.float64)
         if point.shape != (frame_count, 3):
@@ -190,7 +190,7 @@ def infer_hand_binary(
     visibility_source: str = "caller",
     close_ratio_threshold: float = CLOSE_RATIO_THRESHOLD,
 ) -> HandBinaryResult:
-    """Classify every frame independently from paper-aligned MANO geometry."""
+    """Classify every frame independently from MANO geometry."""
 
     if side not in {"left", "right"}:
         raise ValueError(f"Unknown hand side: {side}")
@@ -230,7 +230,7 @@ def infer_hand_binary(
         np.stack(
             [
                 clean_confidences[name]
-                for name in PAPER_HAND_LANDMARKS
+                for name in HAND_LANDMARKS
             ],
             axis=1,
         ),
@@ -269,7 +269,7 @@ def infer_hand_binary(
         warnings.append("out_of_frame_hand_frames_forced_open")
     diagnostics = HandBinaryDiagnostics(
         side=side,
-        method="stateless_paper_ratio_v1",
+        method="stateless_ratio_v1",
         operation_enabled=bool(operation_enabled),
         operation_hands=tuple(operation_hands),
         operation_hand_source=operation_hand_source,
@@ -426,7 +426,7 @@ def infer_binary_grasps_from_hdf5(
         for side in ("left", "right"):
             positions: dict[str, np.ndarray] = {}
             confidences: dict[str, np.ndarray] = {}
-            for name in PAPER_HAND_LANDMARKS:
+            for name in HAND_LANDMARKS:
                 transform_key = f"transforms/{side}{name}"
                 confidence_key = f"confidences/{side}{name}"
                 missing = [

@@ -74,23 +74,6 @@ def _grade_robot(
     return np.clip(rgb[..., ::-1] * 255.0, 0.0, 255.0).astype(np.uint8)
 
 
-def _soften_robot(
-    frame: np.ndarray, mask: np.ndarray, sigma: float
-) -> np.ndarray:
-    """Soften the robot without bleeding the render background into its edge."""
-
-    if sigma <= 0.0:
-        return frame
-    weight = mask.astype(np.float32)
-    blurred_weight = cv2.GaussianBlur(weight, (0, 0), sigma)
-    premultiplied = frame.astype(np.float32) * weight[..., None]
-    blurred = cv2.GaussianBlur(premultiplied, (0, 0), sigma)
-    valid = blurred_weight > 1e-5
-    result = frame.astype(np.float32)
-    result[valid] = blurred[valid] / blurred_weight[valid, None]
-    return np.clip(result, 0.0, 255.0).astype(np.uint8)
-
-
 def _resolve_robot_grade(
     *,
     lighting_profile_path: Path | None,
@@ -98,15 +81,13 @@ def _resolve_robot_grade(
     robot_rgb_gain: tuple[float, float, float] | None,
     robot_contrast: float | None,
     robot_saturation: float | None,
-    robot_soften_sigma: float | None,
-) -> tuple[float, tuple[float, float, float], float, float, float]:
+) -> tuple[float, tuple[float, float, float], float, float]:
     lighting_profile = load_lighting_profile(lighting_profile_path)
     explicit_values: dict[str, object | None] = {
         "robot_exposure": robot_exposure,
         "robot_rgb_gain": robot_rgb_gain,
         "robot_contrast": robot_contrast,
         "robot_saturation": robot_saturation,
-        "robot_soften_sigma": robot_soften_sigma,
     }
     resolved_grade = {
         key: resolve_profile_value(
@@ -129,62 +110,56 @@ def _resolve_robot_grade(
         rgb_gain,
         float(resolved_grade["robot_contrast"]),
         float(resolved_grade["robot_saturation"]),
-        float(resolved_grade["robot_soften_sigma"]),
     )
 
 
-def _object_depths(
+def _depth_to_uint16_mm(depth_m: np.ndarray) -> np.ndarray:
+    valid = np.isfinite(depth_m) & (depth_m > 0.0)
+    depth_mm = np.zeros(depth_m.shape, dtype=np.uint16)
+    depth_mm[valid] = np.clip(
+        np.rint(depth_m[valid] * 1000.0),
+        1,
+        np.iinfo(np.uint16).max,
+    ).astype(np.uint16)
+    return depth_mm
+
+
+def _robot_visibility_mask(
     *,
-    trajectory_path: Path,
-    frame_count: int,
-    object_masks_enabled: bool,
-) -> np.ndarray:
-    with np.load(trajectory_path) as archive:
-        scale = float(archive["scale"])
-        right_observation_camera = (
-            np.asarray(
-                archive["right_observation_camera"],
-                dtype=np.float64,
-            )
-            if "right_observation_camera" in archive
-            else None
-        )
-    if (
-        right_observation_camera is not None
-        and right_observation_camera.shape != (frame_count, 3)
+    robot_mask: np.ndarray,
+    robot_depth_mm: np.ndarray,
+    scene_depth_mm: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    if not (
+        robot_mask.shape
+        == robot_depth_mm.shape
+        == scene_depth_mm.shape
     ):
-        raise ValueError(
-            "right_observation_camera and videos have different lengths"
-        )
-    if object_masks_enabled and right_observation_camera is None:
-        raise ValueError(
-            "Object occlusion requires right_observation_camera in the "
-            "trajectory archive"
-        )
-    if right_observation_camera is None:
-        return np.full(frame_count, np.inf, dtype=np.float64)
-    return np.maximum(
-        0.05,
-        scale * right_observation_camera[:, 2] - 0.02,
+        raise ValueError("Robot mask and depth planes must have equal shapes")
+    robot = robot_mask > 0
+    valid_robot = robot_depth_mm > 0
+    valid_scene = scene_depth_mm > 0
+    visible = (
+        robot
+        & valid_robot
+        & valid_scene
+        & (robot_depth_mm <= scene_depth_mm)
     )
+    return visible, valid_scene
 
 
 def _composite_frame(
     *,
-    source: np.ndarray,
     background: np.ndarray,
     robot: np.ndarray,
     robot_mask: np.ndarray,
     robot_depth: np.ndarray,
-    object_mask: np.ndarray | None,
-    object_depth: float,
+    scene_depth_mm: np.ndarray,
     robot_exposure: float,
     robot_rgb_gain: tuple[float, float, float],
     robot_contrast: float,
     robot_saturation: float,
-    robot_soften_sigma: float,
-) -> tuple[np.ndarray, float, float]:
-    binary_robot = robot_mask > 0
+) -> tuple[np.ndarray, float, float, float]:
     robot = _grade_robot(
         robot,
         exposure=robot_exposure,
@@ -192,35 +167,19 @@ def _composite_frame(
         contrast=robot_contrast,
         saturation=robot_saturation,
     )
-    robot = _soften_robot(robot, binary_robot, robot_soften_sigma)
-
-    occluder = np.zeros(binary_robot.shape, dtype=bool)
-    if object_mask is not None:
-        occluder = (
-            (object_mask > 0)
-            & binary_robot
-            & (object_depth <= robot_depth + 0.015)
-        )
-
-    visible_robot = binary_robot & ~occluder
-    alpha = cv2.GaussianBlur(
-        visible_robot.astype(np.float32),
-        (0, 0),
-        sigmaX=0.8,
-        sigmaY=0.8,
+    visible_robot, valid_scene = _robot_visibility_mask(
+        robot_mask=robot_mask,
+        robot_depth_mm=_depth_to_uint16_mm(robot_depth),
+        scene_depth_mm=scene_depth_mm,
     )
-    alpha[visible_robot] = np.maximum(alpha[visible_robot], 0.94)
-    alpha = np.clip(alpha, 0.0, 1.0)[..., None]
-    synthetic = (
-        robot.astype(np.float32) * alpha
-        + background.astype(np.float32) * (1.0 - alpha)
-    )
-    synthetic = np.clip(synthetic, 0, 255).astype(np.uint8)
-    synthetic[occluder] = source[occluder]
+    occluded_robot = (robot_mask > 0) & ~visible_robot
+    synthetic = background.copy()
+    synthetic[visible_robot] = robot[visible_robot]
     return (
         synthetic,
         float(visible_robot.mean()),
-        float(occluder.mean()),
+        float(occluded_robot.mean()),
+        float(valid_scene.mean()),
     )
 
 
@@ -233,7 +192,7 @@ class InMemoryVideoCompositor:
         source_video: Path,
         inpaint_video: Path,
         trajectory_path: Path,
-        object_mask_root: Path | None,
+        scene_depth_root: Path,
         output_root: Path,
         g1_root: Path,
         lighting_profile_path: Path | None = None,
@@ -241,7 +200,6 @@ class InMemoryVideoCompositor:
         robot_rgb_gain: tuple[float, float, float] | None = None,
         robot_contrast: float | None = None,
         robot_saturation: float | None = None,
-        robot_soften_sigma: float | None = None,
         hardware_encoding: bool = True,
     ) -> None:
         self.source_video = source_video.resolve()
@@ -259,14 +217,12 @@ class InMemoryVideoCompositor:
             self.robot_rgb_gain,
             self.robot_contrast,
             self.robot_saturation,
-            self.robot_soften_sigma,
         ) = _resolve_robot_grade(
             lighting_profile_path=self.lighting_profile_path,
             robot_exposure=robot_exposure,
             robot_rgb_gain=robot_rgb_gain,
             robot_contrast=robot_contrast,
             robot_saturation=robot_saturation,
-            robot_soften_sigma=robot_soften_sigma,
         )
 
         (
@@ -291,47 +247,34 @@ class InMemoryVideoCompositor:
                 f"FPS mismatch: source={self.source_fps}, "
                 f"inpaint={background_fps}"
             )
-        self.object_mask_paths = (
-            _numbered_image_paths(object_mask_root.resolve())
-            if object_mask_root is not None and object_mask_root.is_dir()
-            else None
+        self.scene_depth_root = scene_depth_root.resolve()
+        self.scene_depth_paths = _numbered_image_paths(
+            self.scene_depth_root
         )
-        if (
-            self.object_mask_paths is not None
-            and len(self.object_mask_paths) != self.frame_count
-        ):
+        if len(self.scene_depth_paths) != self.frame_count:
             raise ValueError(
-                "Object mask and video frame counts disagree: "
-                f"{len(self.object_mask_paths)} != {self.frame_count}"
-            )
-        self.object_depths = _object_depths(
-            trajectory_path=self.trajectory_path,
-            frame_count=self.frame_count,
-            object_masks_enabled=self.object_mask_paths is not None,
+                "Scene depth and video frame counts disagree: "
+                f"{len(self.scene_depth_paths)} != {self.frame_count}"
         )
         self.hardware_encoding = hardware_encoding
-        self._source_capture: cv2.VideoCapture | None = None
         self._background_capture: cv2.VideoCapture | None = None
         self._stack: ExitStack | None = None
         self._writer: EncodedVideoWriter | None = None
         self._next_frame = 0
         self._robot_fractions: list[float] = []
-        self._object_occlusion_fractions: list[float] = []
+        self._robot_occlusion_fractions: list[float] = []
+        self._scene_valid_fractions: list[float] = []
         self._encoding: dict[str, object] | None = None
         self._report: dict[str, object] | None = None
 
     def __enter__(self) -> InMemoryVideoCompositor:
         self.output_root.mkdir(parents=True, exist_ok=True)
-        self._source_capture = cv2.VideoCapture(str(self.source_video))
         self._background_capture = cv2.VideoCapture(
             str(self.inpaint_video)
         )
-        if (
-            not self._source_capture.isOpened()
-            or not self._background_capture.isOpened()
-        ):
+        if not self._background_capture.isOpened():
             self._release_captures()
-            raise RuntimeError("Failed to open source or inpaint video")
+            raise RuntimeError("Failed to open inpaint video")
         self._stack = ExitStack()
         try:
             self._writer = self._stack.enter_context(
@@ -380,11 +323,8 @@ class InMemoryVideoCompositor:
             self._release_captures()
 
     def _release_captures(self) -> None:
-        if self._source_capture is not None:
-            self._source_capture.release()
         if self._background_capture is not None:
             self._background_capture.release()
-        self._source_capture = None
         self._background_capture = None
 
     def write(
@@ -394,8 +334,7 @@ class InMemoryVideoCompositor:
         robot_depth: np.ndarray,
     ) -> np.ndarray:
         if (
-            self._source_capture is None
-            or self._background_capture is None
+            self._background_capture is None
             or self._writer is None
         ):
             raise RuntimeError("In-memory compositor is not open")
@@ -421,52 +360,45 @@ class InMemoryVideoCompositor:
                 f"{expected_plane_shape}"
             )
 
-        source_ok, source = self._source_capture.read()
         background_ok, background = self._background_capture.read()
-        if not source_ok or not background_ok:
+        if not background_ok:
             raise RuntimeError(f"Video decode stopped at frame {frame_id}")
-        if source.shape[:2] != (self.source_height, self.source_width):
-            raise RuntimeError(
-                f"Unexpected source frame shape: {source.shape}"
-            )
-        source = cv2.resize(
-            source,
-            (self.width, self.height),
-            interpolation=cv2.INTER_AREA,
-        )
         if background.shape != expected_image_shape:
             raise RuntimeError(
                 f"Unexpected inpaint frame shape: {background.shape}"
             )
-        object_mask = (
-            cv2.resize(
-                _read_image(
-                    self.object_mask_paths[frame_id],
-                    cv2.IMREAD_GRAYSCALE,
-                ),
-                (self.width, self.height),
-                interpolation=cv2.INTER_NEAREST,
-            )
-            if self.object_mask_paths is not None
-            else None
+        scene_depth_mm = _read_image(
+            self.scene_depth_paths[frame_id],
+            cv2.IMREAD_UNCHANGED,
         )
-        synthetic, robot_fraction, object_fraction = _composite_frame(
-            source=source,
+        if (
+            scene_depth_mm.dtype != np.uint16
+            or scene_depth_mm.shape != expected_plane_shape
+        ):
+            raise ValueError(
+                "Scene depth must be source-resolution uint16 millimeters: "
+                f"{self.scene_depth_paths[frame_id]}"
+            )
+        (
+            synthetic,
+            robot_fraction,
+            occlusion_fraction,
+            scene_valid_fraction,
+        ) = _composite_frame(
             background=background,
             robot=robot,
             robot_mask=robot_mask,
             robot_depth=robot_depth,
-            object_mask=object_mask,
-            object_depth=float(self.object_depths[frame_id]),
+            scene_depth_mm=scene_depth_mm,
             robot_exposure=self.robot_exposure,
             robot_rgb_gain=self.robot_rgb_gain,
             robot_contrast=self.robot_contrast,
             robot_saturation=self.robot_saturation,
-            robot_soften_sigma=self.robot_soften_sigma,
         )
         self._writer.write(synthetic)
         self._robot_fractions.append(robot_fraction)
-        self._object_occlusion_fractions.append(object_fraction)
+        self._robot_occlusion_fractions.append(occlusion_fraction)
+        self._scene_valid_fractions.append(scene_valid_fraction)
         self._next_frame += 1
         return synthetic
 
@@ -491,13 +423,22 @@ class InMemoryVideoCompositor:
             "max_robot_area_fraction": float(
                 np.max(self._robot_fractions)
             ),
-            "mean_object_depth_occlusion_fraction": float(
-                np.mean(self._object_occlusion_fractions)
+            "mean_robot_occlusion_fraction": float(
+                np.mean(self._robot_occlusion_fractions)
+            ),
+            "mean_scene_depth_valid_fraction": float(
+                np.mean(self._scene_valid_fractions)
             ),
             "source_video": str(self.source_video),
             "inpaint_video": str(self.inpaint_video),
             "g1_root": str(self.g1_root),
             "trajectory": str(self.trajectory_path),
+            "scene_depth_root": str(self.scene_depth_root),
+            "occlusion_rule": (
+                "M=robot_mask & valid(D_robot) & valid(D_scene) & "
+                "(D_robot_mm <= D_scene_mm); "
+                "I_syn=M*I_robot+(1-M)*I_inpaint"
+            ),
             "lighting_profile": (
                 str(self.lighting_profile_path)
                 if self.lighting_profile_path is not None
@@ -509,7 +450,6 @@ class InMemoryVideoCompositor:
                 "rgb_gain": list(self.robot_rgb_gain),
                 "contrast": self.robot_contrast,
                 "saturation": self.robot_saturation,
-                "soften_sigma_px": self.robot_soften_sigma,
             },
         }
 
@@ -520,14 +460,13 @@ def compose_video(
     inpaint_video: Path,
     g1_root: Path,
     trajectory_path: Path | None = None,
-    object_mask_root: Path | None,
+    scene_depth_root: Path,
     output_root: Path,
     lighting_profile_path: Path | None = None,
     robot_exposure: float | None = None,
     robot_rgb_gain: tuple[float, float, float] | None = None,
     robot_contrast: float | None = None,
     robot_saturation: float | None = None,
-    robot_soften_sigma: float | None = None,
     debug_artifacts: bool = False,
     delete_input_frames: bool = False,
     hardware_encoding: bool = True,
@@ -537,14 +476,12 @@ def compose_video(
         robot_rgb_gain,
         robot_contrast,
         robot_saturation,
-        robot_soften_sigma,
     ) = _resolve_robot_grade(
         lighting_profile_path=lighting_profile_path,
         robot_exposure=robot_exposure,
         robot_rgb_gain=robot_rgb_gain,
         robot_contrast=robot_contrast,
         robot_saturation=robot_saturation,
-        robot_soften_sigma=robot_soften_sigma,
     )
 
     source_width, source_height, source_count, source_fps = video_metadata(
@@ -556,20 +493,15 @@ def compose_video(
     robot_rgb_paths = _numbered_image_paths(g1_root / "robot_rgb")
     robot_mask_paths = _numbered_image_paths(g1_root / "robot_masks")
     robot_depth_paths = _numbered_image_paths(g1_root / "robot_depth_mm")
-    object_mask_paths = (
-        _numbered_image_paths(object_mask_root)
-        if object_mask_root is not None and object_mask_root.is_dir()
-        else None
-    )
+    scene_depth_paths = _numbered_image_paths(scene_depth_root)
     counts = {
         source_count,
         background_count,
         len(robot_rgb_paths),
         len(robot_mask_paths),
         len(robot_depth_paths),
+        len(scene_depth_paths),
     }
-    if object_mask_paths is not None:
-        counts.add(len(object_mask_paths))
     if len(counts) != 1:
         raise ValueError(f"Input frame counts disagree: {sorted(counts)}")
     if abs(source_fps - background_fps) > 0.01:
@@ -581,12 +513,8 @@ def compose_video(
         else g1_root / "g1_trajectory.npz"
     )
     robot_fractions: list[float] = []
-    object_occlusion_fractions: list[float] = []
-    object_depths = _object_depths(
-        trajectory_path=resolved_trajectory_path,
-        frame_count=source_count,
-        object_masks_enabled=object_mask_paths is not None,
-    )
+    robot_occlusion_fractions: list[float] = []
+    scene_valid_fractions: list[float] = []
     output_root.mkdir(parents=True, exist_ok=True)
     source_capture = cv2.VideoCapture(str(source_video))
     background_capture = cv2.VideoCapture(str(inpaint_video))
@@ -601,6 +529,7 @@ def compose_video(
     )
     selected_frames: dict[int, np.ndarray] = {}
     comparison_encoding: dict[str, object] | None = None
+    print(f"Composite processed 0/{source_count}", flush=True)
     try:
         with ExitStack() as stack:
             synthetic_writer = stack.enter_context(
@@ -656,32 +585,34 @@ def compose_video(
                 )
                 depth = depth_mm.astype(np.float32) / 1000.0
 
-                object_mask = (
-                    cv2.resize(
-                        _read_image(
-                            object_mask_paths[frame_id],
-                            cv2.IMREAD_GRAYSCALE,
-                        ),
-                        (width, height),
-                        interpolation=cv2.INTER_NEAREST,
-                    )
-                    if object_mask_paths is not None
-                    else None
+                scene_depth_mm = _read_image(
+                    scene_depth_paths[frame_id],
+                    cv2.IMREAD_UNCHANGED,
                 )
-                synthetic, robot_fraction, object_fraction = (
+                if (
+                    scene_depth_mm.dtype != np.uint16
+                    or scene_depth_mm.shape != (height, width)
+                ):
+                    raise ValueError(
+                        "Scene depth must be source-resolution uint16 "
+                        f"millimeters: {scene_depth_paths[frame_id]}"
+                    )
+                (
+                    synthetic,
+                    robot_fraction,
+                    occlusion_fraction,
+                    scene_valid_fraction,
+                ) = (
                     _composite_frame(
-                        source=source,
                         background=background,
                         robot=robot,
                         robot_mask=robot_mask,
                         robot_depth=depth,
-                        object_mask=object_mask,
-                        object_depth=float(object_depths[frame_id]),
+                        scene_depth_mm=scene_depth_mm,
                         robot_exposure=robot_exposure,
                         robot_rgb_gain=robot_rgb_gain,
                         robot_contrast=robot_contrast,
                         robot_saturation=robot_saturation,
-                        robot_soften_sigma=robot_soften_sigma,
                     )
                 )
                 synthetic_writer.write(synthetic)
@@ -698,7 +629,8 @@ def compose_video(
                 if frame_id in selected:
                     selected_frames[frame_id] = synthetic.copy()
                 robot_fractions.append(robot_fraction)
-                object_occlusion_fractions.append(object_fraction)
+                robot_occlusion_fractions.append(occlusion_fraction)
+                scene_valid_fractions.append(scene_valid_fraction)
                 if delete_input_frames:
                     robot_rgb_paths[frame_id].unlink(missing_ok=True)
                     robot_mask_paths[frame_id].unlink(missing_ok=True)
@@ -748,13 +680,22 @@ def compose_video(
         "comparison_encoding": comparison_encoding,
         "mean_robot_area_fraction": float(np.mean(robot_fractions)),
         "max_robot_area_fraction": float(np.max(robot_fractions)),
-        "mean_object_depth_occlusion_fraction": float(
-            np.mean(object_occlusion_fractions)
+        "mean_robot_occlusion_fraction": float(
+            np.mean(robot_occlusion_fractions)
+        ),
+        "mean_scene_depth_valid_fraction": float(
+            np.mean(scene_valid_fractions)
         ),
         "source_video": str(source_video),
         "inpaint_video": str(inpaint_video),
         "g1_root": str(g1_root),
         "trajectory": str(resolved_trajectory_path),
+        "scene_depth_root": str(scene_depth_root),
+        "occlusion_rule": (
+            "M=robot_mask & valid(D_robot) & valid(D_scene) & "
+            "(D_robot_mm <= D_scene_mm); "
+            "I_syn=M*I_robot+(1-M)*I_inpaint"
+        ),
         "lighting_profile": (
             str(lighting_profile_path) if lighting_profile_path is not None else None
         ),
@@ -763,7 +704,6 @@ def compose_video(
             "rgb_gain": list(robot_rgb_gain),
             "contrast": robot_contrast,
             "saturation": robot_saturation,
-            "soften_sigma_px": robot_soften_sigma,
         },
     }
     (output_root / "composite_report.json").write_text(
@@ -784,7 +724,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Trajectory NPZ; defaults to G1_ROOT/g1_trajectory.npz",
     )
-    parser.add_argument("--object-masks", type=Path)
+    parser.add_argument(
+        "--scene-depths",
+        type=Path,
+        required=True,
+        help="Numbered native-metric DA3 depth PNGs in uint16 millimeters",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
         "--lighting-profile",
@@ -800,7 +745,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--robot-contrast", type=float)
     parser.add_argument("--robot-saturation", type=float)
-    parser.add_argument("--robot-soften-sigma", type=float)
     parser.add_argument("--debug-artifacts", action="store_true")
     parser.add_argument("--delete-input-frames", action="store_true")
     parser.add_argument(
@@ -823,9 +767,7 @@ def main() -> None:
             if args.trajectory is not None
             else None
         ),
-        object_mask_root=(
-            args.object_masks.resolve() if args.object_masks is not None else None
-        ),
+        scene_depth_root=args.scene_depths.resolve(),
         output_root=args.output.resolve(),
         lighting_profile_path=(
             args.lighting_profile.resolve()
@@ -838,7 +780,6 @@ def main() -> None:
         ),
         robot_contrast=args.robot_contrast,
         robot_saturation=args.robot_saturation,
-        robot_soften_sigma=args.robot_soften_sigma,
         debug_artifacts=args.debug_artifacts,
         delete_input_frames=args.delete_input_frames,
         hardware_encoding=args.hardware_encoding,

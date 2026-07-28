@@ -39,10 +39,11 @@ class PipelineStateTests(unittest.TestCase):
                 "mtime_ns": 1,
                 "sha256": "same-content",
             },
-            "parameters": {"backend": "isaacsim", "debug_artifacts": True},
+            "parameters": {"debug_artifacts": True},
         }
         expected = {
             "signature_version": 1,
+            "prepare_generation": 2,
             "inputs": {
                 "video": {"path": "0.mp4", "size": 10, "mtime_ns": 1},
                 "pipeline_code": {
@@ -59,6 +60,7 @@ class PipelineStateTests(unittest.TestCase):
             },
             "parameters": {"debug_artifacts": True},
         }
+        recorded["prepare_generation"] = 1
 
         self.assertFalse(_signatures_match(recorded, expected))
         self.assertTrue(
@@ -66,6 +68,7 @@ class PipelineStateTests(unittest.TestCase):
                 recorded,
                 expected,
                 ignored_inputs=frozenset({"pipeline_code"}),
+                ignored_top_level=frozenset({"prepare_generation"}),
             )
         )
         self.assertTrue(
@@ -189,7 +192,10 @@ class PipelineStateTests(unittest.TestCase):
     def test_completed_overwrite_clears_error_and_is_cacheable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             state_path = Path(temporary) / "pipeline_state.json"
-            signature = {"episode": "0", "parameters": {"width": 1280}}
+            signature = {
+                "episode": "0",
+                "parameters": {"source_resolution": [1280, 720]},
+            }
             other_record = {
                 "status": "completed",
                 "signature": {"task": "lighting"},
@@ -228,34 +234,26 @@ class PipelineStateTests(unittest.TestCase):
 
 
 class PipelineParserDefaultsTests(unittest.TestCase):
-    def test_resolution_and_chunking_defaults(self) -> None:
+    def test_source_resolution_is_not_a_cli_parameter(self) -> None:
         args = build_parser().parse_args(
             ["--folder", "dataset/test", "--output", "outputs/test"]
         )
 
-        self.assertEqual((args.width, args.height), (1280, 720))
+        self.assertFalse(hasattr(args, "width"))
+        self.assertFalse(hasattr(args, "height"))
         self.assertEqual(args.propainter_subvideo_length, 80)
-        self.assertEqual(args.propainter_context_frames, 20)
+        self.assertEqual(args.propainter_context_frames, 10)
         self.assertEqual(args.propainter_roi_margin, 64)
+        self.assertEqual(
+            args.propainter_max_chunk_pixel_frames,
+            60_000_000,
+        )
         self.assertEqual(args.propainter_max_clip_frames, 240)
         self.assertEqual(args.propainter_transition_frames, 16)
         self.assertTrue(args.binary_hands)
         self.assertTrue(args.hardware_encoding)
+        self.assertFalse(args.visualize)
         self.assertFalse(hasattr(args, "backend"))
-
-    def test_legacy_isaacsim_backend_argument_is_still_accepted(self) -> None:
-        args = build_parser().parse_args(
-            [
-                "--folder",
-                "dataset/test",
-                "--output",
-                "outputs/test",
-                "--backend",
-                "isaacsim",
-            ]
-        )
-
-        self.assertEqual(args._legacy_backend, "isaacsim")
 
 
 if __name__ == "__main__":

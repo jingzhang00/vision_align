@@ -28,7 +28,6 @@ DEFAULT_COMPOSITE_PROFILE: dict[str, object] = {
     "robot_rgb_gain": [1.0, 1.0, 1.0],
     "robot_contrast": 0.92,
     "robot_saturation": 0.82,
-    "robot_soften_sigma": 0.55,
 }
 
 

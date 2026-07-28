@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11,<3.12"
 dependencies = [
+    "addict>=2.4.0",
     "av>=15.0.0",
     "einops>=0.8.1",
     "ftfy==6.1.1",
@@ -15,9 +16,11 @@ dependencies = [
     "matplotlib>=3.10.0",
     "numpy>=1.26,<2",
     "nvitop>=1.7.1",
+    "omegaconf>=2.3.0",
     "pycocotools>=2.0.10",
     "regex",
     "requests>=2.32.0",
+    "safetensors>=0.5.0",
     "sam3",
     "scipy>=1.14.0",
     "timm>=1.0.17",

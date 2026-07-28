@@ -15,6 +15,7 @@ from human_to_robot.pipeline import (
     IsaacRuntime,
     PreparedEpisode,
     _discard_episode_workspace,
+    _persist_failure_diagnostics,
     _publish_episode_outputs,
     _render_episode,
     _resolve_isaacsim_runtime,
@@ -45,6 +46,12 @@ class PipelineOutputTests(unittest.TestCase):
             trajectory.parent.mkdir(parents=True)
             inpaint.touch()
             trajectory.touch()
+            scene_depth_report = (
+                episode_root
+                / "depth_anything3/scene_depth_report.json"
+            )
+            scene_depth_report.parent.mkdir(parents=True)
+            scene_depth_report.write_text("{}", encoding="utf-8")
             episode = Episode(
                 task_dir=source_task,
                 task_relative=Path("task_a"),
@@ -75,6 +82,7 @@ class PipelineOutputTests(unittest.TestCase):
                     "--output",
                     str(root / "published"),
                     "--no-hardware-encoding",
+                    "--visualize",
                 ]
             )
             commands: list[list[str]] = []
@@ -138,7 +146,11 @@ class PipelineOutputTests(unittest.TestCase):
             self.assertIn("human_to_robot.render_isaacsim", command)
             self.assertIn("--inpaint-video", command)
             self.assertIn("--composite-output", command)
+            self.assertIn("--scene-depths", command)
+            self.assertIn("--no-headless", command)
             self.assertNotIn("human_to_robot.composite", command)
+            self.assertNotIn("--width", command)
+            self.assertNotIn("--height", command)
             for directory_name in (
                 "robot_rgb",
                 "robot_masks",
@@ -296,6 +308,11 @@ class PipelineOutputTests(unittest.TestCase):
             self.assertEqual(prepare_mock.call_count, 3)
             self.assertEqual(report["completed_episode_count"], 1)
             self.assertEqual(report["failed_episode_count"], 2)
+            self.assertEqual(len(report["episodes"]), 3)
+            self.assertNotIn("tasks", report)
+            self.assertFalse(
+                (workspace / "task_a" / "task_report.json").exists()
+            )
             self.assertFalse(episodes[0].output_root.exists())
             self.assertFalse(episodes[1].output_root.exists())
             self.assertFalse(episodes[2].output_root.exists())
@@ -338,6 +355,42 @@ class PipelineOutputTests(unittest.TestCase):
             _discard_episode_workspace(episode, debug=True)
 
             self.assertTrue(episode_root.is_dir())
+
+    def test_non_debug_persists_failure_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            episode_root = root / "workspace" / "task_a" / "0"
+            episode_root.mkdir(parents=True)
+            (episode_root / "pipeline.log").write_text(
+                "underlying failure\n",
+                encoding="utf-8",
+            )
+            episode = Episode(
+                task_dir=root / "source" / "task_a",
+                task_relative=Path("task_a"),
+                task_name="task_a",
+                name="0",
+                video=root / "source" / "task_a" / "0.mp4",
+                hdf5=root / "source" / "task_a" / "0.hdf5",
+                output_root=episode_root,
+            )
+
+            persisted = _persist_failure_diagnostics(
+                episode,
+                output=root / "published",
+                report={"status": "failed", "error": "RuntimeError: boom"},
+            )
+
+            failure_root = root / "published" / "task_a" / ".failures" / "0"
+            self.assertEqual(
+                (failure_root / "pipeline.log").read_text(encoding="utf-8"),
+                "underlying failure\n",
+            )
+            self.assertEqual(
+                persisted["log"],
+                str(failure_root / "pipeline.log"),
+            )
+            self.assertTrue((failure_root / "episode_report.json").is_file())
 
     def test_dataset_root_mirrors_task_subfolder(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -510,6 +563,7 @@ class PipelineOutputTests(unittest.TestCase):
         )
 
         self.assertFalse(default_args.debug)
+        self.assertFalse(default_args.visualize)
         self.assertTrue(debug_args.debug)
 
 

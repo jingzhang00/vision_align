@@ -9,12 +9,14 @@ from contextlib import ExitStack
 from pathlib import Path
 
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 from .lighting_profile import (
     DEFAULT_ISAAC_PROFILE,
     load_lighting_profile,
     resolve_profile_value,
 )
+from .video_io import video_metadata
 
 
 ARM_LINKS = {
@@ -43,6 +45,61 @@ HAND_LINK_PREFIXES = tuple(
         "pinky_",
     )
 )
+
+
+def _camera_projection_from_intrinsic(
+    intrinsic: np.ndarray,
+    *,
+    width: int,
+    height: int,
+    horizontal_aperture: float = 2.0955,
+) -> tuple[float, float, float]:
+    """Convert the supported OpenCV pinhole K to Isaac/USD camera values."""
+
+    intrinsic = np.asarray(intrinsic, dtype=np.float64)
+    if intrinsic.shape != (3, 3) or not np.isfinite(intrinsic).all():
+        raise ValueError("Camera intrinsic must be a finite 3x3 matrix")
+    if width <= 0 or height <= 0:
+        raise ValueError("Camera resolution must be positive")
+    canonical = intrinsic.copy()
+    canonical[0, 0] = 1.0
+    canonical[1, 1] = 1.0
+    canonical[0, 2] = 0.0
+    canonical[1, 2] = 0.0
+    if not np.allclose(
+        canonical,
+        np.eye(3),
+        rtol=0.0,
+        atol=1e-9,
+    ):
+        raise ValueError(
+            "Camera intrinsic must have zero skew and bottom row [0, 0, 1]"
+        )
+    fx = float(intrinsic[0, 0])
+    fy = float(intrinsic[1, 1])
+    cx = float(intrinsic[0, 2])
+    cy = float(intrinsic[1, 2])
+    if fx <= 0.0 or fy <= 0.0:
+        raise ValueError("Camera focal lengths must be positive")
+    if not np.isclose(fx, fy, rtol=1e-6, atol=1e-6):
+        raise ValueError(
+            "Isaac Camera only supports square pixels, but "
+            f"fx={fx} and fy={fy}"
+        )
+    if not (
+        np.isclose(cx, width / 2.0, rtol=0.0, atol=1e-6)
+        and np.isclose(cy, height / 2.0, rtol=0.0, atol=1e-6)
+    ):
+        raise ValueError(
+            "Isaac Camera does not use aperture offsets; expected a "
+            f"centered principal point, got ({cx}, {cy}) for "
+            f"{width}x{height}"
+        )
+    focal_length = fx / float(width) * horizontal_aperture
+    vertical_aperture = (
+        focal_length * float(height) / fy
+    )
+    return horizontal_aperture, vertical_aperture, focal_length
 
 
 def _is_render_link(name: str) -> bool:
@@ -141,6 +198,7 @@ def _validate_archive(archive: np.lib.npyio.NpzFile) -> int:
         "qpos",
         "joint_names",
         "base_position",
+        "base_rotation",
         "link_names",
         "link_positions",
         "link_quaternions",
@@ -160,6 +218,8 @@ def _validate_archive(archive: np.lib.npyio.NpzFile) -> int:
         raise ValueError("camera_gl_quaternions must have shape [frame_count, 4]")
     if archive["base_position"].shape != (3,):
         raise ValueError("base_position must have shape [3]")
+    if archive["base_rotation"].shape != (3, 3):
+        raise ValueError("base_rotation must have shape [3, 3]")
     link_count = int(archive["link_names"].shape[0])
     if archive["link_positions"].shape != (
         frame_count,
@@ -219,7 +279,20 @@ def render(args: argparse.Namespace) -> dict[str, object]:
         raise ValueError(
             "--inpaint-video and --composite-output must be supplied together"
         )
+    if args.composite_output is not None and args.scene_depths is None:
+        raise ValueError(
+            "--scene-depths is required for in-process compositing"
+        )
     lighting_profile, lighting_profile_path = _resolve_render_settings(args)
+    source_video = args.video.resolve()
+    render_width, render_height, source_frame_count, source_fps = (
+        video_metadata(source_video)
+    )
+    if (
+        min(render_width, render_height, source_frame_count) <= 0
+        or source_fps <= 0
+    ):
+        raise ValueError(f"Invalid source video metadata: {source_video}")
     # SimulationApp must be constructed before importing any omni/pxr modules.
     from isaacsim import SimulationApp
 
@@ -227,8 +300,8 @@ def render(args: argparse.Namespace) -> dict[str, object]:
         {
             "headless": args.headless,
             "renderer": args.renderer,
-            "width": args.width,
-            "height": args.height,
+            "width": render_width,
+            "height": render_height,
             "anti_aliasing": 0,
         }
     )
@@ -244,11 +317,10 @@ def render(args: argparse.Namespace) -> dict[str, object]:
         from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux, UsdPhysics
 
         from .composite import InMemoryVideoCompositor
-        from .video_io import video_metadata, write_video
+        from .video_io import write_video
 
         trajectory_path = args.trajectory.resolve()
         source_urdf = args.urdf.resolve()
-        source_video = args.video.resolve()
         source_hdf5 = args.hdf5.resolve()
         output_root = args.output.resolve()
         output_root.mkdir(parents=True, exist_ok=True)
@@ -263,9 +335,9 @@ def render(args: argparse.Namespace) -> dict[str, object]:
             if args.composite_output is not None
             else None
         )
-        object_mask_root = (
-            args.object_masks.resolve()
-            if args.object_masks is not None
+        scene_depth_root = (
+            args.scene_depths.resolve()
+            if args.scene_depths is not None
             else None
         )
         render_urdf = output_root / "g1_arms_hands_isaacsim.urdf"
@@ -300,9 +372,6 @@ def render(args: argparse.Namespace) -> dict[str, object]:
                 "Rendered URDF links have no archived Pinocchio pose: "
                 f"{missing_visible_poses}"
             )
-        source_width, source_height, source_frame_count, source_fps = (
-            video_metadata(source_video)
-        )
         with h5py.File(source_hdf5, "r") as source_data:
             intrinsic = np.asarray(
                 source_data["camera/intrinsic"], dtype=np.float64
@@ -337,6 +406,13 @@ def render(args: argparse.Namespace) -> dict[str, object]:
         context.new_stage()
         simulation_app.update()
         stage = context.get_stage()
+        UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+        meters_per_unit = float(UsdGeom.GetStageMetersPerUnit(stage))
+        if not np.isclose(meters_per_unit, 1.0):
+            raise RuntimeError(
+                "Isaac stage must use meters for metric depth, got "
+                f"metersPerUnit={meters_per_unit}"
+            )
 
         status, import_config = omni.kit.commands.execute(
             "URDFCreateImportConfig"
@@ -390,12 +466,54 @@ def render(args: argparse.Namespace) -> dict[str, object]:
         key.CreateAngleAttr(args.key_angle)
         key.AddRotateXYZOp().Set(Gf.Vec3f(*args.key_rotation))
 
-        camera = Camera(
-            prim_path="/World/SynthesisCamera",
-            name="synthesis_camera",
-            resolution=(args.width, args.height),
+        (
+            horizontal_aperture,
+            vertical_aperture,
+            focal_length,
+        ) = _camera_projection_from_intrinsic(
+            intrinsic,
+            width=render_width,
+            height=render_height,
         )
+        camera_path = "/World/SynthesisCamera"
+        camera_schema = UsdGeom.Camera.Define(stage, Sdf.Path(camera_path))
+        camera_schema.CreateHorizontalApertureAttr(
+            horizontal_aperture * 10.0
+        )
+        camera_schema.CreateVerticalApertureAttr(
+            vertical_aperture * 10.0
+        )
+        camera_schema.CreateFocalLengthAttr(focal_length * 10.0)
+        camera = Camera(
+            prim_path=camera_path,
+            name="synthesis_camera",
+            resolution=(render_width, render_height),
+        )
+        camera.set_horizontal_aperture(
+            horizontal_aperture,
+            maintain_square_pixels=False,
+        )
+        camera.set_vertical_aperture(
+            vertical_aperture,
+            maintain_square_pixels=False,
+        )
+        camera.set_focal_length(focal_length)
         camera.initialize()
+        resolved_intrinsic = np.asarray(
+            camera.get_intrinsics_matrix(),
+            dtype=np.float64,
+        )
+        if not np.allclose(
+            resolved_intrinsic,
+            intrinsic,
+            rtol=1e-6,
+            atol=1e-4,
+        ):
+            raise RuntimeError(
+                "Isaac camera calibration does not match source K: "
+                f"expected={intrinsic.tolist()}, "
+                f"actual={resolved_intrinsic.tolist()}"
+            )
         camera.add_distance_to_image_plane_to_frame()
         simulation_app.update()
         simulation_app.update()
@@ -486,16 +604,6 @@ def render(args: argparse.Namespace) -> dict[str, object]:
             f"missing={missing_joint_names}",
             flush=True,
         )
-        # Match the OpenCV pinhole calibration. USD stores focal length and
-        # aperture in the same arbitrary unit, so their ratio is what matters.
-        horizontal_aperture = 20.955
-        focal_length = (
-            float(intrinsic[0, 0])
-            / float(source_width)
-            * horizontal_aperture
-        )
-        camera.set_horizontal_aperture(horizontal_aperture)
-        camera.set_focal_length(focal_length)
         camera.set_clipping_range(0.01, 100.0)
         camera.set_lens_aperture(0.0)
 
@@ -506,13 +614,35 @@ def render(args: argparse.Namespace) -> dict[str, object]:
             for directory in (rgb_dir, mask_dir, depth_dir):
                 directory.mkdir(parents=True, exist_ok=True)
 
-        base_position = np.asarray(archive["base_position"], dtype=np.float64)
-        camera_positions = (
-            np.asarray(archive["camera_positions"], dtype=np.float64)
-            - base_position
+        base_position = np.asarray(
+            archive["base_position"],
+            dtype=np.float64,
         )
-        camera_quaternions = np.asarray(
+        base_rotation = np.asarray(
+            archive["base_rotation"],
+            dtype=np.float64,
+        )
+        camera_positions = np.einsum(
+            "ij,nj->ni",
+            base_rotation.T,
+            np.asarray(archive["camera_positions"], dtype=np.float64)
+            - base_position,
+        )
+        camera_world_quaternions = np.asarray(
             archive["camera_gl_quaternions"], dtype=np.float64
+        )
+        camera_world_rotations = Rotation.from_quat(
+            np.roll(camera_world_quaternions, -1, axis=1)
+        ).as_matrix()
+        camera_base_rotations = np.einsum(
+            "ij,njk->nik",
+            base_rotation.T,
+            camera_world_rotations,
+        )
+        camera_quaternions = np.roll(
+            Rotation.from_matrix(camera_base_rotations).as_quat(),
+            1,
+            axis=1,
         )
         video_frames: list[np.ndarray] = []
         mask_fractions: list[float] = []
@@ -530,12 +660,16 @@ def render(args: argparse.Namespace) -> dict[str, object]:
                     raise RuntimeError(
                         "Streaming composite paths were not resolved"
                     )
+                if scene_depth_root is None:
+                    raise RuntimeError(
+                        "Streaming scene depth path was not resolved"
+                    )
                 compositor = render_stack.enter_context(
                     InMemoryVideoCompositor(
                         source_video=source_video,
                         inpaint_video=inpaint_video,
                         trajectory_path=trajectory_path,
-                        object_mask_root=object_mask_root,
+                        scene_depth_root=scene_depth_root,
                         output_root=composite_output,
                         g1_root=output_root,
                         lighting_profile_path=lighting_profile_path,
@@ -548,15 +682,19 @@ def render(args: argparse.Namespace) -> dict[str, object]:
                         f"{frame_count} != {compositor.frame_count}"
                     )
                 if (compositor.width, compositor.height) != (
-                    args.width,
-                    args.height,
+                    render_width,
+                    render_height,
                 ):
                     raise ValueError(
                         "Inpaint and render resolutions disagree: "
                         f"{compositor.width}x{compositor.height} != "
-                        f"{args.width}x{args.height}"
+                        f"{render_width}x{render_height}"
                     )
 
+            print(
+                f"Isaac Sim rendered 0/{frame_count}",
+                flush=True,
+            )
             for frame_id in range(frame_count):
                 for link_index, translate_op, orient_op in body_pose_ops:
                     relative_position = link_positions[frame_id, link_index]
@@ -593,9 +731,9 @@ def render(args: argparse.Namespace) -> dict[str, object]:
                     )
                 rgba = np.asarray(rgba)
                 depth = np.asarray(depth, dtype=np.float32)
-                if rgba.shape[:2] != (args.height, args.width):
+                if rgba.shape[:2] != (render_height, render_width):
                     raise RuntimeError(f"Unexpected RGBA shape: {rgba.shape}")
-                if depth.shape != (args.height, args.width):
+                if depth.shape != (render_height, render_width):
                     raise RuntimeError(f"Unexpected depth shape: {depth.shape}")
 
                 mask = (
@@ -611,7 +749,11 @@ def render(args: argparse.Namespace) -> dict[str, object]:
                 else:
                     depth_mm = np.where(
                         mask,
-                        np.clip(depth * 1000.0, 0.0, 65535.0),
+                        np.clip(
+                            np.rint(depth * 1000.0),
+                            0.0,
+                            65535.0,
+                        ),
                         0.0,
                     ).astype(np.uint16)
                     if not cv2.imwrite(
@@ -683,10 +825,17 @@ def render(args: argparse.Namespace) -> dict[str, object]:
             "ik": "Pinocchio (precomputed link poses)",
             "frame_count": frame_count,
             "source_frame_count": total_frames,
-            "resolution": [args.width, args.height],
-            "source_resolution": [source_width, source_height],
+            "resolution": [render_width, render_height],
+            "source_resolution": [render_width, render_height],
             "source_fps": source_fps,
-            "focal_length_px": float(intrinsic[0, 0]),
+            "camera_intrinsic": intrinsic.tolist(),
+            "resolved_camera_intrinsic": resolved_intrinsic.tolist(),
+            "camera_projection": {
+                "horizontal_aperture": horizontal_aperture,
+                "vertical_aperture": vertical_aperture,
+                "focal_length": focal_length,
+                "stage_meters_per_unit": meters_per_unit,
+            },
             "lighting": {
                 "profile": (
                     str(lighting_profile_path)
@@ -771,12 +920,13 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--object-masks",
+        "--scene-depths",
         type=Path,
-        help="Optional numbered object masks for depth-aware occlusion",
+        help=(
+            "Numbered native-metric DA3 depth PNGs in uint16 millimeters; "
+            "required with --composite-output"
+        ),
     )
-    parser.add_argument("--width", type=int, default=1280)
-    parser.add_argument("--height", type=int, default=720)
     parser.add_argument(
         "--renderer",
         choices=("RaytracedLighting", "PathTracing"),

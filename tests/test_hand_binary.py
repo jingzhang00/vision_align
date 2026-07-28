@@ -9,7 +9,7 @@ import numpy as np
 
 from human_to_robot.hand_binary import (
     CLOSE_RATIO_THRESHOLD,
-    PAPER_HAND_LANDMARKS,
+    HAND_LANDMARKS,
     infer_binary_grasps_from_hdf5,
     infer_hand_binary,
 )
@@ -54,7 +54,7 @@ def _tracks_from_ratios(
     }
     confidences = {
         name: np.ones(frame_count, dtype=np.float64)
-        for name in PAPER_HAND_LANDMARKS
+        for name in HAND_LANDMARKS
     }
     return positions, confidences
 
@@ -101,7 +101,7 @@ def _write_hdf5(
             ("left", left_positions, left_confidences),
             ("right", right_positions, right_confidences),
         ):
-            for name in PAPER_HAND_LANDMARKS:
+            for name in HAND_LANDMARKS:
                 transform = np.repeat(
                     np.eye(4, dtype=np.float64)[None],
                     len(ratios),
@@ -119,7 +119,7 @@ def _write_hdf5(
 
 
 class StatelessHandBinaryTests(unittest.TestCase):
-    def test_exact_paper_ratio_threshold_without_temporal_processing(self) -> None:
+    def test_exact_ratio_threshold_without_temporal_processing(self) -> None:
         ratios = [0.1, 0.5, 0.2, 0.6, CLOSE_RATIO_THRESHOLD]
         positions, confidences = _tracks_from_ratios(ratios)
 
