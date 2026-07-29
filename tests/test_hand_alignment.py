@@ -787,12 +787,11 @@ class LinkerHandUrdfTests(unittest.TestCase):
             )
 
     def test_rigid_palm_keeps_both_robot_hands_exactly_open(self) -> None:
-        commands, states, targets, achieved, profiles = (
+        commands, targets, achieved, profiles = (
             _fixed_open_hand_action(self.model, 5)
         )
 
         np.testing.assert_array_equal(commands, np.zeros((5, 2)))
-        np.testing.assert_array_equal(states, np.zeros((5, 2), dtype=np.uint8))
         self.assertTrue(np.isnan(targets).all())
         self.assertTrue(np.isfinite(achieved).all())
         self.assertEqual(len(profiles), 2)

@@ -13,7 +13,6 @@ import pinocchio as pin
 from scipy.signal import savgol_filter
 from scipy.spatial.transform import Rotation
 
-from .hand_binary import HandBinaryResult, infer_binary_grasps_from_hdf5
 from .trajectory import (
     FINGERTIP_GRASP_TARGET,
     HAND_LANDMARK_NAMES,
@@ -146,7 +145,7 @@ BASE_YAW_OFFSETS_RAD = np.deg2rad(
 IK_FEASIBLE_POSITION_ERROR_M = 0.02
 IK_FEASIBLE_ORIENTATION_ERROR_RAD = np.deg2rad(15.0)
 IK_ORIENTATION_WEIGHT = 0.05
-TRAJECTORY_SCHEMA_VERSION = 12
+TRAJECTORY_SCHEMA_VERSION = 13
 EPISODE_SKIP_REPORT = "episode_skip.json"
 
 
@@ -173,7 +172,6 @@ class PinocchioRetargetResult:
     right_visible: np.ndarray
     hand_closures: np.ndarray
     hand_motor_commands: np.ndarray
-    hand_binary_states: np.ndarray
     target_hand_widths: np.ndarray
     achieved_hand_widths: np.ndarray
     hand_aperture_profiles: list[dict[str, object]]
@@ -1192,137 +1190,10 @@ def _retarget_articulated_hands(
     )
 
 
-def _retarget_binary_hands(
-    model: pin.Model,
-    hand_binary: dict[str, HandBinaryResult],
-    human_widths: np.ndarray,
-    *,
-    scale: float,
-) -> tuple[
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    list[dict[str, object]],
-    dict[str, dict[str, object]],
-]:
-    """Map two exact binary actions to the six O6 motor presets."""
-
-    if set(hand_binary) != {"left", "right"}:
-        raise ValueError("Binary hand actions must contain left and right")
-    widths = np.asarray(human_widths, dtype=np.float64)
-    frame_count = widths.shape[0]
-    states = np.stack(
-        [hand_binary[side].binary for side in ("left", "right")],
-        axis=1,
-    ).astype(np.uint8)
-    commands = states.astype(np.float64)
-    if states.shape != (frame_count, 2):
-        raise ValueError(
-            "Binary hand action frame count does not match the trajectory"
-        )
-    if not np.isin(states, (0, 1)).all():
-        raise ValueError("Binary hand states must contain only 0 and 1")
-    if (
-        not np.isfinite(commands).all()
-        or np.any(commands < 0.0)
-        or np.any(commands > 1.0)
-    ):
-        raise ValueError("O6 hand commands must remain within [0, 1]")
-
-    target_widths = scale * widths
-    achieved_widths = np.empty_like(target_widths)
-    data = model.createData()
-    for frame_id, command in enumerate(commands):
-        q = pin.neutral(model)
-        _set_continuous_hand_configuration(model, q, command)
-        pin.forwardKinematics(model, data, q)
-        pin.updateFramePlacements(model, data)
-        for side_index, side in enumerate(("left", "right")):
-            achieved_widths[frame_id, side_index] = (
-                _current_hand_jaw_width(model, data, side=side)
-            )
-
-    profiles: list[dict[str, object]] = []
-    for side_index, side in enumerate(("left", "right")):
-        open_q = pin.neutral(model)
-        closed_q = pin.neutral(model)
-        open_command = np.zeros(2, dtype=np.float64)
-        closed_command = np.zeros(2, dtype=np.float64)
-        closed_command[side_index] = 1.0
-        _set_continuous_hand_configuration(model, open_q, open_command)
-        _set_continuous_hand_configuration(model, closed_q, closed_command)
-        curve_commands, curve_widths = _hand_aperture_curve(
-            model,
-            side=side,
-        )
-        profile_data = model.createData()
-        pin.forwardKinematics(model, profile_data, closed_q)
-        pin.updateFramePlacements(model, profile_data)
-        full_preset_width = _current_hand_jaw_width(
-            model,
-            profile_data,
-            side=side,
-        )
-        master_suffixes = (
-            "thumb_cmc_yaw",
-            "thumb_cmc_pitch",
-            "index_mcp_pitch",
-            "middle_mcp_pitch",
-            "ring_mcp_pitch",
-            "pinky_mcp_pitch",
-        )
-        profiles.append(
-            {
-                "command_semantics": "0=open; 1=URDF power-fist preset",
-                "preset_geometry": (
-                    "The power-fist continues past the minimum parallel-jaw "
-                    "aperture, so thumb/virtual-finger width is non-monotonic "
-                    "near full closure."
-                ),
-                "open_width_m": float(curve_widths[0]),
-                "pinch_minimum_command": float(curve_commands[-1]),
-                "pinch_minimum_width_m": float(curve_widths[-1]),
-                "full_preset_width_m": full_preset_width,
-                "closed_master_joint_radians": {
-                    suffix: float(
-                        closed_q[
-                            model.idx_qs[
-                                model.getJointId(f"{side}_{suffix}")
-                            ]
-                        ]
-                    )
-                    for suffix in master_suffixes
-                },
-                "binary_runs": [
-                    {
-                        "start": run.start,
-                        "end": run.end,
-                        "confidence": run.confidence,
-                    }
-                    for run in hand_binary[side].runs
-                ],
-            }
-        )
-    diagnostics = {
-        side: hand_binary[side].diagnostics.as_dict()
-        for side in ("left", "right")
-    }
-    return (
-        commands,
-        states,
-        target_widths,
-        achieved_widths,
-        profiles,
-        diagnostics,
-    )
-
-
 def _fixed_open_hand_action(
     model: pin.Model,
     frame_count: int,
 ) -> tuple[
-    np.ndarray,
     np.ndarray,
     np.ndarray,
     np.ndarray,
@@ -1331,7 +1202,6 @@ def _fixed_open_hand_action(
     """Return an explicit fixed-open action when fingers are unobserved."""
 
     commands = np.zeros((frame_count, 2), dtype=np.float64)
-    states = np.zeros((frame_count, 2), dtype=np.uint8)
     target_widths = np.full((frame_count, 2), np.nan, dtype=np.float64)
     open_q = pin.neutral(model)
     _set_continuous_hand_configuration(model, open_q, commands[0])
@@ -1354,7 +1224,7 @@ def _fixed_open_hand_action(
         }
         for side_index in range(2)
     ]
-    return commands, states, target_widths, achieved_widths, profiles
+    return commands, target_widths, achieved_widths, profiles
 
 
 def _visible(
@@ -2306,7 +2176,6 @@ def retarget_with_pinocchio(
     *,
     source_width: int,
     source_height: int,
-    hand_binary: dict[str, HandBinaryResult] | None = None,
     camera_origin: np.ndarray | None = None,
     scale: float | None = None,
 ) -> PinocchioRetargetResult:
@@ -2347,14 +2216,8 @@ def retarget_with_pinocchio(
 
     rigid_palm_mode = trajectory.target_mode == RIGID_PALM_TARGET
     if rigid_palm_mode:
-        if hand_binary is not None:
-            raise ValueError(
-                "Binary finger actions are incompatible with rigid-palm "
-                "targets"
-            )
         (
             hand_closures,
-            hand_binary_states,
             target_hand_widths,
             achieved_hand_widths,
             hand_aperture_profiles,
@@ -2365,25 +2228,6 @@ def retarget_with_pinocchio(
         )
         hand_action_mode = "rigid_palm_fixed_open"
         hand_action_diagnostics = {}
-    elif hand_binary is not None:
-        (
-            hand_closures,
-            hand_binary_states,
-            target_hand_widths,
-            achieved_hand_widths,
-            hand_aperture_profiles,
-            hand_action_diagnostics,
-        ) = _retarget_binary_hands(
-            model,
-            hand_binary,
-            human_widths,
-            scale=scale,
-        )
-        hand_motor_commands = _closures_to_motor_commands(
-            model,
-            hand_closures,
-        )
-        hand_action_mode = "binary_o6_power_grasp"
     elif (
         trajectory.left_articulated_hand is not None
         or trajectory.right_articulated_hand is not None
@@ -2401,10 +2245,6 @@ def retarget_with_pinocchio(
             human_widths,
             scale=scale,
         )
-        hand_binary_states = np.zeros_like(
-            hand_closures,
-            dtype=np.uint8,
-        )
         hand_action_mode = "articulated_o6"
     else:
         (
@@ -2420,10 +2260,6 @@ def retarget_with_pinocchio(
         hand_motor_commands = _closures_to_motor_commands(
             model,
             hand_closures,
-        )
-        hand_binary_states = np.zeros_like(
-            hand_closures,
-            dtype=np.uint8,
         )
         hand_action_mode = "continuous_width_fallback"
         hand_action_diagnostics = {
@@ -2702,7 +2538,6 @@ def retarget_with_pinocchio(
         right_visible=right_visible,
         hand_closures=hand_closures,
         hand_motor_commands=hand_motor_commands,
-        hand_binary_states=hand_binary_states,
         target_hand_widths=target_hand_widths,
         achieved_hand_widths=achieved_hand_widths,
         hand_aperture_profiles=hand_aperture_profiles,
@@ -2809,7 +2644,6 @@ def save_pinocchio_trajectory(
             "range_rad": float(np.ptp(values)),
             "max_step_rad": float(np.max(steps)) if steps.size else 0.0,
         }
-    binary_mode = result.hand_action_mode == "binary_o6_power_grasp"
     rigid_palm_mode = result.hand_action_mode == "rigid_palm_fixed_open"
     articulated_mode = result.hand_action_mode == "articulated_o6"
     achieved_width_range = {
@@ -2887,14 +2721,10 @@ def save_pinocchio_trajectory(
             "fingertip p,R with state-dependent LinkerHand O6 jaw/TCP"
         )
         hand_action_source = (
-            "stateless per-frame binary action from HDF5 fingertip geometry"
-            if binary_mode
-            else (
-                "25-landmark palm-local geometry retargeted to independent "
-                "LinkerHand O6 motors"
-                if articulated_mode
-                else "continuous fingertip p,R,w width fallback"
-            )
+            "25-landmark palm-local geometry retargeted to independent "
+            "LinkerHand O6 motors"
+            if articulated_mode
+            else "continuous fingertip p,R,w width fallback"
         )
         hand_action_report = {
             "type": result.hand_action_mode,
@@ -2906,36 +2736,23 @@ def save_pinocchio_trajectory(
             "order": ["left", "right"],
             "motor_order": list(O6_MOTOR_SUFFIXES),
             "formula": (
+                "p,R retain the fingertip-derived grasp TCP; each hand's "
+                "25 landmarks are converted to a palm-anatomical frame; "
+                "thumb fits yaw+pitch and index/middle/ring/pinky fit "
+                "independent flexion through O6 forward-kinematics LUTs"
+                if articulated_mode
+                else
                 "p=0.5*(thumb+0.7*index+0.3*middle); "
-                "r=||thumb-(0.7*index+0.3*middle)||/"
-                "||(0.7*index+0.3*middle)-Hand||; "
-                "binary=(active && visible && valid && "
-                "r<=configured threshold)"
-                if binary_mode
-                else (
-                    "p,R retain the fingertip-derived grasp TCP; each hand's "
-                    "25 landmarks are converted to a palm-anatomical frame; "
-                    "thumb fits yaw+pitch and index/middle/ring/pinky fit "
-                    "independent flexion through O6 forward-kinematics LUTs"
-                    if articulated_mode
-                    else
-                    "p=0.5*(thumb+0.7*index+0.3*middle); "
-                    "R=[x y z] from the jaw/wrist axes; "
-                    "w=||thumb-(0.7*index+0.3*middle)||_2"
-                )
+                "R=[x y z] from the jaw/wrist axes; "
+                "w=||thumb-(0.7*index+0.3*middle)||_2"
             ),
             "closure_semantics": (
-                "binary state and O6 command are identical: "
-                "0=open, 1=power-fist preset; no temporal blending"
-                if binary_mode
-                else (
-                    "six independent motor angles per hand in radians; "
-                    "URDF mimic joints are expanded after fitting"
-                    if articulated_mode
-                    else
-                    "0=open; increasing values close the hand along the "
-                    "calibrated monotonic aperture branch"
-                )
+                "six independent motor angles per hand in radians; "
+                "URDF mimic joints are expanded after fitting"
+                if articulated_mode
+                else
+                "0=open; increasing values close the hand along the "
+                "calibrated monotonic aperture branch"
             ),
             "source": list(trajectory.hand_sources),
             "human_width_range_m": {
@@ -2962,60 +2779,24 @@ def save_pinocchio_trajectory(
                 "basis"
             ),
         }
-        if binary_mode:
-            hand_action_report.update(
-                {
-                    "scaled_human_width_range_m": {
-                        side: [
-                            float(
-                                np.min(
-                                    result.target_hand_widths[:, side_index]
-                                )
-                            ),
-                            float(
-                                np.max(
-                                    result.target_hand_widths[:, side_index]
-                                )
-                            ),
-                        ]
-                        for side_index, side in enumerate(("left", "right"))
-                    },
-                    "width_role": (
-                        "diagnostic only; binary state, not width, selects "
-                        "the O6 preset"
-                    ),
-                    "binary_closed_frames": {
-                        side: int(
-                            np.count_nonzero(
-                                result.hand_binary_states[:, side_index]
-                            )
-                        )
-                        for side_index, side in enumerate(("left", "right"))
-                    },
-                    "diagnostics": result.hand_action_diagnostics,
-                }
-            )
-        else:
-            hand_action_report["target_width_range_m"] = {
-                side: [
-                    float(
-                        np.min(result.target_hand_widths[:, side_index])
-                    ),
-                    float(
-                        np.max(result.target_hand_widths[:, side_index])
-                    ),
-                ]
-                for side_index, side in enumerate(("left", "right"))
-            }
-            hand_action_report["width_role"] = (
-                "diagnostic only; articulated O6 motors come from full "
-                "hand geometry"
-                if articulated_mode
-                else "continuous scalar actuator target"
-            )
-            hand_action_report["diagnostics"] = (
-                result.hand_action_diagnostics
-            )
+        hand_action_report["target_width_range_m"] = {
+            side: [
+                float(
+                    np.min(result.target_hand_widths[:, side_index])
+                ),
+                float(
+                    np.max(result.target_hand_widths[:, side_index])
+                ),
+            ]
+            for side_index, side in enumerate(("left", "right"))
+        }
+        hand_action_report["width_role"] = (
+            "diagnostic only; articulated O6 motors come from full "
+            "hand geometry"
+            if articulated_mode
+            else "continuous scalar actuator target"
+        )
+        hand_action_report["diagnostics"] = result.hand_action_diagnostics
     shoulder_aligned = np.isfinite(result.mapped_shoulder_center).all()
     resolved_shoulder_center = (
         result.base_position
@@ -3232,7 +3013,6 @@ def save_pinocchio_trajectory(
         hand_closures=result.hand_closures,
         hand_motor_commands=result.hand_motor_commands,
         hand_motor_order=np.asarray(O6_MOTOR_SUFFIXES),
-        hand_binary_states=result.hand_binary_states,
         hand_closure_order=np.asarray(["left", "right"]),
         hand_closure_semantics=np.asarray(
             (
@@ -3240,19 +3020,13 @@ def save_pinocchio_trajectory(
                 "source finger articulation is unavailable"
                 if rigid_palm_mode
                 else (
-                    "binary state and hand_closures are identical exact "
-                    "commands: 0=open and 1=power-fist preset; no temporal "
-                    "blending"
-                    if binary_mode
+                    "mean normalized value of the six independent O6 "
+                    "motors; inspect hand_motor_commands for actuator "
+                    "angles"
+                    if articulated_mode
                     else (
-                        "mean normalized value of the six independent O6 "
-                        "motors; inspect hand_motor_commands for actuator "
-                        "angles"
-                        if articulated_mode
-                        else (
-                            "0=open; increasing closes along the calibrated "
-                            "monotonic aperture branch"
-                        )
+                        "0=open; increasing closes along the calibrated "
+                        "monotonic aperture branch"
                     )
                 )
             )
@@ -3267,7 +3041,7 @@ def save_pinocchio_trajectory(
                 if rigid_palm_mode
                 else (
                     "diagnostic_only_not_actuator_target"
-                    if binary_mode or articulated_mode
+                    if articulated_mode
                     else "continuous_actuator_target"
                 )
             )
@@ -3347,18 +3121,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hdf5", type=Path, required=True)
     parser.add_argument("--urdf", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument(
-        "--binary-hands",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help=(
-            "Threshold each visible HDF5 hand frame directly and map its "
-            "exact 0/1 state to O6 presets; disabling retargets a complete "
-            "25-landmark hand track to six independent O6 motors and falls "
-            "back to continuous fingertip width when unavailable "
-            "(default: true)"
-        ),
-    )
     return parser
 
 
@@ -3375,29 +3137,12 @@ def main() -> None:
             f"{frame_count}"
     )
     model = build_pinocchio_g1(args.urdf)
-    hand_binary: dict[str, HandBinaryResult] | None = None
-    if (
-        args.binary_hands
-        and trajectory.target_mode == FINGERTIP_GRASP_TARGET
-    ):
-        try:
-            hand_binary = infer_binary_grasps_from_hdf5(
-                args.hdf5,
-                image_size=(source_width, source_height),
-            )
-        except (KeyError, ValueError) as error:
-            print(
-                "Binary O6 action inference unavailable; falling back to "
-                f"articulated O6/continuous width mode: {error}",
-                file=sys.stderr,
-            )
     try:
         result = retarget_with_pinocchio(
             model,
             trajectory,
             source_width=source_width,
             source_height=source_height,
-            hand_binary=hand_binary,
         )
     except NoCommonBasePlacementError as error:
         skip_report: dict[str, object] = {

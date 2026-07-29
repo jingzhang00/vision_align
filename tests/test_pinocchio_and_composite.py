@@ -37,6 +37,7 @@ from human_to_robot.retarget_g1_pinocchio import (
 from human_to_robot.trajectory import SourceBodyAlignment
 from human_to_robot.render_isaacsim import (
     _camera_projection_from_intrinsic,
+    _isaac_intrinsic_from_source,
 )
 import pinocchio as pin
 from scipy.spatial.transform import Rotation
@@ -97,6 +98,43 @@ class PinocchioRetargetingTests(unittest.TestCase):
         )
 
         self.assertAlmostEqual(horizontal, 2.0955)
+        self.assertAlmostEqual(width * focal / horizontal, intrinsic[0, 0])
+        self.assertAlmostEqual(height * focal / vertical, intrinsic[1, 1])
+
+    def test_isaac_projection_normalizes_pixel_center_coordinates(self) -> None:
+        width, height = 384, 384
+        intrinsic = np.asarray(
+            [
+                [260.0, 0.0, (width - 1) / 2],
+                [0.0, 260.0, (height - 1) / 2],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        )
+
+        normalized = _isaac_intrinsic_from_source(
+            intrinsic,
+            width=width,
+            height=height,
+        )
+        horizontal, vertical, focal = (
+            _camera_projection_from_intrinsic(
+                intrinsic,
+                width=width,
+                height=height,
+            )
+        )
+
+        np.testing.assert_allclose(
+            normalized,
+            np.asarray(
+                [
+                    [260.0, 0.0, width / 2],
+                    [0.0, 260.0, height / 2],
+                    [0.0, 0.0, 1.0],
+                ]
+            ),
+        )
         self.assertAlmostEqual(width * focal / horizontal, intrinsic[0, 0])
         self.assertAlmostEqual(height * focal / vertical, intrinsic[1, 1])
 

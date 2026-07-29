@@ -252,7 +252,6 @@ class PipelineParserDefaultsTests(unittest.TestCase):
         )
         self.assertEqual(args.propainter_max_clip_frames, 240)
         self.assertEqual(args.propainter_transition_frames, 16)
-        self.assertTrue(args.binary_hands)
         self.assertTrue(args.hardware_encoding)
         self.assertFalse(args.visualize)
         self.assertFalse(hasattr(args, "backend"))

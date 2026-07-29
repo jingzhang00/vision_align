@@ -44,8 +44,10 @@ Run all activity clips in one episode:
 ```bash
 .venv/bin/python -m nymeria.visual_alignment \
   --episode-root dataset/nymeria/20230814_s1_david_hall_act0_n9k3wo \
-  --output outputs/nymeria_visual_alignment \
-  --isaacsim-root /home/ai01/isaacsim
+  --output outputs/ \
+  --isaacsim-root /home/ai01/isaacsim \
+  --clip c024 \
+  --debug
 ```
 
 Run one clip:
@@ -53,7 +55,7 @@ Run one clip:
 ```bash
 .venv/bin/python -m nymeria.visual_alignment \
   --episode-root dataset/nymeria/20230814_s1_david_hall_act0_n9k3wo \
-  --output outputs/nymeria_visual_alignment \
+  --output outputs/ \
   --isaacsim-root /home/ai01/isaacsim \
   --clip c024
 ```

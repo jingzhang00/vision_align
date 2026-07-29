@@ -7,3 +7,17 @@
 [submodule "Depth-Anything-3"]
 	path = Depth-Anything-3
 	url = https://github.com/ByteDance-Seed/Depth-Anything-3.git
+[submodule "PowerPaint"]
+	path = PowerPaint
+	url = https://github.com/open-mmlab/PowerPaint.git
+[submodule "Inpaint-Anything"]
+	path = Inpaint-Anything
+	url = https://github.com/geekyutao/Inpaint-Anything.git
+	branch = main_2026
+[submodule "stream"]
+	path = stream
+	url = git@gitee.com:wang414/stream.git
+	branch = gmr
+[submodule "smplx"]
+	path = smplx
+	url = https://github.com/vchoutas/smplx.git

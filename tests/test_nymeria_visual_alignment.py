@@ -563,7 +563,6 @@ class NymeriaAdapterTests(unittest.TestCase):
         self.assertEqual(parsed.output, Path("/tmp/output"))
         self.assertNotIn("--width", command)
         self.assertNotIn("--height", command)
-        self.assertTrue(parsed.binary_hands)
         self.assertFalse(parsed.hardware_encoding)
         self.assertFalse(parsed.reuse)
 

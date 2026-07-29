@@ -56,6 +56,28 @@ def _camera_projection_from_intrinsic(
 ) -> tuple[float, float, float]:
     """Convert the supported OpenCV pinhole K to Isaac/USD camera values."""
 
+    isaac_intrinsic = _isaac_intrinsic_from_source(
+        intrinsic,
+        width=width,
+        height=height,
+    )
+    fx = float(isaac_intrinsic[0, 0])
+    fy = float(isaac_intrinsic[1, 1])
+    focal_length = fx / float(width) * horizontal_aperture
+    vertical_aperture = (
+        focal_length * float(height) / fy
+    )
+    return horizontal_aperture, vertical_aperture, focal_length
+
+
+def _isaac_intrinsic_from_source(
+    intrinsic: np.ndarray,
+    *,
+    width: int,
+    height: int,
+) -> np.ndarray:
+    """Normalize a centered source K to Isaac's image-edge coordinates."""
+
     intrinsic = np.asarray(intrinsic, dtype=np.float64)
     if intrinsic.shape != (3, 3) or not np.isfinite(intrinsic).all():
         raise ValueError("Camera intrinsic must be a finite 3x3 matrix")
@@ -86,20 +108,22 @@ def _camera_projection_from_intrinsic(
             "Isaac Camera only supports square pixels, but "
             f"fx={fx} and fy={fy}"
         )
-    if not (
-        np.isclose(cx, width / 2.0, rtol=0.0, atol=1e-6)
-        and np.isclose(cy, height / 2.0, rtol=0.0, atol=1e-6)
-    ):
+    isaac_center = (width / 2.0, height / 2.0)
+    pixel_center = ((width - 1) / 2.0, (height - 1) / 2.0)
+    centered = any(
+        np.isclose(cx, center_x, rtol=0.0, atol=1e-6)
+        and np.isclose(cy, center_y, rtol=0.0, atol=1e-6)
+        for center_x, center_y in (isaac_center, pixel_center)
+    )
+    if not centered:
         raise ValueError(
             "Isaac Camera does not use aperture offsets; expected a "
-            f"centered principal point, got ({cx}, {cy}) for "
-            f"{width}x{height}"
+            "centered principal point in either image-edge or pixel-center "
+            f"coordinates, got ({cx}, {cy}) for {width}x{height}"
         )
-    focal_length = fx / float(width) * horizontal_aperture
-    vertical_aperture = (
-        focal_length * float(height) / fy
-    )
-    return horizontal_aperture, vertical_aperture, focal_length
+    normalized = intrinsic.copy()
+    normalized[0, 2], normalized[1, 2] = isaac_center
+    return normalized
 
 
 def _is_render_link(name: str) -> bool:
@@ -475,6 +499,11 @@ def render(args: argparse.Namespace) -> dict[str, object]:
             width=render_width,
             height=render_height,
         )
+        isaac_intrinsic = _isaac_intrinsic_from_source(
+            intrinsic,
+            width=render_width,
+            height=render_height,
+        )
         camera_path = "/World/SynthesisCamera"
         camera_schema = UsdGeom.Camera.Define(stage, Sdf.Path(camera_path))
         camera_schema.CreateHorizontalApertureAttr(
@@ -505,13 +534,14 @@ def render(args: argparse.Namespace) -> dict[str, object]:
         )
         if not np.allclose(
             resolved_intrinsic,
-            intrinsic,
+            isaac_intrinsic,
             rtol=1e-6,
             atol=1e-4,
         ):
             raise RuntimeError(
                 "Isaac camera calibration does not match source K: "
-                f"expected={intrinsic.tolist()}, "
+                f"source={intrinsic.tolist()}, "
+                f"expected={isaac_intrinsic.tolist()}, "
                 f"actual={resolved_intrinsic.tolist()}"
             )
         camera.add_distance_to_image_plane_to_frame()
@@ -829,6 +859,7 @@ def render(args: argparse.Namespace) -> dict[str, object]:
             "source_resolution": [render_width, render_height],
             "source_fps": source_fps,
             "camera_intrinsic": intrinsic.tolist(),
+            "isaac_camera_intrinsic": isaac_intrinsic.tolist(),
             "resolved_camera_intrinsic": resolved_intrinsic.tolist(),
             "camera_projection": {
                 "horizontal_aperture": horizontal_aperture,

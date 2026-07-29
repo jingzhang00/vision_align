@@ -579,7 +579,6 @@ def _prepare_stage_signature(
         "urdf": urdf,
         "retarget_code": repo / "human_to_robot/retarget_g1_pinocchio.py",
         "trajectory_code": repo / "human_to_robot/trajectory.py",
-        "hand_binary_code": repo / "human_to_robot/hand_binary.py",
         "scene_depth_code": repo / "human_to_robot/scene_depth_da3.py",
         "da3_config": repo / "models/DA3METRIC-LARGE/config.json",
         "da3_weights": (
@@ -609,7 +608,6 @@ def _prepare_stage_signature(
             "python": str(Path(sys.executable).resolve()),
             "debug_artifacts": args.debug,
             "hardware_encoding": args.hardware_encoding,
-            "binary_hands": args.binary_hands,
             "source_resolution": list(source_size),
             "propainter_mode": args.propainter_mode,
             "propainter_fp16": args.propainter_fp16,
@@ -1353,7 +1351,6 @@ def _prepare_episode(
         "urdf",
         "retarget_code",
         "trajectory_code",
-        "hand_binary_code",
     }
     reuse_trajectory = (
         reuse_existing_prepare
@@ -1362,7 +1359,7 @@ def _prepare_episode(
             previous_signature,
             prepare_signature,
             input_names=frozenset(trajectory_signature_inputs),
-            parameter_names=frozenset({"python", "binary_hands"}),
+            parameter_names=frozenset({"python"}),
         )
     )
     if not reuse_trajectory:
@@ -1381,11 +1378,6 @@ def _prepare_episode(
             str(urdf),
             "--output",
             str(g1_root),
-            (
-                "--binary-hands"
-                if args.binary_hands
-                else "--no-binary-hands"
-            ),
         ]
         _run_logged(
             retarget_command,
@@ -1454,7 +1446,6 @@ def _prepare_episode(
             parameter_names=frozenset(
                 {
                     "python",
-                    "binary_hands",
                     "source_resolution",
                 }
             ),
@@ -2587,18 +2578,6 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Use NVIDIA NVENC for generated videos when available; "
             "automatically fall back to software encoding (default: true)"
-        ),
-    )
-    parser.add_argument(
-        "--binary-hands",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help=(
-            "Threshold each visible HDF5 hand frame directly and drive the "
-            "LinkerHand O6 power-fist presets with the exact 0/1 state "
-            "when enabled; disabling retargets a complete 25-landmark hand "
-            "track to six independent O6 motors and falls back to continuous "
-            "fingertip width when unavailable (default: true)"
         ),
     )
     parser.add_argument(
