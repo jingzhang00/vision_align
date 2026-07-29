@@ -65,6 +65,7 @@ def _write_hdf5(
     ratios: list[float],
     operation_hand: str | None = "right",
     right_wrist_x: list[float] | None = None,
+    include_confidences: bool = True,
 ) -> None:
     right_positions, right_confidences = _tracks_from_ratios(
         ratios,
@@ -112,13 +113,34 @@ def _write_hdf5(
                     f"transforms/{side}{name}",
                     data=transform,
                 )
-                handle.create_dataset(
-                    f"confidences/{side}{name}",
-                    data=confidences[name],
-                )
+                if include_confidences:
+                    handle.create_dataset(
+                        f"confidences/{side}{name}",
+                        data=confidences[name],
+                    )
 
 
 class StatelessHandBinaryTests(unittest.TestCase):
+    def test_missing_hdf5_confidences_default_to_one(self) -> None:
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "episode.hdf5"
+            _write_hdf5(
+                path,
+                ratios=[0.2, 0.5, 0.2],
+                include_confidences=False,
+            )
+
+            result = infer_binary_grasps_from_hdf5(
+                path,
+                image_size=(100, 100),
+            )["right"]
+
+        np.testing.assert_array_equal(result.binary, [1, 0, 1])
+        np.testing.assert_array_equal(
+            result.diagnostics.frame_confidence,
+            np.ones(3),
+        )
+
     def test_exact_ratio_threshold_without_temporal_processing(self) -> None:
         ratios = [0.1, 0.5, 0.2, 0.6, CLOSE_RATIO_THRESHOLD]
         positions, confidences = _tracks_from_ratios(ratios)

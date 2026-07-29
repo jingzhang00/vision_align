@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import tempfile
 import unittest
@@ -12,10 +13,13 @@ import h5py
 from human_to_robot.pipeline import (
     Episode,
     EpisodeInterrupted,
+    EpisodeSkipped,
     IsaacRuntime,
     PreparedEpisode,
+    _auto_arm_prompt_frame,
     _discard_episode_workspace,
     _persist_failure_diagnostics,
+    _propainter_invocation,
     _publish_episode_outputs,
     _render_episode,
     _resolve_isaacsim_runtime,
@@ -28,6 +32,79 @@ from human_to_robot.pipeline import (
 
 
 class PipelineOutputTests(unittest.TestCase):
+    def test_official_propainter_is_the_default_invocation(self) -> None:
+        args = build_parser().parse_args(
+            ["--folder", "dataset/test", "--output", "outputs/test"]
+        )
+        repo = Path("/workspace")
+        propainter = repo / "ProPainter"
+
+        command, cwd = _propainter_invocation(
+            args=args,
+            python="/venv/bin/python",
+            video=Path("/data/episode.mp4"),
+            mask_root=Path("/data/masks"),
+            output_root=Path("/data/output"),
+            propainter=propainter,
+            repo=repo,
+        )
+
+        self.assertEqual(cwd, propainter)
+        self.assertEqual(
+            command[:2],
+            ["/venv/bin/python", str(propainter / "inference_propainter.py")],
+        )
+        self.assertIn("--subvideo_length", command)
+        self.assertIn("--fp16", command)
+        self.assertNotIn("human_to_robot.propainter_chunked", command)
+
+    def test_chunked_propainter_remains_an_explicit_fallback(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "--folder",
+                "dataset/test",
+                "--output",
+                "outputs/test",
+                "--propainter-mode",
+                "chunked",
+                "--no-propainter-fp16",
+                "--no-hardware-encoding",
+            ]
+        )
+        repo = Path("/workspace")
+
+        command, cwd = _propainter_invocation(
+            args=args,
+            python="/venv/bin/python",
+            video=Path("/data/episode.mp4"),
+            mask_root=Path("/data/masks"),
+            output_root=Path("/data/output"),
+            propainter=repo / "ProPainter",
+            repo=repo,
+        )
+
+        self.assertEqual(cwd, repo)
+        self.assertEqual(
+            command[:3],
+            [
+                "/venv/bin/python",
+                "-m",
+                "human_to_robot.propainter_chunked",
+            ],
+        )
+        self.assertIn("--no-fp16", command)
+        self.assertIn("--no-hardware-encoding", command)
+
+    def test_auto_arm_prompt_frame_accepts_missing_confidences(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "episode.hdf5"
+            with h5py.File(path, "w"):
+                pass
+
+            prompt_frame = _auto_arm_prompt_frame(path, frame_count=9)
+
+        self.assertEqual(prompt_frame, 4)
+
     def test_non_debug_routes_render_and_composite_through_one_process(
         self,
     ) -> None:
@@ -221,7 +298,7 @@ class PipelineOutputTests(unittest.TestCase):
                     hdf5=folder / f"{index}.hdf5",
                     output_root=workspace / "task_a" / str(index),
                 )
-                for index in range(3)
+                for index in range(4)
             ]
             args = build_parser().parse_args(
                 [
@@ -241,6 +318,11 @@ class PipelineOutputTests(unittest.TestCase):
                     raise RuntimeError("synthetic prepare failure")
                 if episode.name == "1":
                     raise EpisodeInterrupted("synthetic child interruption")
+                if episode.name == "2":
+                    raise EpisodeSkipped(
+                        "no common grounded placement",
+                        reason_code="no_common_base_search_region",
+                    )
                 return PreparedEpisode(
                     episode=episode,
                     frame_count=1,
@@ -305,17 +387,39 @@ class PipelineOutputTests(unittest.TestCase):
                     workspace_output=workspace,
                 )
 
-            self.assertEqual(prepare_mock.call_count, 3)
+            self.assertEqual(prepare_mock.call_count, 4)
             self.assertEqual(report["completed_episode_count"], 1)
             self.assertEqual(report["failed_episode_count"], 2)
-            self.assertEqual(len(report["episodes"]), 3)
+            self.assertEqual(report["skipped_episode_count"], 1)
+            self.assertEqual(
+                report["skipped_episode_paths"],
+                [str(episodes[2].hdf5)],
+            )
+            self.assertEqual(len(report["episodes"]), 4)
             self.assertNotIn("tasks", report)
+            skip_report_path = (
+                output / "task_a" / ".skipped" / "2" / "episode_report.json"
+            )
+            skip_report = json.loads(
+                skip_report_path.read_text(encoding="utf-8")
+            )
+            self.assertEqual(skip_report["status"], "skipped")
+            self.assertNotIn("error", skip_report)
+            self.assertEqual(
+                skip_report["episode_path"],
+                str(episodes[2].hdf5),
+            )
+            self.assertEqual(
+                skip_report["reason_code"],
+                "no_common_base_search_region",
+            )
             self.assertFalse(
                 (workspace / "task_a" / "task_report.json").exists()
             )
             self.assertFalse(episodes[0].output_root.exists())
             self.assertFalse(episodes[1].output_root.exists())
             self.assertFalse(episodes[2].output_root.exists())
+            self.assertFalse(episodes[3].output_root.exists())
 
     def test_non_debug_discards_episode_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

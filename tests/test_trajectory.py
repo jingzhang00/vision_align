@@ -11,6 +11,7 @@ from scipy.spatial.transform import Rotation
 from human_to_robot.trajectory import (
     HAND_KEYPOINT_NAMES,
     HAND_LANDMARK_NAMES,
+    hdf5_action_keypoint_availability,
     load_hand_trajectory,
 )
 
@@ -65,6 +66,59 @@ def _landmark_local_pose(
 
 
 class HandLandmarkTrajectoryTests(unittest.TestCase):
+    def test_loader_defaults_missing_confidences_to_one(self) -> None:
+        frame_count = 5
+        positions = {
+            "Hand": np.array([0.0, 0.0, 1.0]),
+            "ThumbTip": np.array([0.04, 0.10, 1.0]),
+            "IndexFingerTip": np.array([0.0, 0.10, 1.0]),
+            "MiddleFingerTip": np.array([0.0, 0.10, 1.0]),
+        }
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "episode.hdf5"
+            with h5py.File(path, "w") as handle:
+                handle.create_dataset("camera/intrinsic", data=np.eye(3))
+                handle.create_dataset(
+                    "transforms/camera",
+                    data=np.repeat(np.eye(4)[None], frame_count, axis=0),
+                )
+                for side in ("left", "right"):
+                    for name in HAND_LANDMARK_NAMES:
+                        transforms = np.repeat(
+                            np.eye(4)[None],
+                            frame_count,
+                            axis=0,
+                        )
+                        transforms[:, :3, 3] = positions.get(
+                            name,
+                            positions["Hand"],
+                        )
+                        handle.create_dataset(
+                            f"transforms/{side}{name}",
+                            data=transforms,
+                        )
+
+            availability = hdf5_action_keypoint_availability(path)
+            trajectory = load_hand_trajectory(path)
+
+        self.assertEqual(availability, {"left": True, "right": True})
+        np.testing.assert_array_equal(
+            trajectory.left_confidence,
+            np.ones(frame_count),
+        )
+        np.testing.assert_array_equal(
+            trajectory.right_confidence,
+            np.ones(frame_count),
+        )
+        for side in ("left", "right"):
+            articulated = getattr(trajectory, f"{side}_articulated_hand")
+            self.assertIsNotNone(articulated)
+            assert articulated is not None
+            np.testing.assert_array_equal(
+                articulated.confidence,
+                np.ones((frame_count, len(HAND_LANDMARK_NAMES))),
+            )
+
     def test_loader_preserves_complete_hand_tracks_in_reference_and_palm_frames(
         self,
     ) -> None:
@@ -239,6 +293,25 @@ class HandLandmarkTrajectoryTests(unittest.TestCase):
                             f"confidences/{side}{name}",
                             data=np.ones(frame_count),
                         )
+                body_positions = {
+                    "hip": np.array([0.0, 0.0, 0.3]),
+                    "neck4": np.array([0.0, 0.0, 0.9]),
+                    "leftArm": np.array([0.0, 0.2, 0.7]),
+                    "leftForearm": np.array([0.2, 0.2, 0.7]),
+                    "rightArm": np.array([0.0, -0.2, 0.7]),
+                    "rightForearm": np.array([0.2, -0.2, 0.7]),
+                }
+                for name, position in body_positions.items():
+                    transforms = np.repeat(
+                        np.eye(4)[None],
+                        frame_count,
+                        axis=0,
+                    )
+                    transforms[:, :3, 3] = position
+                    handle.create_dataset(
+                        f"transforms/{name}",
+                        data=transforms,
+                    )
 
             trajectory = load_hand_trajectory(path)
 
@@ -247,6 +320,23 @@ class HandLandmarkTrajectoryTests(unittest.TestCase):
         self.assertEqual(trajectory.frame_count, frame_count)
         self.assertTrue(np.isfinite(trajectory.left_widths).all())
         self.assertTrue(np.isfinite(trajectory.right_widths).all())
+        self.assertIsNotNone(trajectory.body_alignment)
+        assert trajectory.body_alignment is not None
+        np.testing.assert_array_equal(
+            trajectory.body_alignment.world_up,
+            [0.0, 0.0, 1.0],
+        )
+        np.testing.assert_allclose(
+            trajectory.body_alignment.shoulder_center_reference_camera,
+            np.repeat(
+                np.asarray([[0.0, 0.0, 0.7]]),
+                frame_count,
+                axis=0,
+            ),
+        )
+        self.assertTrue(
+            np.all(trajectory.body_alignment.arm_lengths > 0.0)
+        )
 
 
 if __name__ == "__main__":

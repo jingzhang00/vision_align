@@ -57,32 +57,6 @@ class ChunkTransition:
     end: int
 
 
-@dataclass(frozen=True)
-class BackgroundReference:
-    image: np.ndarray
-    observed: np.ndarray
-    sample_count: int
-    observed_fraction: float
-    median_error: float
-    reliable: bool
-    sample_indices: tuple[int, ...] = ()
-    samples: np.ndarray | None = None
-    sample_invalid: np.ndarray | None = None
-    feature_scale: float = 1.0
-    sample_keypoints: tuple[tuple[cv2.KeyPoint, ...], ...] = ()
-    sample_descriptors: tuple[np.ndarray | None, ...] = ()
-
-    def report(self) -> dict[str, object]:
-        return {
-            "enabled": True,
-            "reliable": self.reliable,
-            "sample_count": self.sample_count,
-            "observed_fraction": self.observed_fraction,
-            "median_unmasked_error": self.median_error,
-            "camera_aligned_samples": bool(self.sample_descriptors),
-        }
-
-
 def _strict_numbered_masks(mask_root: Path, frame_count: int) -> list[Path]:
     if frame_count <= 0:
         raise ValueError("frame_count must be positive")
@@ -510,628 +484,6 @@ def _resize_frame(
     return cv2.resize(frame, target_size, interpolation=interpolation)
 
 
-def _sample_frame_indices(frame_count: int, max_samples: int) -> list[int]:
-    if frame_count <= 0:
-        raise ValueError("frame_count must be positive")
-    if max_samples <= 0:
-        raise ValueError("max_samples must be positive")
-    sample_count = min(frame_count, max_samples)
-    return sorted(
-        {
-            int(round(value))
-            for value in np.linspace(
-                0,
-                frame_count - 1,
-                num=sample_count,
-            )
-        }
-    )
-
-
-def _read_sample_frames(
-    video: Path,
-    *,
-    frame_count: int,
-    target_size: tuple[int, int],
-    sample_indices: Sequence[int],
-) -> np.ndarray:
-    selected = {index: position for position, index in enumerate(sample_indices)}
-    frames = np.empty(
-        (
-            len(sample_indices),
-            target_size[1],
-            target_size[0],
-            3,
-        ),
-        dtype=np.uint8,
-    )
-    capture = cv2.VideoCapture(str(video))
-    if not capture.isOpened():
-        raise FileNotFoundError(f"Could not open video: {video}")
-    found = 0
-    try:
-        for frame_index in range(frame_count):
-            ok, frame = capture.read()
-            if not ok:
-                raise RuntimeError(
-                    f"Could not decode frame {frame_index} from {video}"
-                )
-            position = selected.get(frame_index)
-            if position is None:
-                continue
-            frames[position] = _resize_frame(frame, target_size)
-            found += 1
-            if found == len(sample_indices):
-                break
-    finally:
-        capture.release()
-    if found != len(sample_indices):
-        raise RuntimeError(
-            f"Read {found} background samples, expected "
-            f"{len(sample_indices)}"
-        )
-    return frames
-
-
-def _dilated_mask(
-    info: MaskFrameInfo,
-    target_size: tuple[int, int],
-    *,
-    iterations: int,
-) -> np.ndarray:
-    mask = _target_mask(info.path, target_size).astype(np.uint8)
-    if iterations > 0:
-        mask = cv2.dilate(
-            mask,
-            np.ones((3, 3), dtype=np.uint8),
-            iterations=iterations,
-        )
-    return mask != 0
-
-
-def _estimate_background_reference(
-    *,
-    video: Path,
-    infos: Sequence[MaskFrameInfo],
-    frame_count: int,
-    target_size: tuple[int, int],
-    max_samples: int,
-    mask_dilation: int,
-    max_median_error: float,
-) -> BackgroundReference:
-    sample_indices = _sample_frame_indices(frame_count, max_samples)
-    samples = _read_sample_frames(
-        video,
-        frame_count=frame_count,
-        target_size=target_size,
-        sample_indices=sample_indices,
-    )
-    height, width = samples.shape[1:3]
-    sample_invalid = np.stack(
-        [
-            _dilated_mask(
-                infos[frame_index],
-                target_size,
-                iterations=mask_dilation,
-            )
-            for frame_index in sample_indices
-        ]
-    )
-    valid_count = np.sum(
-        ~sample_invalid,
-        axis=0,
-        dtype=np.uint16,
-    )
-
-    observed = valid_count != 0
-    observed_fraction = float(np.mean(observed))
-    if not np.any(observed):
-        return BackgroundReference(
-            image=np.zeros((height, width, 3), dtype=np.uint8),
-            observed=observed,
-            sample_count=len(sample_indices),
-            observed_fraction=0.0,
-            median_error=float("inf"),
-            reliable=False,
-        )
-
-    median_index = np.maximum((valid_count.astype(np.int32) - 1) // 2, 0)
-    plate = np.empty((height, width, 3), dtype=np.uint8)
-    for channel in range(3):
-        values = samples[:, :, :, channel].copy()
-        values[sample_invalid] = 255
-        values.sort(axis=0)
-        plate[:, :, channel] = np.take_along_axis(
-            values,
-            median_index[None, :, :],
-            axis=0,
-        )[0]
-
-    missing = (~observed).astype(np.uint8) * 255
-    if np.any(missing):
-        plate[missing != 0] = 0
-        plate = cv2.inpaint(
-            plate,
-            missing,
-            7,
-            cv2.INPAINT_TELEA,
-        )
-
-    errors: list[float] = []
-    comparison_dilation = max(mask_dilation * 2, 8)
-    for sample_position, frame_index in enumerate(sample_indices):
-        excluded = _dilated_mask(
-            infos[frame_index],
-            target_size,
-            iterations=comparison_dilation,
-        )
-        stable = observed & ~excluded
-        stable_small = stable[::8, ::8]
-        if np.count_nonzero(stable_small) < 64:
-            continue
-        source_small = samples[sample_position, ::8, ::8].astype(np.int16)
-        plate_small = plate[::8, ::8].astype(np.int16)
-        offsets = np.array(
-            [
-                np.median(
-                    (source_small[:, :, channel] - plate_small[:, :, channel])[
-                        stable_small
-                    ]
-                )
-                for channel in range(3)
-            ],
-            dtype=np.float64,
-        )
-        residual = np.mean(
-            np.abs(source_small - (plate_small + offsets)),
-            axis=2,
-        )
-        errors.append(float(np.median(residual[stable_small])))
-
-    median_error = float(np.median(errors)) if errors else float("inf")
-    feature_scale = min(1.0, 960.0 / width)
-    detector = cv2.SIFT_create(
-        nfeatures=1200,
-        contrastThreshold=0.02,
-    )
-    feature_results = [
-        _extract_background_features(
-            samples[position],
-            sample_invalid[position],
-            scale=feature_scale,
-            detector=detector,
-        )
-        for position in range(len(sample_indices))
-    ]
-    return BackgroundReference(
-        image=plate,
-        observed=observed,
-        sample_count=len(sample_indices),
-        observed_fraction=observed_fraction,
-        median_error=median_error,
-        reliable=(
-            observed_fraction >= 0.5 and median_error <= max_median_error
-        ),
-        sample_indices=tuple(sample_indices),
-        samples=samples,
-        sample_invalid=sample_invalid,
-        feature_scale=feature_scale,
-        sample_keypoints=tuple(result[0] for result in feature_results),
-        sample_descriptors=tuple(result[1] for result in feature_results),
-    )
-
-
-def _match_background_color(
-    source: np.ndarray,
-    reference: BackgroundReference,
-    *,
-    excluded: np.ndarray,
-) -> np.ndarray:
-    stable = reference.observed & ~excluded
-    stable_small = stable[::8, ::8]
-    if np.count_nonzero(stable_small) < 64:
-        return reference.image
-    source_small = source[::8, ::8].astype(np.int16)
-    plate_small = reference.image[::8, ::8].astype(np.int16)
-    offsets = np.array(
-        [
-            np.median(
-                (source_small[:, :, channel] - plate_small[:, :, channel])[
-                    stable_small
-                ]
-            )
-            for channel in range(3)
-        ],
-        dtype=np.int16,
-    )
-    offsets = np.clip(offsets, -24, 24)
-    return np.clip(
-        reference.image.astype(np.int16) + offsets,
-        0,
-        255,
-    ).astype(np.uint8)
-
-
-def _extract_background_features(
-    frame: np.ndarray,
-    invalid: np.ndarray,
-    *,
-    scale: float,
-    detector: cv2.SIFT,
-) -> tuple[tuple[cv2.KeyPoint, ...], np.ndarray | None]:
-    if scale != 1.0:
-        frame = cv2.resize(
-            frame,
-            None,
-            fx=scale,
-            fy=scale,
-            interpolation=cv2.INTER_AREA,
-        )
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    valid = cv2.resize(
-        (~invalid).astype(np.uint8) * 255,
-        gray.shape[1::-1],
-        interpolation=cv2.INTER_NEAREST,
-    )
-    valid = cv2.erode(
-        valid,
-        np.ones((9, 9), dtype=np.uint8),
-    )
-    keypoints, descriptors = detector.detectAndCompute(gray, valid)
-    return tuple(keypoints), descriptors
-
-
-def _full_resolution_homography(
-    candidate_points: np.ndarray,
-    target_points: np.ndarray,
-    *,
-    feature_scale: float,
-) -> tuple[np.ndarray, int] | None:
-    transform, inlier_mask = cv2.findHomography(
-        candidate_points,
-        target_points,
-        cv2.RANSAC,
-        3.0,
-    )
-    if transform is None or inlier_mask is None:
-        return None
-    inlier_count = int(np.count_nonzero(inlier_mask))
-    if inlier_count < 8:
-        return None
-    scale = np.diag([feature_scale, feature_scale, 1.0])
-    return np.linalg.inv(scale) @ transform @ scale, inlier_count
-
-
-def _sane_homography(
-    transform: np.ndarray,
-    *,
-    width: int,
-    height: int,
-) -> bool:
-    corners = np.float32(
-        [[[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]]]
-    )
-    mapped = cv2.perspectiveTransform(corners, transform)[0]
-    if not np.all(np.isfinite(mapped)):
-        return False
-    area = abs(float(cv2.contourArea(mapped)))
-    source_area = float(width * height)
-    if area < source_area * 0.45 or area > source_area * 2.2:
-        return False
-    margin_x = width * 0.6
-    margin_y = height * 0.6
-    return bool(
-        np.all(mapped[:, 0] >= -margin_x)
-        and np.all(mapped[:, 0] <= width - 1 + margin_x)
-        and np.all(mapped[:, 1] >= -margin_y)
-        and np.all(mapped[:, 1] <= height - 1 + margin_y)
-    )
-
-
-def _aligned_background_plate(
-    *,
-    source: np.ndarray,
-    inpainted: np.ndarray,
-    mask: np.ndarray,
-    frame_index: int,
-    reference: BackgroundReference,
-    shadow_radius: int,
-) -> tuple[np.ndarray, np.ndarray] | None:
-    if (
-        reference.samples is None
-        or reference.sample_invalid is None
-        or not reference.sample_descriptors
-    ):
-        return None
-    height, width = mask.shape
-    points = cv2.findNonZero(mask.astype(np.uint8))
-    if points is None:
-        return None
-    x, y, box_width, box_height = cv2.boundingRect(points)
-    margin = shadow_radius + 24
-    x0 = max(0, x - margin)
-    y0 = max(0, y - margin)
-    x1 = min(width, x + box_width + margin)
-    y1 = min(height, y + box_height + margin)
-    roi_width = x1 - x0
-    roi_height = y1 - y0
-    roi_mask = mask[y0:y1, x0:x1]
-
-    detector = cv2.SIFT_create(
-        nfeatures=1200,
-        contrastThreshold=0.02,
-    )
-    target_keypoints, target_descriptors = _extract_background_features(
-        source,
-        mask,
-        scale=reference.feature_scale,
-        detector=detector,
-    )
-    if target_descriptors is None or len(target_keypoints) < 8:
-        return None
-
-    sampled_target = mask[::8, ::8]
-    candidate_order: list[tuple[float, int, int]] = []
-    for position, sample_index in enumerate(reference.sample_indices):
-        if abs(sample_index - frame_index) < 3:
-            continue
-        sample_valid = ~reference.sample_invalid[position, ::8, ::8]
-        coverage = (
-            float(np.mean(sample_valid[sampled_target]))
-            if np.any(sampled_target)
-            else 0.0
-        )
-        candidate_order.append((-coverage, abs(sample_index - frame_index), position))
-    candidate_order.sort()
-    candidate_positions = [item[2] for item in candidate_order[:12]]
-
-    matcher = cv2.BFMatcher(cv2.NORM_L2)
-    translation = np.array(
-        [[1.0, 0.0, -x0], [0.0, 1.0, -y0], [0.0, 0.0, 1.0]],
-        dtype=np.float64,
-    )
-    expanded_target = cv2.dilate(
-        roi_mask.astype(np.uint8),
-        np.ones((9, 9), dtype=np.uint8),
-        iterations=3,
-    ).astype(bool)
-    aligned: list[tuple[float, float, np.ndarray, np.ndarray]] = []
-    for position in candidate_positions:
-        descriptors = reference.sample_descriptors[position]
-        keypoints = reference.sample_keypoints[position]
-        if descriptors is None or len(keypoints) < 8:
-            continue
-        pairs = matcher.knnMatch(descriptors, target_descriptors, k=2)
-        good = [
-            first
-            for first, second in pairs
-            if first.distance < 0.72 * second.distance
-        ]
-        if len(good) < 12:
-            continue
-        candidate_points = np.float32(
-            [keypoints[match.queryIdx].pt for match in good]
-        )
-        target_points = np.float32(
-            [target_keypoints[match.trainIdx].pt for match in good]
-        )
-        result = _full_resolution_homography(
-            candidate_points,
-            target_points,
-            feature_scale=reference.feature_scale,
-        )
-        if result is None:
-            continue
-        transform, inlier_count = result
-        if not _sane_homography(transform, width=width, height=height):
-            continue
-        roi_transform = translation @ transform
-        warped = cv2.warpPerspective(
-            reference.samples[position],
-            roi_transform,
-            (roi_width, roi_height),
-            flags=cv2.INTER_LINEAR,
-        )
-        invalid = cv2.dilate(
-            reference.sample_invalid[position].astype(np.uint8),
-            np.ones((9, 9), dtype=np.uint8),
-            iterations=2,
-        )
-        valid = (
-            cv2.warpPerspective(
-                (invalid == 0).astype(np.uint8),
-                roi_transform,
-                (roi_width, roi_height),
-                flags=cv2.INTER_NEAREST,
-            )
-            != 0
-        )
-        target_coverage = float(np.mean(valid[roi_mask]))
-        if target_coverage < 0.2:
-            continue
-        stable = valid & ~expanded_target
-        stable_small = stable[::8, ::8]
-        if np.count_nonzero(stable_small) < 64:
-            continue
-        warped_small = warped[::8, ::8].astype(np.int16)
-        source_small = source[y0:y1:8, x0:x1:8].astype(np.int16)
-        offsets = np.array(
-            [
-                np.median(
-                    (source_small[:, :, channel] - warped_small[:, :, channel])[
-                        stable_small
-                    ]
-                )
-                for channel in range(3)
-            ],
-            dtype=np.int16,
-        )
-        offsets = np.clip(offsets, -24, 24)
-        warped = np.clip(
-            warped.astype(np.int16) + offsets,
-            0,
-            255,
-        ).astype(np.uint8)
-        residual = np.mean(
-            np.abs(
-                source_small
-                - np.clip(
-                    warped_small + offsets,
-                    0,
-                    255,
-                )
-            ),
-            axis=2,
-        )
-        error = float(np.median(residual[stable_small]))
-        if error > 18.0:
-            continue
-        aligned.append(
-            (
-                error,
-                -target_coverage - inlier_count * 1e-4,
-                warped,
-                valid,
-            )
-        )
-
-    if not aligned:
-        return None
-    aligned.sort(key=lambda item: (item[0], item[1]))
-    selected = aligned[:5]
-    values = np.stack([item[2] for item in selected])
-    validity = np.stack([item[3] for item in selected])
-    valid_count = np.sum(validity, axis=0, dtype=np.uint8)
-    median_index = np.maximum(
-        (valid_count.astype(np.int16) - 1) // 2,
-        0,
-    )
-    plate_roi = inpainted[y0:y1, x0:x1].copy()
-    for channel in range(3):
-        channel_values = values[:, :, :, channel].copy()
-        channel_values[~validity] = 255
-        channel_values.sort(axis=0)
-        median = np.take_along_axis(
-            channel_values,
-            median_index[None, :, :],
-            axis=0,
-        )[0]
-        plate_roi[:, :, channel][valid_count != 0] = median[valid_count != 0]
-
-    plate = inpainted.copy()
-    plate[y0:y1, x0:x1] = plate_roi
-    observed = np.zeros((height, width), dtype=bool)
-    observed[y0:y1, x0:x1] = valid_count != 0
-    return plate, observed
-
-
-def _apply_background_cleanup(
-    *,
-    source: np.ndarray,
-    inpainted: np.ndarray,
-    mask: np.ndarray,
-    frame_index: int = 0,
-    reference: BackgroundReference,
-) -> np.ndarray:
-    if not reference.reliable or not np.any(mask):
-        return inpainted
-    height, width = mask.shape
-    scale = min(width, height) / 1080.0
-    inner_dilation = max(2, int(round(4 * scale)))
-    blend_dilation = max(3, int(round(8 * scale)))
-    shadow_radius = max(16, int(round(240 * scale)))
-    blur_sigma = max(1.0, 3.0 * scale)
-    kernel = np.ones((3, 3), dtype=np.uint8)
-    binary = mask.astype(np.uint8)
-    distance = cv2.distanceTransform(
-        (binary == 0).astype(np.uint8),
-        cv2.DIST_L2,
-        3,
-    )
-    near_hand = distance <= shadow_radius
-    aligned = _aligned_background_plate(
-        source=source,
-        inpainted=inpainted,
-        mask=mask,
-        frame_index=frame_index,
-        reference=reference,
-        shadow_radius=shadow_radius,
-    )
-    if aligned is None:
-        if reference.sample_descriptors:
-            return inpainted
-        plate = _match_background_color(
-            source,
-            reference,
-            excluded=near_hand,
-        )
-        observed = reference.observed
-    else:
-        plate, observed = aligned
-
-    source_lab = cv2.cvtColor(source, cv2.COLOR_BGR2LAB).astype(np.int16)
-    plate_lab = cv2.cvtColor(plate, cv2.COLOR_BGR2LAB).astype(np.int16)
-    darkness = plate_lab[:, :, 0] - source_lab[:, :, 0]
-    chroma_error = np.maximum(
-        np.abs(plate_lab[:, :, 1] - source_lab[:, :, 1]),
-        np.abs(plate_lab[:, :, 2] - source_lab[:, :, 2]),
-    )
-    shadow_candidate = (
-        near_hand
-        & (binary == 0)
-        & observed
-        & (darkness > 4)
-        & (chroma_error < 24)
-    ).astype(np.uint8)
-    shadow_candidate = cv2.morphologyEx(
-        shadow_candidate,
-        cv2.MORPH_OPEN,
-        kernel,
-    )
-    seed = cv2.dilate(binary, kernel, iterations=5)
-    component_count, labels = cv2.connectedComponents(
-        (shadow_candidate | seed).astype(np.uint8)
-    )
-    keep = np.zeros(component_count, dtype=bool)
-    keep[np.unique(labels[binary != 0])] = True
-    shadow = keep[labels] & (shadow_candidate != 0)
-
-    inner = cv2.dilate(
-        binary,
-        kernel,
-        iterations=inner_dilation,
-    )
-    outer = cv2.dilate(
-        inner,
-        kernel,
-        iterations=blend_dilation,
-    ).astype(np.float32)
-    alpha = cv2.GaussianBlur(
-        outer,
-        (0, 0),
-        blur_sigma,
-    )
-    alpha[inner != 0] = 1.0
-    shadow_alpha = np.clip(
-        (darkness.astype(np.float32) - 2.0) / 18.0,
-        0.0,
-        0.95,
-    )
-    shadow_alpha *= shadow.astype(np.float32)
-    shadow_alpha = cv2.GaussianBlur(
-        shadow_alpha,
-        (0, 0),
-        blur_sigma,
-    )
-    alpha = np.maximum(alpha, shadow_alpha)[:, :, None]
-    return np.clip(
-        plate.astype(np.float32) * alpha
-        + inpainted.astype(np.float32) * (1.0 - alpha),
-        0,
-        255,
-    ).astype(np.uint8)
-
-
 def _write_chunk_inputs(
     *,
     video: Path,
@@ -1327,7 +679,6 @@ def _stream_final_video(
     mask_dilation: int,
     transition_frames: int,
     hardware_encoding: bool,
-    background_reference: BackgroundReference | None,
 ) -> dict[str, object]:
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(
@@ -1394,8 +745,6 @@ def _stream_final_video(
                     f"Could not decode source frame {frame_index}: {video}"
                 )
             frame = _resize_frame(frame, target_size)
-            source = frame.copy()
-            mask: np.ndarray | None = None
             while (
                 chunk_index < len(chunks)
                 and frame_index >= chunks[chunk_index].core_end
@@ -1440,18 +789,6 @@ def _stream_final_video(
                         weight,
                         0.0,
                     )
-            if (
-                mask is not None
-                and background_reference is not None
-                and background_reference.reliable
-            ):
-                frame = _apply_background_cleanup(
-                    source=source,
-                    inpainted=frame,
-                    mask=mask,
-                    frame_index=frame_index,
-                    reference=background_reference,
-                )
             writer.write(frame)
             written += 1
         writer.close()
@@ -1496,9 +833,6 @@ def run_chunked_propainter(
     ref_stride: int = 10,
     raft_iter: int = 20,
     mask_dilation: int = 4,
-    background_cleanup: bool = True,
-    background_max_samples: int = 33,
-    background_max_median_error: float = 12.0,
     fp16: bool = True,
     hardware_encoding: bool = True,
     runner: CommandRunner = _default_runner,
@@ -1521,10 +855,6 @@ def run_chunked_propainter(
         raise ValueError("max_chunk_pixel_frames must be positive")
     if transition_frames < 0:
         raise ValueError("transition_frames cannot be negative")
-    if background_max_samples <= 0:
-        raise ValueError("background_max_samples must be positive")
-    if background_max_median_error <= 0:
-        raise ValueError("background_max_median_error must be positive")
     if roi_margin < mask_dilation:
         raise ValueError("roi_margin must be at least mask_dilation")
     if max_clip_frames < 20:
@@ -1539,29 +869,6 @@ def run_chunked_propainter(
         frame_count=frame_count,
         target_size=target_size,
     )
-    background_reference: BackgroundReference | None = None
-    if background_cleanup:
-        background_mask_dilation = max(
-            mask_dilation,
-            int(round(min(width, height) * 8 / 1080)),
-        )
-        background_reference = _estimate_background_reference(
-            video=video,
-            infos=infos,
-            frame_count=frame_count,
-            target_size=target_size,
-            max_samples=background_max_samples,
-            mask_dilation=background_mask_dilation,
-            max_median_error=background_max_median_error,
-        )
-        print(
-            "Background cleanup reference: "
-            f"samples={background_reference.sample_count}, "
-            f"observed={background_reference.observed_fraction:.3f}, "
-            f"median_error={background_reference.median_error:.2f}, "
-            f"reliable={background_reference.reliable}",
-            flush=True,
-        )
     chunks = plan_chunks(
         infos,
         frame_count=frame_count,
@@ -1617,7 +924,6 @@ def run_chunked_propainter(
             mask_dilation=mask_dilation,
             transition_frames=transition_frames,
             hardware_encoding=hardware_encoding,
-            background_reference=background_reference,
         )
 
     report: dict[str, object] = {
@@ -1648,18 +954,10 @@ def run_chunked_propainter(
             "raft_iter": raft_iter,
             "hardware_encoding": hardware_encoding,
             "mask_dilation": mask_dilation,
-            "background_cleanup": background_cleanup,
-            "background_max_samples": background_max_samples,
-            "background_max_median_error": background_max_median_error,
             "fp16": fp16,
             "persistent_worker": True,
             "frames_only": True,
         },
-        "background_cleanup": (
-            background_reference.report()
-            if background_reference is not None
-            else {"enabled": False}
-        ),
         "chunks": [asdict(chunk) for chunk in chunks],
         "transitions": [asdict(transition) for transition in transitions],
     }
@@ -1701,25 +999,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--raft-iter", type=int, default=20)
     parser.add_argument("--mask-dilation", type=int, default=4)
     parser.add_argument(
-        "--background-cleanup",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help=(
-            "Replace residual hands and connected shadows with a robust "
-            "unmasked temporal background when the camera is stationary"
-        ),
-    )
-    parser.add_argument("--background-max-samples", type=int, default=33)
-    parser.add_argument(
-        "--background-max-median-error",
-        type=float,
-        default=12.0,
-        help=(
-            "Disable temporal background cleanup when the median unmasked "
-            "reference error exceeds this value"
-        ),
-    )
-    parser.add_argument(
         "--fp16",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -1750,9 +1029,6 @@ def main() -> None:
         ref_stride=args.ref_stride,
         raft_iter=args.raft_iter,
         mask_dilation=args.mask_dilation,
-        background_cleanup=args.background_cleanup,
-        background_max_samples=args.background_max_samples,
-        background_max_median_error=args.background_max_median_error,
         fp16=args.fp16,
         hardware_encoding=args.hardware_encoding,
     )

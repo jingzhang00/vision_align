@@ -84,6 +84,7 @@ Use a fast preparation-only check before starting SAM3, ProPainter, or Isaac:
 Preparation requires these recording-level inputs in the parent episode:
 
 ```text
+metadata.json
 body/xdata.npz
 narration/activity_summarization.csv
 recording_head/mps/slam/closed_loop_trajectory.csv
@@ -110,12 +111,19 @@ The alignment policy is:
   device. Per-frame `T_World_Camera` from MPS is preserved in the adapter, so
   Isaac receives the real head-camera motion rather than a stabilized-camera
   approximation.
+- `participant_height_cm` is read from Nymeria's `metadata.json` and retained
+  as adapter provenance. Pelvis, Head, UpperArm, Forearm, and Hand XSens
+  segments are registered into the same Aria world and exported as the common
+  upper-body alignment anchors. The shared G1 retargeter derives its actual
+  scale from the calibrated arm chains rather than treating participant
+  height as camera height.
 - Fixed-base compatibility and projected wrist visibility are checked before
   a clip is re-encoded or sent to the expensive synthesis stages.
 - Nymeria's body data has rigid `L_Hand`/`R_Hand` tracks but no articulated
-  finger pose. The adapter writes only those explicit rigid-palm targets; it
-  does not synthesize fingertips. The shared retargeter maps them through its
-  normal base search and 6D palm IK while keeping both robot hands open.
+  finger pose. The adapter writes those explicit rigid-palm targets plus the
+  body-alignment anchors; it does not synthesize fingertips. The shared
+  retargeter maps them through its normal base search and 6D palm IK while
+  keeping both robot hands open.
 
 Some source clips contain hidden stream-copy preroll: the container may report
 460 frames while only 450 are visible. The adapter normalizes only the decoded

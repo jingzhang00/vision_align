@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import cv2
 import numpy as np
@@ -14,14 +17,24 @@ from human_to_robot.composite import (
     compose_video,
 )
 from human_to_robot.retarget_g1_pinocchio import (
+    CV_TO_G1_WORLD,
+    G1_BASE_FRAME,
+    NoCommonBasePlacementError,
     _base_candidates,
+    _derive_spatial_alignment,
     _representative_keyframes,
+    _robot_arm_lengths,
     _robot_maximum_reach,
+    _robot_nominal_pelvis_height,
+    _robot_shoulder_center,
+    _shoulder_aligned_base_candidates,
     _solve_frame,
     _trajectory_centroid,
     _active_velocity_indices,
     build_pinocchio_g1,
+    main as retarget_main,
 )
+from human_to_robot.trajectory import SourceBodyAlignment
 from human_to_robot.render_isaacsim import (
     _camera_projection_from_intrinsic,
 )
@@ -194,11 +207,13 @@ class PinocchioRetargetingTests(unittest.TestCase):
                 keyframe_positions,
                 trajectory_centroid=centroid,
                 r_max=0.7,
+                base_height=0.8,
             )
         )
 
         self.assertGreater(len(candidates), 0)
         for position, rotation in candidates:
+            self.assertAlmostEqual(position[2], 0.8)
             self.assertTrue(
                 np.all(
                     np.linalg.norm(
@@ -213,6 +228,80 @@ class PinocchioRetargetingTests(unittest.TestCase):
                 np.eye(3),
                 atol=1e-12,
             )
+
+    def test_missing_common_base_range_has_a_distinct_skip_error(self) -> None:
+        with self.assertRaises(NoCommonBasePlacementError):
+            list(
+                _base_candidates(
+                    np.asarray(
+                        [[0.0, 0.0, 0.8], [2.0, 0.0, 0.8]],
+                        dtype=np.float64,
+                    ),
+                    trajectory_centroid=np.asarray(
+                        [1.0, 0.0, 0.8],
+                        dtype=np.float64,
+                    ),
+                    r_max=0.5,
+                    base_height=0.8,
+                )
+            )
+
+    def test_retarget_cli_writes_episode_skip_report(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            video = root / "task" / "12.mp4"
+            hdf5 = root / "task" / "12.hdf5"
+            output = root / "output"
+            trajectory = mock.Mock(
+                frame_count=4,
+                target_mode="rigid_palm",
+            )
+            argv = [
+                "retarget_g1_pinocchio",
+                "--video",
+                str(video),
+                "--hdf5",
+                str(hdf5),
+                "--urdf",
+                str(root / "robot.urdf"),
+                "--output",
+                str(output),
+            ]
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch(
+                    "human_to_robot.retarget_g1_pinocchio.video_metadata",
+                    return_value=(48, 32, 4, 12.0),
+                ),
+                mock.patch(
+                    "human_to_robot.retarget_g1_pinocchio."
+                    "load_hand_trajectory",
+                    return_value=trajectory,
+                ),
+                mock.patch(
+                    "human_to_robot.retarget_g1_pinocchio."
+                    "build_pinocchio_g1",
+                    return_value=mock.sentinel.model,
+                ),
+                mock.patch(
+                    "human_to_robot.retarget_g1_pinocchio."
+                    "retarget_with_pinocchio",
+                    side_effect=NoCommonBasePlacementError(
+                        "no common grounded placement"
+                    ),
+                ),
+            ):
+                retarget_main()
+
+            report = json.loads(
+                (output / "episode_skip.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(report["status"], "skipped")
+            self.assertEqual(
+                report["reason_code"],
+                "no_common_base_search_region",
+            )
+            self.assertEqual(report["episode_path"], str(hdf5.resolve()))
 
     def test_model_driven_g1_reach_and_rotated_base_transform(self) -> None:
         model = build_pinocchio_g1(
@@ -256,6 +345,177 @@ class PinocchioRetargetingTests(unittest.TestCase):
 
         np.testing.assert_allclose(solved, reference_q, atol=1e-10)
         np.testing.assert_allclose(metrics, 0.0, atol=1e-10)
+
+    def test_g1_base_is_pelvis_and_waist_participates_in_ik(self) -> None:
+        model = build_pinocchio_g1(
+            REPOSITORY
+            / "assets/unitree_description/urdf/g1/main_with_hand_new.urdf"
+        )
+
+        self.assertEqual(G1_BASE_FRAME, "pelvis")
+        self.assertLess(model.getFrameId(G1_BASE_FRAME), model.nframes)
+        self.assertAlmostEqual(
+            _robot_nominal_pelvis_height(model),
+            0.793863752,
+            places=8,
+        )
+        active = set(
+            _active_velocity_indices(
+                model,
+                position_only=False,
+            ).tolist()
+        )
+        for joint_name in (
+            "waist_yaw_joint",
+            "waist_roll_joint",
+            "waist_pitch_joint",
+        ):
+            self.assertIn(
+                model.idx_vs[model.getJointId(joint_name)],
+                active,
+            )
+        for joint_name in (
+            "left_hip_pitch_joint",
+            "right_hip_pitch_joint",
+        ):
+            self.assertNotIn(
+                model.idx_vs[model.getJointId(joint_name)],
+                active,
+            )
+
+    def test_episode_body_alignment_derives_scale_and_camera_origin(
+        self,
+    ) -> None:
+        model = build_pinocchio_g1(
+            REPOSITORY
+            / "assets/unitree_description/urdf/g1/main_with_hand_new.urdf"
+        )
+        pelvis_samples = np.asarray(
+            [
+                [0.10, 0.60, 0.20],
+                [0.12, 0.58, 0.21],
+                [0.08, 0.62, 0.19],
+            ],
+            dtype=np.float64,
+        )
+        shoulder_samples = np.asarray(
+            [
+                [0.12, 0.18, 0.82],
+                [0.14, 0.16, 0.83],
+                [0.10, 0.20, 0.81],
+            ],
+            dtype=np.float64,
+        )
+        trajectory = type(
+            "Trajectory",
+            (),
+            {
+                "camera_to_world": np.repeat(
+                    np.block(
+                        [
+                            [CV_TO_G1_WORLD, np.zeros((3, 1))],
+                            [np.zeros((1, 3)), np.ones((1, 1))],
+                        ]
+                    )[None],
+                    3,
+                    axis=0,
+                ),
+                "body_alignment": SourceBodyAlignment(
+                    pelvis_reference_camera=pelvis_samples,
+                    shoulder_center_reference_camera=shoulder_samples,
+                    arm_lengths=np.asarray([0.57, 0.57]),
+                    world_up=np.asarray([0.0, 0.0, 1.0]),
+                    source="synthetic_test",
+                ),
+            },
+        )()
+        pelvis_height = _robot_nominal_pelvis_height(model)
+
+        alignment = _derive_spatial_alignment(
+            model,
+            trajectory,
+            nominal_pelvis_height=pelvis_height,
+            scale=None,
+            camera_origin=None,
+        )
+
+        robot_lengths = _robot_arm_lengths(model)
+        expected_scale = float(np.median(robot_lengths / 0.57))
+        np.testing.assert_allclose(alignment.scale, expected_scale)
+        np.testing.assert_allclose(
+            alignment.world_from_reference_camera,
+            CV_TO_G1_WORLD,
+            atol=1e-12,
+        )
+        mapped_pelvis = alignment.camera_origin + (
+            alignment.world_from_reference_camera
+            @ (
+                alignment.scale
+                * np.median(pelvis_samples, axis=0)
+            )
+        )
+        np.testing.assert_allclose(
+            mapped_pelvis,
+            [0.0, 0.0, pelvis_height],
+            atol=1e-12,
+        )
+        np.testing.assert_allclose(
+            alignment.shoulder_anchor_reference_camera,
+            np.median(shoulder_samples, axis=0),
+        )
+        np.testing.assert_allclose(
+            alignment.robot_shoulder_center_from_pelvis,
+            _robot_shoulder_center(model),
+        )
+        self.assertIn("synthetic_test", alignment.scale_source)
+
+    def test_shoulder_alignment_derives_pelvis_for_each_yaw(self) -> None:
+        source_shoulder = np.asarray([0.4, -0.2, 1.15])
+        robot_shoulder = np.asarray([0.01, 0.0, 0.29])
+        centroid = np.asarray([0.8, 0.1, 1.05])
+
+        candidates = list(
+            _shoulder_aligned_base_candidates(
+                source_shoulder,
+                robot_shoulder,
+                trajectory_centroid=centroid,
+            )
+        )
+
+        self.assertEqual(len(candidates), 9)
+        for pelvis_position, pelvis_rotation in candidates:
+            np.testing.assert_allclose(
+                pelvis_position + pelvis_rotation @ robot_shoulder,
+                source_shoulder,
+                atol=1e-12,
+            )
+            np.testing.assert_allclose(
+                pelvis_rotation.T @ pelvis_rotation,
+                np.eye(3),
+                atol=1e-12,
+            )
+
+    def test_spatial_alignment_has_no_silent_scale_or_camera_fallback(
+        self,
+    ) -> None:
+        model = build_pinocchio_g1(
+            REPOSITORY
+            / "assets/unitree_description/urdf/g1/main_with_hand_new.urdf"
+        )
+        trajectory = type(
+            "Trajectory",
+            (),
+            {"body_alignment": None},
+        )()
+
+        with self.assertRaisesRegex(ValueError, "upper-body anchors"):
+            _derive_spatial_alignment(
+                model,
+                trajectory,
+                nominal_pelvis_height=_robot_nominal_pelvis_height(model),
+                scale=None,
+                camera_origin=None,
+            )
 
 
 class StreamingCompositeTests(unittest.TestCase):

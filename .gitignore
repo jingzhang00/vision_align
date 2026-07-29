@@ -14,5 +14,4 @@ assets/unitree_description/meshes/g1/*_tmp/
 ._*
 # Virtual environments
 .venv
-
 mano_v1_2/models/*.pkl

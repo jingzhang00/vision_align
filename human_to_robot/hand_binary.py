@@ -2,7 +2,8 @@
 
 There is deliberately no interpolation, smoothing, hysteresis, event
 detection, or state latch in this module.  Frame ``t`` depends only on MANO
-landmarks and visibility at frame ``t``.
+landmarks, optional confidence, and visibility at frame ``t``. Missing
+confidence is treated as one, leaving finite geometry to determine validity.
 
 The geometry follows the action-alignment:
 
@@ -119,17 +120,15 @@ class HandBinaryResult:
 
 def _validate_tracks(
     positions: Mapping[str, np.ndarray],
-    confidences: Mapping[str, np.ndarray],
+    confidences: Mapping[str, np.ndarray] | None,
 ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], int]:
     missing_positions = [
         name for name in HAND_LANDMARKS if name not in positions
     ]
-    missing_confidences = [
-        name for name in HAND_LANDMARKS if name not in confidences
-    ]
-    if missing_positions or missing_confidences:
-        missing = sorted(set(missing_positions + missing_confidences))
-        raise KeyError(f"Missing MANO hand landmarks: {', '.join(missing)}")
+    if missing_positions:
+        raise KeyError(
+            f"Missing MANO hand landmarks: {', '.join(missing_positions)}"
+        )
 
     hand = np.asarray(positions["Hand"])
     if hand.ndim != 2 or hand.shape[1] != 3:
@@ -142,7 +141,11 @@ def _validate_tracks(
     clean_confidences: dict[str, np.ndarray] = {}
     for name in HAND_LANDMARKS:
         point = np.asarray(positions[name], dtype=np.float64)
-        confidence = np.asarray(confidences[name], dtype=np.float64)
+        confidence = (
+            np.ones(frame_count, dtype=np.float64)
+            if confidences is None or name not in confidences
+            else np.asarray(confidences[name], dtype=np.float64)
+        )
         if point.shape != (frame_count, 3):
             raise ValueError(
                 f"{name} positions must have shape {(frame_count, 3)}, "
@@ -180,7 +183,7 @@ def _closed_runs(
 
 def infer_hand_binary(
     positions: Mapping[str, np.ndarray],
-    confidences: Mapping[str, np.ndarray],
+    confidences: Mapping[str, np.ndarray] | None = None,
     *,
     side: str,
     operation_enabled: bool = True,
@@ -190,7 +193,7 @@ def infer_hand_binary(
     visibility_source: str = "caller",
     close_ratio_threshold: float = CLOSE_RATIO_THRESHOLD,
 ) -> HandBinaryResult:
-    """Classify every frame independently from MANO geometry."""
+    """Classify each frame from MANO geometry and optional confidence."""
 
     if side not in {"left", "right"}:
         raise ValueError(f"Unknown hand side: {side}")
@@ -429,13 +432,8 @@ def infer_binary_grasps_from_hdf5(
             for name in HAND_LANDMARKS:
                 transform_key = f"transforms/{side}{name}"
                 confidence_key = f"confidences/{side}{name}"
-                missing = [
-                    key
-                    for key in (transform_key, confidence_key)
-                    if key not in handle
-                ]
-                if missing:
-                    raise KeyError(f"{path} is missing: {', '.join(missing)}")
+                if transform_key not in handle:
+                    raise KeyError(f"{path} is missing: {transform_key}")
                 transform = np.asarray(handle[transform_key], dtype=np.float64)
                 if transform.ndim != 3 or transform.shape[1:] != (4, 4):
                     raise ValueError(
@@ -443,9 +441,10 @@ def infer_binary_grasps_from_hdf5(
                         f"got {transform.shape}"
                     )
                 positions[name] = transform[:, :3, 3]
-                confidences[name] = np.asarray(
-                    handle[confidence_key],
-                    dtype=np.float64,
+                confidences[name] = (
+                    np.asarray(handle[confidence_key], dtype=np.float64)
+                    if confidence_key in handle
+                    else np.ones(transform.shape[0], dtype=np.float64)
                 )
             visible, visibility_source = _camera_visibility(
                 handle,

@@ -62,7 +62,8 @@ class ArticulatedHandTrajectory:
     expressed in the first video camera frame. ``transforms_palm`` is
     expressed in the corresponding frame's tracked ``Hand`` transform, so it
     contains articulation without global hand or camera motion. Confidence has
-    shape ``[N, 25]`` and is preserved without smoothing or thresholding.
+    shape ``[N, 25]`` and is preserved without smoothing or thresholding;
+    source files without confidence receive ones.
     """
 
     names: tuple[str, ...]
@@ -89,6 +90,25 @@ class ArticulatedHandTrajectory:
     @property
     def frame_count(self) -> int:
         return int(self.transforms_reference_camera.shape[0])
+
+
+@dataclass(frozen=True)
+class SourceBodyAlignment:
+    """Episode body anchors used for morphology-aware spatial alignment.
+
+    ``pelvis_reference_camera`` is the tracked hip expressed in the first
+    video-camera frame. ``shoulder_center_reference_camera`` is the midpoint
+    of the tracked left/right arm roots in that same frame. ``arm_lengths``
+    contains the robust left/right shoulder-to-hand kinematic lengths measured
+    from the source body rig. ``world_up`` is the gravity-aligned cardinal axis
+    inferred from the episode's hip-to-neck direction.
+    """
+
+    pelvis_reference_camera: np.ndarray
+    shoulder_center_reference_camera: np.ndarray
+    arm_lengths: np.ndarray
+    world_up: np.ndarray
+    source: str
 
 
 @dataclass(frozen=True)
@@ -123,6 +143,7 @@ class HandTrajectory:
     intrinsic: np.ndarray
     camera_to_world: np.ndarray
     camera_motion: np.ndarray
+    body_alignment: SourceBodyAlignment | None = None
     left_articulated_hand: ArticulatedHandTrajectory | None = None
     right_articulated_hand: ArticulatedHandTrajectory | None = None
 
@@ -417,19 +438,158 @@ def align_hand_action(
     )
 
 
-def _hdf5_hand_keys(side: str) -> tuple[str, ...]:
+def _hdf5_hand_transform_keys(side: str) -> tuple[str, ...]:
     return tuple(
-        f"{root}/{side}{name}"
+        f"transforms/{side}{name}"
         for name in HAND_KEYPOINT_NAMES
-        for root in ("transforms", "confidences")
     )
 
 
-def _hdf5_hand_landmark_keys(side: str) -> tuple[str, ...]:
+def _hdf5_hand_landmark_transform_keys(side: str) -> tuple[str, ...]:
     return tuple(
-        f"{root}/{side}{name}"
+        f"transforms/{side}{name}"
         for name in HAND_LANDMARK_NAMES
-        for root in ("transforms", "confidences")
+    )
+
+
+def _hdf5_optional_confidence(
+    handle: h5py.File,
+    *,
+    key: str,
+    frame_count: int,
+) -> np.ndarray:
+    """Load confidence when available, otherwise trust finite transforms."""
+
+    if key not in handle:
+        return np.ones(frame_count, dtype=np.float64)
+    confidence = np.asarray(handle[key], dtype=np.float64)
+    if confidence.shape != (frame_count,):
+        raise ValueError(
+            f"{key} must have shape {(frame_count,)}, got {confidence.shape}"
+        )
+    return confidence
+
+
+def _hdf5_body_alignment(
+    handle: h5py.File,
+    *,
+    reference_world_to_camera: np.ndarray,
+    frame_count: int,
+) -> SourceBodyAlignment | None:
+    """Load the common upper-body anchors without dataset-specific logic."""
+
+    required = (
+        "transforms/hip",
+        "transforms/leftArm",
+        "transforms/leftForearm",
+        "transforms/leftHand",
+        "transforms/rightArm",
+        "transforms/rightForearm",
+        "transforms/rightHand",
+    )
+    if not all(key in handle for key in required):
+        return None
+    transforms: dict[str, np.ndarray] = {}
+    for key in required:
+        value = np.asarray(handle[key], dtype=np.float64)
+        if value.shape != (frame_count, 4, 4):
+            raise ValueError(
+                f"{key} must have shape {(frame_count, 4, 4)}, "
+                f"got {value.shape}"
+            )
+        transforms[key.removeprefix("transforms/")] = value
+
+    arm_lengths: list[float] = []
+    for side in ("left", "right"):
+        shoulder = transforms[f"{side}Arm"][:, :3, 3]
+        elbow = transforms[f"{side}Forearm"][:, :3, 3]
+        hand = transforms[f"{side}Hand"][:, :3, 3]
+        lengths = np.linalg.norm(shoulder - elbow, axis=1) + np.linalg.norm(
+            elbow - hand,
+            axis=1,
+        )
+        valid = np.isfinite(lengths) & (lengths > 1e-4)
+        if np.count_nonzero(valid) < 2:
+            return None
+        arm_lengths.append(float(np.median(lengths[valid])))
+
+    hip_world = transforms["hip"][:, :3, 3]
+    repeated_reference = np.repeat(
+        reference_world_to_camera[None],
+        frame_count,
+        axis=0,
+    )
+    pelvis_reference_camera = _transform_points(
+        repeated_reference,
+        hip_world,
+    )
+    if np.count_nonzero(
+        np.isfinite(pelvis_reference_camera).all(axis=1)
+    ) < 2:
+        return None
+    shoulder_center_world = 0.5 * (
+        transforms["leftArm"][:, :3, 3]
+        + transforms["rightArm"][:, :3, 3]
+    )
+    shoulder_center_reference_camera = _transform_points(
+        repeated_reference,
+        shoulder_center_world,
+    )
+    if np.count_nonzero(
+        np.isfinite(shoulder_center_reference_camera).all(axis=1)
+    ) < 2:
+        return None
+
+    upper_key = next(
+        (
+            key
+            for key in (
+                "transforms/neck4",
+                "transforms/neck3",
+                "transforms/spine7",
+            )
+            if key in handle
+        ),
+        None,
+    )
+    if upper_key is None:
+        upper_world = np.asarray(
+            handle["transforms/camera"],
+            dtype=np.float64,
+        )[:, :3, 3]
+    else:
+        upper = np.asarray(handle[upper_key], dtype=np.float64)
+        if upper.shape != (frame_count, 4, 4):
+            raise ValueError(
+                f"{upper_key} must have shape {(frame_count, 4, 4)}, "
+                f"got {upper.shape}"
+            )
+        upper_world = upper[:, :3, 3]
+    torso_vectors = upper_world - hip_world
+    valid_torso = np.isfinite(torso_vectors).all(axis=1)
+    if np.count_nonzero(valid_torso) < 2:
+        return None
+    torso_up = np.median(torso_vectors[valid_torso], axis=0)
+    if np.linalg.norm(torso_up) <= 1e-6:
+        return None
+    up_axis = int(np.argmax(np.abs(torso_up)))
+    world_up = np.zeros(3, dtype=np.float64)
+    world_up[up_axis] = np.sign(torso_up[up_axis])
+
+    raw_source = handle.attrs.get(
+        "human_to_robot_body_alignment_source",
+        "hdf5_upper_body",
+    )
+    if isinstance(raw_source, bytes):
+        raw_source = raw_source.decode("utf-8")
+    return SourceBodyAlignment(
+        pelvis_reference_camera=pelvis_reference_camera,
+        shoulder_center_reference_camera=(
+            shoulder_center_reference_camera
+        ),
+        arm_lengths=np.asarray(arm_lengths, dtype=np.float64),
+        world_up=world_up,
+        source=str(raw_source),
     )
 
 
@@ -443,23 +603,22 @@ def _hdf5_hand_landmarks_reference_camera(
     """Load a complete articulated track when all 25 landmarks are present."""
 
     if not all(
-        key in handle for key in _hdf5_hand_landmark_keys(side)
+        key in handle for key in _hdf5_hand_landmark_transform_keys(side)
     ):
         return None
 
     for name in HAND_LANDMARK_NAMES:
         transform = handle[f"transforms/{side}{name}"]
-        confidence = handle[f"confidences/{side}{name}"]
         if transform.shape != (frame_count, 4, 4):
             raise ValueError(
                 f"transforms/{side}{name} must have shape "
                 f"{(frame_count, 4, 4)}, got {transform.shape}"
             )
-        if confidence.shape != (frame_count,):
-            raise ValueError(
-                f"confidences/{side}{name} must have shape "
-                f"{(frame_count,)}, got {confidence.shape}"
-            )
+        _hdf5_optional_confidence(
+            handle,
+            key=f"confidences/{side}{name}",
+            frame_count=frame_count,
+        )
 
     transforms_world = np.stack(
         [
@@ -473,9 +632,10 @@ def _hdf5_hand_landmarks_reference_camera(
     )
     confidence = np.stack(
         [
-            np.asarray(
-                handle[f"confidences/{side}{name}"],
-                dtype=np.float64,
+            _hdf5_optional_confidence(
+                handle,
+                key=f"confidences/{side}{name}",
+                frame_count=frame_count,
             )
             for name in HAND_LANDMARK_NAMES
         ],
@@ -520,22 +680,26 @@ def _hdf5_hand_landmarks_reference_camera(
 def _hdf5_hand_usable(handle: h5py.File, *, side: str) -> bool:
     if (
         "transforms/camera" not in handle
-        or not all(key in handle for key in _hdf5_hand_keys(side))
+        or not all(
+            key in handle for key in _hdf5_hand_transform_keys(side)
+        )
     ):
         return False
     frame_count = int(handle["transforms/camera"].shape[0])
     valid = np.ones(frame_count, dtype=bool)
     for name in HAND_KEYPOINT_NAMES:
         transform = handle[f"transforms/{side}{name}"]
-        confidence = handle[f"confidences/{side}{name}"]
-        if transform.shape != (frame_count, 4, 4) or confidence.shape != (
-            frame_count,
-        ):
+        if transform.shape != (frame_count, 4, 4):
             return False
-        confidence_values = np.asarray(confidence, dtype=np.float64)
         valid &= np.isfinite(transform[:, :3, 3]).all(axis=1)
-        valid &= np.isfinite(confidence_values)
-        valid &= confidence_values > 0.0
+        confidence_key = f"confidences/{side}{name}"
+        if confidence_key in handle:
+            confidence = handle[confidence_key]
+            if confidence.shape != (frame_count,):
+                return False
+            confidence_values = np.asarray(confidence, dtype=np.float64)
+            valid &= np.isfinite(confidence_values)
+            valid &= confidence_values > 0.0
     return int(valid.sum()) >= 2
 
 
@@ -545,23 +709,21 @@ def _hdf5_rigid_palm_usable(handle: h5py.File, *, side: str) -> bool:
     if (
         "transforms/camera" not in handle
         or transform_key not in handle
-        or confidence_key not in handle
     ):
         return False
     frame_count = int(handle["transforms/camera"].shape[0])
     transform = handle[transform_key]
-    confidence = handle[confidence_key]
-    if transform.shape != (frame_count, 4, 4) or confidence.shape != (
-        frame_count,
-    ):
+    if transform.shape != (frame_count, 4, 4):
         return False
     transform_values = np.asarray(transform, dtype=np.float64)
-    confidence_values = np.asarray(confidence, dtype=np.float64)
-    valid = (
-        np.isfinite(transform_values[:, :3, :]).all(axis=(1, 2))
-        & np.isfinite(confidence_values)
-        & (confidence_values > 0.0)
-    )
+    valid = np.isfinite(transform_values[:, :3, :]).all(axis=(1, 2))
+    if confidence_key in handle:
+        confidence = handle[confidence_key]
+        if confidence.shape != (frame_count,):
+            return False
+        confidence_values = np.asarray(confidence, dtype=np.float64)
+        valid &= np.isfinite(confidence_values)
+        valid &= confidence_values > 0.0
     return int(valid.sum()) >= 2
 
 
@@ -627,7 +789,11 @@ def _hdf5_keypoints_reference_camera(
     )
     confidence = np.stack(
         [
-            np.asarray(handle[f"confidences/{side}{name}"], dtype=np.float64)
+            _hdf5_optional_confidence(
+                handle,
+                key=f"confidences/{side}{name}",
+                frame_count=transforms.shape[0],
+            )
             for name in HAND_KEYPOINT_NAMES
         ],
         axis=1,
@@ -658,7 +824,7 @@ def load_hand_trajectory(
     orientation_smooth_window: int = 15,
     polynomial_order: int = 2,
 ) -> HandTrajectory:
-    """Load fingertip-grasp or explicitly declared rigid-palm targets."""
+    """Load hand targets, defaulting absent confidence tracks to one."""
 
     path = Path(hdf5_path)
     with h5py.File(path, "r") as handle:
@@ -697,15 +863,15 @@ def load_hand_trajectory(
                 raise ValueError(
                     f"{path} lacks usable rigid palm transforms for "
                     f"{', '.join(missing_sides)} hand(s). Required "
-                    "leftHand/rightHand transforms and confidences with at "
-                    "least two valid frames."
+                    "leftHand/rightHand transforms with at least two valid "
+                    "frames; confidence is optional."
                 )
             required_names = ", ".join(HAND_KEYPOINT_NAMES)
             raise ValueError(
                 f"{path} lacks usable annotated keypoints for "
-                f"{', '.join(missing_sides)} hand(s). Required transforms "
-                f"and confidences: {required_names}, with at least two "
-                "valid frames."
+                f"{', '.join(missing_sides)} hand(s). Required transforms: "
+                f"{required_names}, with at least two valid frames; "
+                "confidence is optional."
             )
         keypoints = (
             {
@@ -725,9 +891,10 @@ def load_hand_trajectory(
                     handle[f"transforms/{side}Hand"],
                     dtype=np.float64,
                 ),
-                np.asarray(
-                    handle[f"confidences/{side}Hand"],
-                    dtype=np.float64,
+                _hdf5_optional_confidence(
+                    handle,
+                    key=f"confidences/{side}Hand",
+                    frame_count=frame_count,
                 ),
             )
             for side in ("left", "right")
@@ -741,6 +908,11 @@ def load_hand_trajectory(
             )
             for side in ("left", "right")
         }
+        body_alignment = _hdf5_body_alignment(
+            handle,
+            reference_world_to_camera=reference_world_to_camera,
+            frame_count=frame_count,
+        )
 
     aligned = (
         {
@@ -855,6 +1027,7 @@ def load_hand_trajectory(
         intrinsic=intrinsic,
         camera_to_world=camera_to_world,
         camera_motion=camera_motion,
+        body_alignment=body_alignment,
         left_articulated_hand=hand_landmark_tracks["left"],
         right_articulated_hand=hand_landmark_tracks["right"],
     )

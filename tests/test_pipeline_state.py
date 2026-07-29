@@ -241,6 +241,8 @@ class PipelineParserDefaultsTests(unittest.TestCase):
 
         self.assertFalse(hasattr(args, "width"))
         self.assertFalse(hasattr(args, "height"))
+        self.assertEqual(args.propainter_mode, "official")
+        self.assertTrue(args.propainter_fp16)
         self.assertEqual(args.propainter_subvideo_length, 80)
         self.assertEqual(args.propainter_context_frames, 10)
         self.assertEqual(args.propainter_roi_margin, 64)

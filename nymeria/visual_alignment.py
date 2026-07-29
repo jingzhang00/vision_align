@@ -94,6 +94,16 @@ PART_NAMES = (
     "L_Toe",
 )
 PART_INDEX = {name: index for index, name in enumerate(PART_NAMES)}
+ADAPTER_BODY_PARTS = (
+    ("neck4", "Head"),
+    ("hip", "Pelvis"),
+    ("leftArm", "L_UpperArm"),
+    ("leftForearm", "L_Forearm"),
+    ("leftHand", "L_Hand"),
+    ("rightArm", "R_UpperArm"),
+    ("rightForearm", "R_Forearm"),
+    ("rightHand", "R_Hand"),
+)
 
 
 @dataclass(frozen=True)
@@ -1048,11 +1058,40 @@ def world_space_hands(
         raise ValueError(
             "Expected [frame, head/left/right, 4, 4] XSens transforms"
         )
+    aligned, camera_to_world = world_space_parts(
+        xsens_parts,
+        world_from_device,
+        camera=camera,
+        hand_eye=hand_eye,
+        head_index=0,
+    )
+    return aligned[:, 1], aligned[:, 2], camera_to_world
+
+
+def world_space_parts(
+    xsens_parts: np.ndarray,
+    world_from_device: np.ndarray,
+    *,
+    camera: CameraCalibration,
+    hand_eye: HandEyeResult,
+    head_index: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Register arbitrary XSens body parts and RGB camera in Aria world."""
+
+    if (
+        xsens_parts.ndim != 4
+        or xsens_parts.shape[2:] != (4, 4)
+        or not 0 <= head_index < xsens_parts.shape[1]
+    ):
+        raise ValueError(
+            "Expected [frame, part, 4, 4] XSens transforms and valid head "
+            "index"
+        )
     if world_from_device.shape != (len(xsens_parts), 4, 4):
         raise ValueError(
             "Expected one [4, 4] Aria device pose for every XSens frame"
         )
-    xsens_head_from_world = np.linalg.inv(xsens_parts[:, 0])
+    xsens_head_from_world = np.linalg.inv(xsens_parts[:, head_index])
     device_from_xsens_head = np.repeat(
         hand_eye.device_from_xsens_head[None],
         len(xsens_parts),
@@ -1064,22 +1103,17 @@ def world_space_hands(
         device_from_xsens_head,
         xsens_head_from_world,
     )
-    left = np.einsum(
-        "nij,njk->nik",
+    aligned_parts = np.einsum(
+        "nij,nkjl->nkil",
         world_from_xsens_world,
-        xsens_parts[:, 1],
-    )
-    right = np.einsum(
-        "nij,njk->nik",
-        world_from_xsens_world,
-        xsens_parts[:, 2],
+        xsens_parts,
     )
     camera_to_world = np.einsum(
         "nij,jk->nik",
         world_from_device,
         camera.device_from_video_camera,
     )
-    return left, right, camera_to_world
+    return aligned_parts, camera_to_world
 
 
 def _fixed_base_motion_metrics(
@@ -1173,10 +1207,12 @@ def write_adapter_hdf5(
     camera_to_world: np.ndarray,
     left_hands: np.ndarray,
     right_hands: np.ndarray,
+    body_transforms: dict[str, np.ndarray],
     left_confidence: np.ndarray,
     right_confidence: np.ndarray,
     body_times: np.ndarray,
     source_frame_indices: np.ndarray,
+    participant_height_m: float,
 ) -> None:
     frame_count = len(left_hands)
     if (
@@ -1187,6 +1223,49 @@ def write_adapter_hdf5(
         or right_confidence.shape != (frame_count,)
     ):
         raise ValueError("Adapter hand arrays have inconsistent shapes")
+    expected_body = {
+        "hip",
+        "neck4",
+        "leftArm",
+        "leftForearm",
+        "rightArm",
+        "rightForearm",
+    }
+    if set(body_transforms) != expected_body:
+        raise ValueError(
+            "Nymeria adapter body transforms must be exactly "
+            f"{sorted(expected_body)}"
+        )
+    for name, transforms in body_transforms.items():
+        if transforms.shape != (frame_count, 4, 4):
+            raise ValueError(
+                f"Nymeria {name} transforms must have shape "
+                f"{(frame_count, 4, 4)}, got {transforms.shape}"
+            )
+    if not np.isfinite(participant_height_m) or participant_height_m <= 0.0:
+        raise ValueError("Nymeria participant height must be positive")
+    source_arm_lengths: list[float] = []
+    for side, hands in (("left", left_hands), ("right", right_hands)):
+        shoulder = body_transforms[f"{side}Arm"][:, :3, 3]
+        elbow = body_transforms[f"{side}Forearm"][:, :3, 3]
+        hand = hands[:, :3, 3]
+        lengths = np.linalg.norm(shoulder - elbow, axis=1) + np.linalg.norm(
+            elbow - hand,
+            axis=1,
+        )
+        valid = np.isfinite(lengths) & (lengths > 1e-4)
+        if np.count_nonzero(valid) < 2:
+            raise ValueError(
+                f"Nymeria {side} arm has fewer than two valid samples"
+            )
+        source_arm_lengths.append(float(np.median(lengths[valid])))
+    arm_to_height = np.asarray(source_arm_lengths) / participant_height_m
+    if np.any((arm_to_height < 0.20) | (arm_to_height > 0.50)):
+        raise ValueError(
+            "Nymeria XSens arm length is inconsistent with participant "
+            f"height: lengths={source_arm_lengths}, "
+            f"height={participant_height_m:.3f} m"
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.",
@@ -1211,6 +1290,14 @@ def write_adapter_hdf5(
                 handle.create_dataset(
                     f"confidences/{side}Hand", data=confidence
                 )
+            for name, transforms in body_transforms.items():
+                handle.create_dataset(
+                    f"transforms/{name}",
+                    data=transforms,
+                )
+            handle.attrs["human_to_robot_body_alignment_source"] = (
+                "nymeria_xsens_calibrated_upper_body"
+            )
             metadata = handle.create_group("nymeria")
             metadata.attrs["source_video"] = str(pair.video)
             metadata.attrs["source_narration"] = str(narration_path)
@@ -1224,6 +1311,14 @@ def write_adapter_hdf5(
                 "T_World_CameraUpright(t)"
             )
             metadata.attrs["action_text"] = pair.annotation.action_text
+            metadata.attrs["participant_height_m"] = participant_height_m
+            metadata.attrs["source_arm_lengths_m"] = source_arm_lengths
+            metadata.attrs["arm_length_to_height_ratio"] = arm_to_height
+            metadata.attrs["body_alignment"] = (
+                "XSens Pelvis, Head, UpperArm, Forearm, and Hand segments "
+                "registered into the Aria MPS world; exported under the "
+                "common upper-body transform names for morphology alignment"
+            )
             metadata.attrs["annotation_original_start_time"] = (
                 pair.annotation.original_start_time
             )
@@ -1269,6 +1364,7 @@ def _prepare_clip(
     slam: SlamTrajectory,
     hand_eye: HandEyeResult,
     narration_path: Path,
+    participant_height_m: float,
     timecode_offset_seconds: float,
     capture_timestamps: np.ndarray,
     full_digests: Sequence[bytes],
@@ -1365,21 +1461,32 @@ def _prepare_clip(
             )
 
         body_timestamps = body.timestamps_us[0] + body_times * 1.0e6
+        adapter_part_names = tuple(
+            source_name for _, source_name in ADAPTER_BODY_PARTS
+        )
         parts = interpolate_parts(
             body,
             body_timestamps,
-            [
-                PART_INDEX["Head"],
-                PART_INDEX["L_Hand"],
-                PART_INDEX["R_Hand"],
-            ],
+            [PART_INDEX[name] for name in adapter_part_names],
         )
-        left_hands, right_hands, camera_to_world = world_space_hands(
+        aligned_parts, camera_to_world = world_space_parts(
             parts,
             world_from_device,
             camera=camera,
             hand_eye=hand_eye,
+            head_index=adapter_part_names.index("Head"),
         )
+        aligned_by_name = {
+            adapter_name: aligned_parts[:, index]
+            for index, (adapter_name, _) in enumerate(ADAPTER_BODY_PARTS)
+        }
+        left_hands = aligned_by_name["leftHand"]
+        right_hands = aligned_by_name["rightHand"]
+        body_transforms = {
+            name: transforms
+            for name, transforms in aligned_by_name.items()
+            if name not in {"leftHand", "rightHand"}
+        }
         world_to_camera = np.linalg.inv(camera_to_world)
         left_observation = np.einsum(
             "nij,njk->nik",
@@ -1460,10 +1567,12 @@ def _prepare_clip(
             camera_to_world=camera_to_world,
             left_hands=left_hands,
             right_hands=right_hands,
+            body_transforms=body_transforms,
             left_confidence=left_confidence,
             right_confidence=right_confidence,
             body_times=body_times,
             source_frame_indices=source_frames,
+            participant_height_m=participant_height_m,
         )
         return (
             PreparedClip(
@@ -1507,6 +1616,7 @@ def prepare_clips(
     slam: SlamTrajectory,
     hand_eye: HandEyeResult,
     narration_path: Path,
+    participant_height_m: float,
     timecode_offset_seconds: float,
     hardware_encoding: bool,
     require_visible_hands: bool,
@@ -1556,6 +1666,7 @@ def prepare_clips(
                     slam=slam,
                     hand_eye=hand_eye,
                     narration_path=narration_path,
+                    participant_height_m=participant_height_m,
                     timecode_offset_seconds=timecode_offset_seconds,
                     capture_timestamps=capture_timestamps,
                     full_digests=full_digests,
@@ -1713,6 +1824,24 @@ def run(args: argparse.Namespace) -> int:
     episode_root = Path(args.episode_root).expanduser().resolve()
     if not episode_root.is_dir():
         raise NotADirectoryError(f"Nymeria episode not found: {episode_root}")
+    episode_metadata_path = episode_root / "metadata.json"
+    episode_metadata = _read_json(episode_metadata_path)
+    try:
+        participant_height_m = (
+            float(episode_metadata["participant_height_cm"]) / 100.0
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(
+            f"{episode_metadata_path} lacks a valid participant_height_cm"
+        ) from error
+    if (
+        not np.isfinite(participant_height_m)
+        or not 1.0 <= participant_height_m <= 2.5
+    ):
+        raise ValueError(
+            f"{episode_metadata_path} has implausible participant height "
+            f"{participant_height_m:.3f} m"
+        )
     video_directory = (
         Path(args.video_dir).expanduser().resolve()
         if args.video_dir is not None
@@ -1824,6 +1953,7 @@ def run(args: argparse.Namespace) -> int:
             slam=slam,
             hand_eye=hand_eye,
             narration_path=narration.path,
+            participant_height_m=participant_height_m,
             timecode_offset_seconds=narration.timecode_offset_seconds,
             hardware_encoding=args.hardware_encoding,
             require_visible_hands=args.require_visible_hands,
@@ -1837,9 +1967,13 @@ def run(args: argparse.Namespace) -> int:
             maximum_hand_displacement_m=args.maximum_hand_displacement_m,
         )
         report: dict[str, Any] = {
-            "schema_version": 3,
+            "schema_version": 4,
             "status": "prepared",
             "episode": episode_root.name,
+            "participant": {
+                "metadata": str(episode_metadata_path),
+                "height_m": participant_height_m,
+            },
             "video_directory": str(video_directory),
             "activity_narration": {
                 "path": str(narration.path),

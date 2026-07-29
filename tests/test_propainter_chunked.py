@@ -13,10 +13,8 @@ import numpy as np
 
 from human_to_robot.pipeline import build_parser as build_pipeline_parser
 from human_to_robot.propainter_chunked import (
-    BackgroundReference,
     ChunkPlan,
     MaskFrameInfo,
-    _apply_background_cleanup,
     compose_crop,
     plan_chunks,
     plan_transitions,
@@ -140,96 +138,6 @@ class RoiCompositionTest(unittest.TestCase):
         self.assertEqual(int(np.count_nonzero(result[:, :, 0])), 5)
         self.assertEqual(result[3, 3].tolist(), [255, 255, 255])
         self.assertEqual(result[0, 0].tolist(), [0, 0, 0])
-
-
-class BackgroundCleanupTest(unittest.TestCase):
-    def test_replaces_mask_and_connected_neutral_shadow(self) -> None:
-        background = np.full((48, 64, 3), (140, 160, 180), dtype=np.uint8)
-        source = background.copy()
-        source[16:34, 12:28] = (90, 120, 180)
-        source[18:32, 28:38] = (115, 135, 155)
-        source[5:11, 45:53] = (220, 50, 20)
-        mask = np.zeros((48, 64), dtype=np.uint8)
-        mask[16:34, 12:28] = 1
-        reference = BackgroundReference(
-            image=background,
-            observed=np.ones((48, 64), dtype=bool),
-            sample_count=8,
-            observed_fraction=1.0,
-            median_error=1.0,
-            reliable=True,
-        )
-
-        result = _apply_background_cleanup(
-            source=source,
-            inpainted=source.copy(),
-            mask=mask,
-            reference=reference,
-        )
-
-        np.testing.assert_allclose(result[24, 20], background[24, 20], atol=1)
-        self.assertLess(
-            np.mean(
-                np.abs(
-                    result[24, 32].astype(np.int16)
-                    - background[24, 32].astype(np.int16)
-                )
-            ),
-            np.mean(
-                np.abs(
-                    source[24, 32].astype(np.int16)
-                    - background[24, 32].astype(np.int16)
-                )
-            ),
-        )
-        np.testing.assert_array_equal(result[8, 48], source[8, 48])
-
-    def test_unreliable_reference_is_not_applied(self) -> None:
-        source = np.full((16, 16, 3), 80, dtype=np.uint8)
-        inpainted = np.full_like(source, 120)
-        reference = BackgroundReference(
-            image=np.full_like(source, 200),
-            observed=np.ones((16, 16), dtype=bool),
-            sample_count=4,
-            observed_fraction=1.0,
-            median_error=30.0,
-            reliable=False,
-        )
-
-        result = _apply_background_cleanup(
-            source=source,
-            inpainted=inpainted,
-            mask=np.ones((16, 16), dtype=np.uint8),
-            reference=reference,
-        )
-
-        np.testing.assert_array_equal(result, inpainted)
-
-    def test_failed_camera_alignment_keeps_propainter_result(self) -> None:
-        source = np.full((16, 16, 3), 80, dtype=np.uint8)
-        inpainted = np.full_like(source, 120)
-        reference = BackgroundReference(
-            image=np.full_like(source, 200),
-            observed=np.ones((16, 16), dtype=bool),
-            sample_count=1,
-            observed_fraction=1.0,
-            median_error=1.0,
-            reliable=True,
-            sample_indices=(0,),
-            samples=np.full((1, 16, 16, 3), 200, dtype=np.uint8),
-            sample_invalid=np.zeros((1, 16, 16), dtype=bool),
-            sample_descriptors=(np.zeros((1, 128), dtype=np.float32),),
-        )
-
-        result = _apply_background_cleanup(
-            source=source,
-            inpainted=inpainted,
-            mask=np.ones((16, 16), dtype=np.uint8),
-            frame_index=10,
-            reference=reference,
-        )
-
-        np.testing.assert_array_equal(result, inpainted)
 
 
 class PipelineDefaultsTest(unittest.TestCase):
@@ -457,7 +365,6 @@ class FakeRunnerEndToEndTest(unittest.TestCase):
                 max_chunk_pixel_frames=20 * 96 * 64,
                 max_clip_frames=20,
                 mask_dilation=0,
-                background_cleanup=False,
                 fp16=True,
                 hardware_encoding=False,
                 runner=self._fake_runner(calls, manifests),
@@ -470,6 +377,11 @@ class FakeRunnerEndToEndTest(unittest.TestCase):
             self.assertEqual(report["chunk_count"], 1)
             self.assertEqual(report["total_chunk_clip_frames"], 4)
             self.assertEqual(report["total_chunk_pixel_frames"], 16_384)
+            self.assertNotIn("background_cleanup", report)
+            self.assertNotIn(
+                "background_cleanup",
+                report["parameters"],
+            )
             self.assertEqual(len(calls), 1)
             self.assertEqual(
                 calls[0][:3],

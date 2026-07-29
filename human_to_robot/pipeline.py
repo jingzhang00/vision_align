@@ -72,11 +72,31 @@ class EpisodeInterrupted(RuntimeError):
     """A child process stopped before completing one episode."""
 
 
+class EpisodeSkipped(RuntimeError):
+    """An episode cannot produce an output for an expected data reason."""
+
+    def __init__(self, message: str, *, reason_code: str) -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
+
+
 def _is_interruption(error: BaseException) -> bool:
     return isinstance(
         error,
         (EpisodeInterrupted, KeyboardInterrupt, SystemExit),
     )
+
+
+def _is_skip(error: BaseException) -> bool:
+    return isinstance(error, EpisodeSkipped)
+
+
+def _episode_error_status(error: BaseException) -> str:
+    if _is_interruption(error):
+        return "interrupted"
+    if _is_skip(error):
+        return "skipped"
+    return "failed"
 
 
 def _natural_key(value: str) -> list[object]:
@@ -379,11 +399,7 @@ def _mark_running_stage_terminal(
         path,
         state,
         stage=stage,
-        status=(
-            "interrupted"
-            if _is_interruption(error)
-            else "failed"
-        ),
+        status=_episode_error_status(error),
         signature=signature,
         started_at_ns=(
             int(record["started_at_ns"])
@@ -553,6 +569,7 @@ def _prepare_stage_signature(
             propainter
             / "web-demos/hugging_face/inpainter/base_inpainter.py"
         ),
+        "official_propainter_code": propainter / "inference_propainter.py",
         "chunked_propainter_code": (
             repo / "human_to_robot/propainter_chunked.py"
         ),
@@ -594,6 +611,8 @@ def _prepare_stage_signature(
             "hardware_encoding": args.hardware_encoding,
             "binary_hands": args.binary_hands,
             "source_resolution": list(source_size),
+            "propainter_mode": args.propainter_mode,
+            "propainter_fp16": args.propainter_fp16,
             "propainter_subvideo_length": args.propainter_subvideo_length,
             "propainter_context_frames": args.propainter_context_frames,
             "propainter_roi_margin": args.propainter_roi_margin,
@@ -758,8 +777,16 @@ def _trajectory_complete(path: Path, expected_count: int) -> bool:
 
 def _auto_arm_prompt_frame(hdf5_path: Path, frame_count: int) -> int:
     with h5py.File(hdf5_path, "r") as handle:
-        left = np.asarray(handle["confidences/leftHand"], dtype=np.float32)
-        right = np.asarray(handle["confidences/rightHand"], dtype=np.float32)
+        confidences = {}
+        for side in ("left", "right"):
+            key = f"confidences/{side}Hand"
+            confidences[side] = (
+                np.asarray(handle[key], dtype=np.float32)
+                if key in handle
+                else np.ones(frame_count, dtype=np.float32)
+            )
+        left = confidences["left"]
+        right = confidences["right"]
     if left.shape != (frame_count,) or right.shape != (frame_count,):
         return frame_count // 2
     both = np.flatnonzero((left >= 0.5) & (right >= 0.5))
@@ -994,6 +1021,67 @@ def _publish_episode_outputs(
     return published_video, published_hdf5
 
 
+def _propainter_invocation(
+    *,
+    args: argparse.Namespace,
+    python: str,
+    video: Path,
+    mask_root: Path,
+    output_root: Path,
+    propainter: Path,
+    repo: Path,
+) -> tuple[list[str], Path]:
+    if args.propainter_mode == "official":
+        command = [
+            python,
+            str(propainter / "inference_propainter.py"),
+            "--video",
+            str(video),
+            "--mask",
+            str(mask_root),
+            "--output",
+            str(output_root),
+            "--subvideo_length",
+            str(args.propainter_subvideo_length),
+        ]
+        if args.propainter_fp16:
+            command.append("--fp16")
+        return command, propainter
+
+    command = [
+        python,
+        "-m",
+        "human_to_robot.propainter_chunked",
+        "--video",
+        str(video),
+        "--mask",
+        str(mask_root),
+        "--output",
+        str(output_root),
+        "--propainter-root",
+        str(propainter),
+        "--subvideo-length",
+        str(args.propainter_subvideo_length),
+        "--context-frames",
+        str(args.propainter_context_frames),
+        "--roi-margin",
+        str(args.propainter_roi_margin),
+        "--max-chunk-pixel-frames",
+        str(args.propainter_max_chunk_pixel_frames),
+        "--max-clip-frames",
+        str(args.propainter_max_clip_frames),
+        "--transition-frames",
+        str(args.propainter_transition_frames),
+        "--fp16" if args.propainter_fp16 else "--no-fp16",
+        (
+            "--hardware-encoding"
+            if args.hardware_encoding
+            else "--no-hardware-encoding"
+        ),
+    ]
+    return command, repo
+
+
 def _prepare_episode(
     episode: Episode,
     *,
@@ -1149,6 +1237,52 @@ def _prepare_episode(
             raise RuntimeError(f"SAM3 arm masks are incomplete: {sam_root}")
 
     inpaint_video = propainter_root / episode.video.stem / "inpaint_out.mp4"
+    if args.propainter_mode == "official":
+        propainter_signature_inputs = frozenset(
+            {
+                "video",
+                "raft_weight",
+                "flow_weight",
+                "propainter_weight",
+                "official_propainter_code",
+            }
+        )
+        propainter_signature_parameters = frozenset(
+            {
+                "python",
+                "propainter_mode",
+                "propainter_fp16",
+                "propainter_subvideo_length",
+            }
+        )
+    else:
+        propainter_signature_inputs = frozenset(
+            {
+                "video",
+                "raft_weight",
+                "flow_weight",
+                "propainter_weight",
+                "video_io_code",
+                "propainter_engine_code",
+                "chunked_propainter_code",
+                "propainter_worker_code",
+            }
+        )
+        propainter_signature_parameters = frozenset(
+            {
+                "python",
+                "hardware_encoding",
+                "propainter_mode",
+                "propainter_fp16",
+                "source_resolution",
+                "propainter_subvideo_length",
+                "propainter_context_frames",
+                "propainter_roi_margin",
+                "propainter_max_chunk_pixel_frames",
+                "propainter_max_clip_frames",
+                "propainter_transition_frames",
+            }
+        )
     reuse_inpaint = (
         reuse_existing_prepare
         and not sam_changed
@@ -1160,31 +1294,8 @@ def _prepare_episode(
         and _signature_subset_matches(
             previous_signature,
             prepare_signature,
-            input_names=frozenset(
-                {
-                    "video",
-                    "raft_weight",
-                    "flow_weight",
-                    "propainter_weight",
-                    "video_io_code",
-                    "propainter_engine_code",
-                    "chunked_propainter_code",
-                    "propainter_worker_code",
-                }
-            ),
-            parameter_names=frozenset(
-                {
-                    "python",
-                    "hardware_encoding",
-                    "source_resolution",
-                    "propainter_subvideo_length",
-                    "propainter_context_frames",
-                    "propainter_roi_margin",
-                    "propainter_max_chunk_pixel_frames",
-                    "propainter_max_clip_frames",
-                    "propainter_transition_frames",
-                }
-            ),
+            input_names=propainter_signature_inputs,
+            parameter_names=propainter_signature_parameters,
         )
     )
     if not reuse_inpaint:
@@ -1192,38 +1303,18 @@ def _prepare_episode(
         environment = os.environ.copy()
         environment.setdefault("MPLCONFIGDIR", "/tmp/vision_align_matplotlib")
         environment["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+        propainter_command, propainter_cwd = _propainter_invocation(
+            args=args,
+            python=python,
+            video=episode.video,
+            mask_root=sam_root / "arm_masks",
+            output_root=propainter_root,
+            propainter=propainter,
+            repo=repo,
+        )
         _run_logged(
-            [
-                python,
-                "-m",
-                "human_to_robot.propainter_chunked",
-                "--video",
-                str(episode.video),
-                "--mask",
-                str(sam_root / "arm_masks"),
-                "--output",
-                str(propainter_root),
-                "--propainter-root",
-                str(propainter),
-                "--subvideo-length",
-                str(args.propainter_subvideo_length),
-                "--context-frames",
-                str(args.propainter_context_frames),
-                "--roi-margin",
-                str(args.propainter_roi_margin),
-                "--max-chunk-pixel-frames",
-                str(args.propainter_max_chunk_pixel_frames),
-                "--max-clip-frames",
-                str(args.propainter_max_clip_frames),
-                "--transition-frames",
-                str(args.propainter_transition_frames),
-                (
-                    "--hardware-encoding"
-                    if args.hardware_encoding
-                    else "--no-hardware-encoding"
-                ),
-            ],
-            cwd=repo,
+            propainter_command,
+            cwd=propainter_cwd,
             environment=environment,
             log_path=log_path,
             progress=progress,
@@ -1276,6 +1367,8 @@ def _prepare_episode(
     )
     if not reuse_trajectory:
         prepare_changed = True
+        skip_report_path = g1_root / "episode_skip.json"
+        skip_report_path.unlink(missing_ok=True)
         retarget_command = [
             python,
             "-m",
@@ -1303,6 +1396,29 @@ def _prepare_episode(
             episode_started=started,
             stage_label="prepare",
         )
+        if skip_report_path.is_file():
+            try:
+                skip_report = json.loads(
+                    skip_report_path.read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError) as error:
+                raise RuntimeError(
+                    f"Invalid retarget skip report: {skip_report_path}"
+                ) from error
+            if (
+                not isinstance(skip_report, dict)
+                or skip_report.get("status") != "skipped"
+            ):
+                raise RuntimeError(
+                    f"Invalid retarget skip report: {skip_report_path}"
+                )
+            reason_code = skip_report.get("reason_code")
+            reason = skip_report.get("reason")
+            if not isinstance(reason_code, str) or not isinstance(reason, str):
+                raise RuntimeError(
+                    f"Incomplete retarget skip report: {skip_report_path}"
+                )
+            raise EpisodeSkipped(reason, reason_code=reason_code)
         if not _trajectory_complete(
             g1_root / "g1_trajectory.npz", frame_count
         ):
@@ -1753,14 +1869,19 @@ def _episode_error_report(
         "task": episode.task_name,
         "task_relative": episode.task_relative.as_posix(),
         "episode": episode.name,
-        "status": "interrupted" if _is_interruption(error) else "failed",
+        "status": _episode_error_status(error),
+        "episode_path": str(episode.hdf5),
         "video": str(episode.video),
         "hdf5": str(episode.hdf5),
         "renderer": "isaacsim",
         "elapsed_seconds": elapsed_seconds,
-        "error": f"{type(error).__name__}: {error}",
         "log": str(episode.output_root / "pipeline.log"),
     }
+    if isinstance(error, EpisodeSkipped):
+        report["reason_code"] = error.reason_code
+        report["reason"] = str(error)
+    else:
+        report["error"] = f"{type(error).__name__}: {error}"
     _write_json(episode.output_root / "episode_report.json", report)
     return report
 
@@ -1794,6 +1915,35 @@ def _persist_failure_diagnostics(
     return persisted
 
 
+def _persist_skip_diagnostics(
+    episode: Episode,
+    *,
+    output: Path,
+    report: dict[str, object],
+) -> dict[str, object]:
+    skip_root = (
+        _task_output_root(output.resolve(), episode)
+        / ".skipped"
+        / episode.name
+    )
+    skip_root.mkdir(parents=True, exist_ok=True)
+    source_log = episode.output_root / "pipeline.log"
+    published_log = skip_root / "pipeline.log"
+    if source_log.is_file():
+        _atomic_copy(source_log, published_log)
+    else:
+        published_log.write_text(
+            f"{report.get('reason', 'Episode skipped')}\n",
+            encoding="utf-8",
+        )
+    persisted = dict(report)
+    persisted["log"] = str(published_log)
+    report_path = skip_root / "episode_report.json"
+    _write_json(report_path, persisted)
+    tqdm.write(f"Skipped episode recorded: {report_path}")
+    return persisted
+
+
 def _record_episode_error(
     episode: Episode,
     *,
@@ -1809,6 +1959,12 @@ def _record_episode_error(
     )
     if debug:
         return report
+    if _is_skip(error):
+        return _persist_skip_diagnostics(
+            episode,
+            output=output,
+            report=report,
+        )
     return _persist_failure_diagnostics(
         episode,
         output=output,
@@ -1835,7 +1991,12 @@ def _print_episode_error(
     error: BaseException,
     interrupted: bool = False,
 ) -> None:
-    outcome = "Interrupted" if interrupted else "Failed"
+    if interrupted:
+        outcome = "Interrupted"
+    elif _is_skip(error):
+        outcome = "Skipped"
+    else:
+        outcome = "Failed"
     tqdm.write(
         f"{outcome} {_episode_label(episode)} after "
         f"{_format_duration(elapsed_seconds)}:\n"
@@ -1861,6 +2022,15 @@ def _make_batch_report(
         report.get("status") in {"failed", "interrupted"}
         for report in episode_reports
     )
+    skipped = sum(
+        report.get("status") == "skipped" for report in episode_reports
+    )
+    skipped_paths = [
+        str(report["episode_path"])
+        for report in episode_reports
+        if report.get("status") == "skipped"
+        and isinstance(report.get("episode_path"), str)
+    ]
     report: dict[str, object] = {
         "input_folder": str(folder),
         "output_root": str(output),
@@ -1869,9 +2039,11 @@ def _make_batch_report(
         "task_count": discovered_task_count,
         "episode_count": discovered_episode_count,
         "completed_episode_count": completed,
+        "skipped_episode_count": skipped,
+        "skipped_episode_paths": skipped_paths,
         "failed_episode_count": failed,
         "pending_episode_count": max(
-            0, discovered_episode_count - completed - failed
+            0, discovered_episode_count - completed - skipped - failed
         ),
         "elapsed_seconds": elapsed_seconds,
         "episodes": episode_reports,
@@ -1933,27 +2105,30 @@ def _run_pipeline(
         tqdm.write(f"Isaac runtime: {isaac_runtime.description}")
         if args.propainter_subvideo_length < 20:
             raise ValueError("--propainter-subvideo-length must be at least 20")
-        if args.propainter_context_frames < 0:
-            raise ValueError("--propainter-context-frames cannot be negative")
-        if args.propainter_max_chunk_pixel_frames <= 0:
-            raise ValueError(
-                "--propainter-max-chunk-pixel-frames must be positive"
-            )
-        if args.propainter_roi_margin < 0:
-            raise ValueError("--propainter-roi-margin cannot be negative")
-        if args.propainter_roi_margin < 4:
-            raise ValueError(
-                "--propainter-roi-margin must be at least the 4-pixel "
-                "inpaint mask dilation"
-            )
-        if args.propainter_transition_frames < 0:
-            raise ValueError(
-                "--propainter-transition-frames cannot be negative"
-            )
-        if args.propainter_max_clip_frames < 20:
-            raise ValueError(
-                "--propainter-max-clip-frames must be at least 20"
-            )
+        if args.propainter_mode == "chunked":
+            if args.propainter_context_frames < 0:
+                raise ValueError(
+                    "--propainter-context-frames cannot be negative"
+                )
+            if args.propainter_max_chunk_pixel_frames <= 0:
+                raise ValueError(
+                    "--propainter-max-chunk-pixel-frames must be positive"
+                )
+            if args.propainter_roi_margin < 0:
+                raise ValueError("--propainter-roi-margin cannot be negative")
+            if args.propainter_roi_margin < 4:
+                raise ValueError(
+                    "--propainter-roi-margin must be at least the 4-pixel "
+                    "inpaint mask dilation"
+                )
+            if args.propainter_transition_frames < 0:
+                raise ValueError(
+                    "--propainter-transition-frames cannot be negative"
+                )
+            if args.propainter_max_clip_frames < 20:
+                raise ValueError(
+                    "--propainter-max-clip-frames must be at least 20"
+                )
         for name in (
             "raft-things.pth",
             "recurrent_flow_completion.pth",
@@ -2247,14 +2422,19 @@ def _run_pipeline(
                 report.get("status") == "completed"
                 for report in ordered_reports
             )
+            task_skipped = sum(
+                report.get("status") == "skipped"
+                for report in ordered_reports
+            )
             task_status = (
                 "completed"
-                if task_completed == len(task_episodes)
+                if task_completed + task_skipped == len(task_episodes)
                 else "failed"
             )
             tqdm.write(
                 f"Task {task_label} {task_status}: "
-                f"{task_completed}/{len(task_episodes)} episodes, "
+                f"{task_completed} completed, {task_skipped} skipped, "
+                f"{len(task_episodes)} total, "
                 f"elapsed {_format_duration(task_seconds)}"
             )
             partial_batch_reports = [
@@ -2310,7 +2490,7 @@ def _run_pipeline(
         "completed"
         if len(ordered_batch_reports) == len(episodes)
         and all(
-            report.get("status") == "completed"
+            report.get("status") in {"completed", "skipped"}
             for report in ordered_batch_reports
         )
         else "failed"
@@ -2327,7 +2507,9 @@ def _run_pipeline(
     _write_json(workspace_output / "batch_report.json", batch_report)
     tqdm.write(
         f"Batch {batch_status}: "
-        f"{batch_report['completed_episode_count']}/{len(episodes)} episodes, "
+        f"{batch_report['completed_episode_count']} completed, "
+        f"{batch_report['skipped_episode_count']} skipped, "
+        f"{len(episodes)} total, "
         f"{len(task_groups)} tasks, "
         f"elapsed {_format_duration(batch_seconds)}"
     )
@@ -2418,6 +2600,21 @@ def build_parser() -> argparse.ArgumentParser:
             "track to six independent O6 motors and falls back to continuous "
             "fingertip width when unavailable (default: true)"
         ),
+    )
+    parser.add_argument(
+        "--propainter-mode",
+        choices=("official", "chunked"),
+        default="official",
+        help=(
+            "Use the official full-frame whole-video ProPainter entry point "
+            "(default), or the memory-bounded ROI chunk wrapper"
+        ),
+    )
+    parser.add_argument(
+        "--propainter-fp16",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use half precision after official RAFT inference (default: true)",
     )
     parser.add_argument(
         "--propainter-subvideo-length",

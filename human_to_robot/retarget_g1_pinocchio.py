@@ -129,15 +129,29 @@ HAND_TIP_LOCAL_OFFSETS = {
     "pinky": np.array([0.01458, 0.0, 0.03707], dtype=np.float64),
 }
 PALM_FRAMES = ("left_palm", "right_palm")
+G1_BASE_FRAME = "pelvis"
+G1_SUPPORT_FRAMES = ("LL_FOOT", "LR_FOOT")
+G1_SHOULDER_JOINTS = (
+    "left_shoulder_pitch_joint",
+    "right_shoulder_pitch_joint",
+)
 PALM_OFFSET_FROM_WRIST = np.array([0.08, 0.0, 0.0], dtype=np.float64)
-ACTION_SCALE = 0.84
 BASE_GRID_POINTS_PER_AXIS = 5
 BASE_YAW_OFFSETS_RAD = np.deg2rad(
-    np.asarray([0.0, -30.0, 30.0, -60.0, 60.0], dtype=np.float64)
+    np.asarray(
+        [0.0, -15.0, 15.0, -30.0, 30.0, -45.0, 45.0, -60.0, 60.0],
+        dtype=np.float64,
+    )
 )
 IK_FEASIBLE_POSITION_ERROR_M = 0.02
 IK_FEASIBLE_ORIENTATION_ERROR_RAD = np.deg2rad(15.0)
-TRAJECTORY_SCHEMA_VERSION = 9
+IK_ORIENTATION_WEIGHT = 0.05
+TRAJECTORY_SCHEMA_VERSION = 12
+EPISODE_SKIP_REPORT = "episode_skip.json"
+
+
+class NoCommonBasePlacementError(RuntimeError):
+    """The representative end-effector targets share no reachable base pose."""
 
 
 @dataclass(frozen=True)
@@ -167,13 +181,37 @@ class PinocchioRetargetResult:
     hand_action_diagnostics: dict[str, dict[str, object]]
     hand_tcp_translations: np.ndarray
     hand_tcp_rotations: np.ndarray
+    base_frame: str
+    nominal_pelvis_height: float
     base_position: np.ndarray
     base_rotation: np.ndarray
     base_search_keyframes: np.ndarray
     base_search_centroid: np.ndarray
     maximum_reach: float
     scale: float
+    scale_source: str
+    source_arm_lengths: np.ndarray
+    robot_arm_lengths: np.ndarray
+    pelvis_anchor_reference_camera: np.ndarray
+    shoulder_anchor_reference_camera: np.ndarray
+    robot_shoulder_center_from_pelvis: np.ndarray
+    mapped_shoulder_center: np.ndarray
+    camera_origin: np.ndarray
+    world_from_reference_camera: np.ndarray
     search_results: list[dict[str, object]]
+
+
+@dataclass(frozen=True)
+class _SpatialAlignment:
+    scale: float
+    scale_source: str
+    source_arm_lengths: np.ndarray
+    robot_arm_lengths: np.ndarray
+    pelvis_anchor_reference_camera: np.ndarray
+    shoulder_anchor_reference_camera: np.ndarray
+    robot_shoulder_center_from_pelvis: np.ndarray
+    camera_origin: np.ndarray
+    world_from_reference_camera: np.ndarray
 
 
 def build_pinocchio_g1(urdf_path: str | Path) -> pin.Model:
@@ -1345,6 +1383,7 @@ def _map_action_targets(
     camera_origin: np.ndarray,
     tcp_translations: np.ndarray,
     tcp_rotations: np.ndarray,
+    world_from_reference_camera: np.ndarray = CV_TO_G1_WORLD,
 ) -> tuple[
     np.ndarray,
     np.ndarray,
@@ -1365,6 +1404,10 @@ def _map_action_targets(
     if tcp_rotations.shape != (2, 3, 3):
         raise ValueError(
             f"TCP rotations must have shape (2, 3, 3), got {tcp_rotations.shape}"
+        )
+    if world_from_reference_camera.shape != (3, 3):
+        raise ValueError(
+            "world_from_reference_camera must have shape (3, 3)"
         )
 
     target_mode = getattr(
@@ -1391,11 +1434,11 @@ def _map_action_targets(
         )
     ):
         action_position = camera_origin + (
-            CV_TO_G1_WORLD @ (scale * positions).T
+            world_from_reference_camera @ (scale * positions).T
         ).T
         action_rotation = np.einsum(
             "ij,njk->nik",
-            CV_TO_G1_WORLD,
+            world_from_reference_camera,
             rotations,
         )
         if target_mode == RIGID_PALM_TARGET:
@@ -1446,16 +1489,17 @@ def _camera_poses(
     trajectory: HandTrajectory,
     scale: float,
     camera_origin: np.ndarray,
+    world_from_reference_camera: np.ndarray = CV_TO_G1_WORLD,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     positions: list[np.ndarray] = []
     cv_rotations: list[np.ndarray] = []
     gl_quaternions: list[np.ndarray] = []
     cv_to_gl = np.diag([1.0, -1.0, -1.0])
     for motion in trajectory.camera_motion:
-        position = camera_origin + CV_TO_G1_WORLD @ (
+        position = camera_origin + world_from_reference_camera @ (
             scale * motion[:3, 3]
         )
-        world_from_cv = CV_TO_G1_WORLD @ motion[:3, :3]
+        world_from_cv = world_from_reference_camera @ motion[:3, :3]
         world_from_gl = world_from_cv @ cv_to_gl
         xyzw = Rotation.from_matrix(world_from_gl).as_quat()
         positions.append(position)
@@ -1567,8 +1611,294 @@ def _robot_maximum_reach(model: pin.Model) -> float:
     return float(max(reaches))
 
 
+def _robot_nominal_pelvis_height(model: pin.Model) -> float:
+    """Return the upright pelvis height that puts both feet on z=0."""
+
+    data = model.createData()
+    pin.forwardKinematics(model, data, pin.neutral(model))
+    pin.updateFramePlacements(model, data)
+    support_heights: list[float] = []
+    for frame_name in G1_SUPPORT_FRAMES:
+        frame_id = model.getFrameId(frame_name)
+        if frame_id >= model.nframes:
+            raise ValueError(
+                f"G1 URDF is missing support frame {frame_name!r}"
+            )
+        support_heights.append(float(data.oMf[frame_id].translation[2]))
+    pelvis_height = -min(support_heights)
+    if not np.isfinite(pelvis_height) or pelvis_height <= 0.0:
+        raise ValueError(
+            "Could not derive a positive neutral pelvis height from "
+            f"{G1_SUPPORT_FRAMES}"
+        )
+    return pelvis_height
+
+
+def _robot_arm_lengths(model: pin.Model) -> np.ndarray:
+    """Return shoulder-to-palm kinematic chain lengths for both G1 arms."""
+
+    lengths: list[float] = []
+    for side, shoulder_name in zip(
+        ("left", "right"),
+        G1_SHOULDER_JOINTS,
+        strict=True,
+    ):
+        shoulder_id = model.getJointId(shoulder_name)
+        if shoulder_id >= model.njoints:
+            raise ValueError(f"G1 URDF is missing joint {shoulder_name!r}")
+        palm_id = model.getFrameId(f"{side}_palm")
+        if palm_id >= model.nframes:
+            raise ValueError(f"G1 URDF is missing {side!r} palm frame")
+        palm = model.frames[palm_id]
+        length = float(np.linalg.norm(palm.placement.translation))
+        joint_id = palm.parent
+        while joint_id != shoulder_id and joint_id > 0:
+            length += float(
+                np.linalg.norm(model.jointPlacements[joint_id].translation)
+            )
+            joint_id = model.parents[joint_id]
+        if joint_id != shoulder_id or not np.isfinite(length) or length <= 0.0:
+            raise ValueError(
+                f"Could not derive the {side} shoulder-to-palm chain length"
+            )
+        lengths.append(length)
+    return np.asarray(lengths, dtype=np.float64)
+
+
+def _robot_shoulder_center(model: pin.Model) -> np.ndarray:
+    """Return the neutral shoulder midpoint in the pelvis frame."""
+
+    data = model.createData()
+    pin.forwardKinematics(model, data, pin.neutral(model))
+    centers: list[np.ndarray] = []
+    for joint_name in G1_SHOULDER_JOINTS:
+        joint_id = model.getJointId(joint_name)
+        if joint_id >= model.njoints:
+            raise ValueError(f"G1 URDF is missing joint {joint_name!r}")
+        centers.append(
+            np.asarray(data.oMi[joint_id].translation, dtype=np.float64)
+        )
+    shoulder_center = np.mean(centers, axis=0)
+    if shoulder_center.shape != (3,) or not np.isfinite(
+        shoulder_center
+    ).all():
+        raise ValueError("G1 neutral shoulder center is invalid")
+    return shoulder_center
+
+
+def _episode_reference_camera_rotation(
+    trajectory: HandTrajectory,
+) -> np.ndarray:
+    """Level the source world while retaining the episode camera attitude."""
+
+    body = trajectory.body_alignment
+    if body is None:
+        raise ValueError("Episode body alignment is unavailable")
+    source_from_reference_camera = Rotation.from_matrix(
+        np.asarray(
+            trajectory.camera_to_world[0, :3, :3],
+            dtype=np.float64,
+        )
+    ).as_matrix()
+    source_up = np.asarray(body.world_up, dtype=np.float64)
+    if (
+        source_from_reference_camera.shape != (3, 3)
+        or source_up.shape != (3,)
+        or not np.isfinite(source_from_reference_camera).all()
+        or not np.isfinite(source_up).all()
+        or not np.isclose(np.linalg.norm(source_up), 1.0, atol=1e-8)
+    ):
+        raise ValueError("Episode camera rotation or world-up axis is invalid")
+
+    source_forward = source_from_reference_camera[:, 2]
+    level_forward = source_forward - source_up * float(
+        np.dot(source_up, source_forward)
+    )
+    if np.linalg.norm(level_forward) <= 1e-6:
+        source_right = source_from_reference_camera[:, 0]
+        level_right = source_right - source_up * float(
+            np.dot(source_up, source_right)
+        )
+        if np.linalg.norm(level_right) <= 1e-6:
+            raise ValueError(
+                "Episode camera axes are degenerate relative to world up"
+            )
+        level_right /= np.linalg.norm(level_right)
+        level_forward = np.cross(level_right, source_up)
+    level_forward /= np.linalg.norm(level_forward)
+    source_left = np.cross(source_up, level_forward)
+    source_left /= np.linalg.norm(source_left)
+    level_forward = np.cross(source_left, source_up)
+    source_basis = np.column_stack(
+        [level_forward, source_left, source_up]
+    )
+    aligned_from_source = source_basis.T
+    world_from_reference_camera = (
+        aligned_from_source @ source_from_reference_camera
+    )
+    if not np.allclose(
+        world_from_reference_camera.T @ world_from_reference_camera,
+        np.eye(3),
+        rtol=0.0,
+        atol=1e-8,
+    ) or not np.isclose(
+        np.linalg.det(world_from_reference_camera),
+        1.0,
+        rtol=0.0,
+        atol=1e-8,
+    ):
+        raise ValueError("Derived episode camera rotation is not in SO(3)")
+    return world_from_reference_camera
+
+
+def _derive_spatial_alignment(
+    model: pin.Model,
+    trajectory: HandTrajectory,
+    *,
+    nominal_pelvis_height: float,
+    scale: float | None,
+    camera_origin: np.ndarray | None,
+) -> _SpatialAlignment:
+    """Align an episode body rig to G1 before retargeting its hands."""
+
+    body = trajectory.body_alignment
+    if body is None and (scale is None or camera_origin is None):
+        raise ValueError(
+            "HDF5 lacks the upper-body anchors required for spatial "
+            "alignment (hip, left/right Arm, Forearm, and Hand). Provide "
+            "an explicit scale and camera origin only for a pre-calibrated "
+            "adapter."
+        )
+    robot_arm_lengths = _robot_arm_lengths(model)
+    source_arm_lengths = (
+        np.asarray(body.arm_lengths, dtype=np.float64)
+        if body is not None
+        else np.full(2, np.nan, dtype=np.float64)
+    )
+    if scale is None:
+        if (
+            source_arm_lengths.shape != (2,)
+            or not np.isfinite(source_arm_lengths).all()
+            or np.any(source_arm_lengths <= 0.0)
+        ):
+            raise ValueError("Episode source arm lengths are invalid")
+        scale = float(np.median(robot_arm_lengths / source_arm_lengths))
+        scale_source = (
+            "median G1 shoulder-to-palm chain length divided by episode "
+            f"shoulder-to-hand chain length ({body.source})"
+        )
+    else:
+        scale = float(scale)
+        scale_source = "explicit caller override"
+    if not np.isfinite(scale) or scale <= 0.0:
+        raise ValueError("Spatial scale must be positive and finite")
+    robot_shoulder_center = _robot_shoulder_center(model)
+
+    if body is None:
+        world_from_reference_camera = CV_TO_G1_WORLD.copy()
+        pelvis_anchor = np.full(3, np.nan, dtype=np.float64)
+        shoulder_anchor = np.full(3, np.nan, dtype=np.float64)
+    else:
+        world_from_reference_camera = _episode_reference_camera_rotation(
+            trajectory
+        )
+        pelvis_samples = np.asarray(
+            body.pelvis_reference_camera,
+            dtype=np.float64,
+        )
+        valid = np.isfinite(pelvis_samples).all(axis=1)
+        if np.count_nonzero(valid) < 2:
+            raise ValueError("Episode pelvis anchor has fewer than two samples")
+        pelvis_anchor = np.median(pelvis_samples[valid], axis=0)
+        shoulder_samples = np.asarray(
+            body.shoulder_center_reference_camera,
+            dtype=np.float64,
+        )
+        if (
+            shoulder_samples.ndim != 2
+            or shoulder_samples.shape[1] != 3
+        ):
+            raise ValueError(
+                "Episode shoulder-center anchor must have shape [N, 3]"
+            )
+        valid = np.isfinite(shoulder_samples).all(axis=1)
+        if np.count_nonzero(valid) < 2:
+            raise ValueError(
+                "Episode shoulder-center anchor has fewer than two samples"
+            )
+        shoulder_anchor = np.median(shoulder_samples[valid], axis=0)
+
+    if camera_origin is None:
+        target_pelvis = np.asarray(
+            [0.0, 0.0, nominal_pelvis_height],
+            dtype=np.float64,
+        )
+        camera_origin = target_pelvis - world_from_reference_camera @ (
+            scale * pelvis_anchor
+        )
+    else:
+        camera_origin = np.asarray(camera_origin, dtype=np.float64)
+    if camera_origin.shape != (3,) or not np.isfinite(camera_origin).all():
+        raise ValueError("Camera origin must be a finite 3-vector")
+
+    return _SpatialAlignment(
+        scale=scale,
+        scale_source=scale_source,
+        source_arm_lengths=source_arm_lengths,
+        robot_arm_lengths=robot_arm_lengths,
+        pelvis_anchor_reference_camera=pelvis_anchor,
+        shoulder_anchor_reference_camera=shoulder_anchor,
+        robot_shoulder_center_from_pelvis=robot_shoulder_center,
+        camera_origin=camera_origin,
+        world_from_reference_camera=world_from_reference_camera,
+    )
+
+
 def _yaw_rotation(yaw: float) -> np.ndarray:
     return Rotation.from_euler("z", yaw).as_matrix()
+
+
+def _shoulder_aligned_base_candidates(
+    mapped_shoulder_center: np.ndarray,
+    robot_shoulder_center_from_pelvis: np.ndarray,
+    *,
+    trajectory_centroid: np.ndarray,
+) -> Iterable[tuple[np.ndarray, np.ndarray]]:
+    """Derive pelvis translations that align the two shoulder centers.
+
+    For every candidate yaw ``R``, the pelvis translation is solved exactly:
+
+    ``p_pelvis = p_source_shoulder - R @ p_robot_shoulder_from_pelvis``.
+
+    Translation is therefore not an independent search variable.  This avoids
+    transferring the source hip-to-shoulder length to a robot with a different
+    torso morphology.
+    """
+
+    for name, value in (
+        ("mapped_shoulder_center", mapped_shoulder_center),
+        (
+            "robot_shoulder_center_from_pelvis",
+            robot_shoulder_center_from_pelvis,
+        ),
+        ("trajectory_centroid", trajectory_centroid),
+    ):
+        if value.shape != (3,) or not np.isfinite(value).all():
+            raise ValueError(f"{name} must be a finite 3-vector")
+
+    direction = trajectory_centroid[:2] - mapped_shoulder_center[:2]
+    facing_yaw = (
+        float(np.arctan2(direction[1], direction[0]))
+        if np.linalg.norm(direction) > 1e-9
+        else 0.0
+    )
+    for yaw_offset in BASE_YAW_OFFSETS_RAD:
+        rotation = _yaw_rotation(facing_yaw + float(yaw_offset))
+        position = (
+            mapped_shoulder_center
+            - rotation @ robot_shoulder_center_from_pelvis
+        )
+        yield position, rotation
 
 
 def _base_candidates(
@@ -1576,8 +1906,14 @@ def _base_candidates(
     *,
     trajectory_centroid: np.ndarray,
     r_max: float,
+    base_height: float | None = None,
 ) -> Iterable[tuple[np.ndarray, np.ndarray]]:
-    """Grid base translations around the trajectory centroid within r_max."""
+    """Grid upright pelvis poses around the trajectory centroid within r_max.
+
+    ``base_height`` fixes the humanoid root height so frozen neutral legs stay
+    grounded. Leaving it unset retains the generic three-axis helper used by
+    unit tests and non-grounded morphology experiments.
+    """
 
     if (
         keyframe_target_positions.ndim != 2
@@ -1592,18 +1928,32 @@ def _base_candidates(
         raise ValueError("trajectory_centroid must be a finite 3-vector")
     if not np.isfinite(r_max) or r_max <= 0.0:
         raise ValueError("r_max must be positive and finite")
+    if base_height is not None and (
+        not np.isfinite(base_height) or base_height <= 0.0
+    ):
+        raise ValueError("base_height must be positive and finite")
 
     centroid = trajectory_centroid
     lower = np.max(keyframe_target_positions - r_max, axis=0)
     upper = np.min(keyframe_target_positions + r_max, axis=0)
-    if np.any(lower > upper):
-        raise RuntimeError(
-            "No base placement can cover all representative trajectory "
-            f"extremes within r_max={r_max:.4f} m"
+    grounded_height_in_reach = (
+        base_height is None
+        or lower[2] - 1e-9 <= base_height <= upper[2] + 1e-9
+    )
+    missing_overlap = np.any(lower[:2] > upper[:2]) or (
+        base_height is None and lower[2] > upper[2]
+    )
+    if missing_overlap or not grounded_height_in_reach:
+        raise NoCommonBasePlacementError(
+            "No grounded pelvis placement can cover all representative "
+            f"trajectory extremes within r_max={r_max:.4f} m"
         )
 
     axes: list[np.ndarray] = []
     for axis in range(3):
+        if axis == 2 and base_height is not None:
+            axes.append(np.asarray([base_height], dtype=np.float64))
+            continue
         values = np.linspace(
             lower[axis],
             upper[axis],
@@ -1707,10 +2057,12 @@ def _solve_frame(
     right_active: bool,
     active_indices: np.ndarray,
     iterations: int,
+    orientation_weight: float = IK_ORIENTATION_WEIGHT,
 ) -> tuple[np.ndarray, tuple[float, float, float, float]]:
     frame_ids = tuple(model.getFrameId(name) for name in PALM_FRAMES)
     posture_weights = _posture_weights(model, active_indices)
-    orientation_weight = 0.15
+    if not np.isfinite(orientation_weight) or orientation_weight < 0.0:
+        raise ValueError("orientation_weight must be finite and non-negative")
     frame_start_q = q.copy()
     for _ in range(iterations):
         pin.forwardKinematics(model, data, q)
@@ -1834,8 +2186,11 @@ def _evaluate_candidate(
     pose_indices = _active_velocity_indices(model, position_only=False)
     position_errors: list[float] = []
     orientation_errors: list[float] = []
+    feasibility_violations: list[float] = []
     feasible_keyframes = 0
     evaluated_keyframes = 0
+    feasible_targets = 0
+    evaluated_targets = 0
     for frame_id in keyframes:
         left_active = bool(left_tracked[frame_id])
         right_active = bool(right_tracked[frame_id])
@@ -1880,15 +2235,35 @@ def _evaluate_candidate(
             if active:
                 position_errors.append(position_error)
                 orientation_errors.append(orientation_error)
-                frame_feasible = frame_feasible and (
+                target_feasible = (
                     position_error <= IK_FEASIBLE_POSITION_ERROR_M
                     and orientation_error
                     <= IK_FEASIBLE_ORIENTATION_ERROR_RAD
+                )
+                frame_feasible = frame_feasible and target_feasible
+                feasible_targets += int(target_feasible)
+                evaluated_targets += 1
+                feasibility_violations.append(
+                    max(
+                        position_error / IK_FEASIBLE_POSITION_ERROR_M - 1.0,
+                        0.0,
+                    )
+                    + max(
+                        orientation_error
+                        / IK_FEASIBLE_ORIENTATION_ERROR_RAD
+                        - 1.0,
+                        0.0,
+                    )
                 )
         feasible_keyframes += int(frame_feasible)
     if evaluated_keyframes == 0:
         raise ValueError("No active representative keyframes to evaluate")
     feasible_fraction = feasible_keyframes / evaluated_keyframes
+    feasible_target_fraction = (
+        feasible_targets / evaluated_targets
+        if evaluated_targets
+        else 0.0
+    )
     yaw = float(
         np.arctan2(base_rotation[1, 0], base_rotation[0, 0])
     )
@@ -1906,13 +2281,21 @@ def _evaluate_candidate(
         "base_position": base_position.tolist(),
         "base_rotation": base_rotation.tolist(),
         "base_yaw_rad": yaw,
-        "feasible_keyframes": float(feasible_keyframes),
-        "keyframe_count": float(evaluated_keyframes),
+        "feasible_keyframes": feasible_keyframes,
+        "keyframe_count": evaluated_keyframes,
         "feasible_fraction": float(feasible_fraction),
+        "feasible_targets": feasible_targets,
+        "target_count": evaluated_targets,
+        "feasible_target_fraction": float(feasible_target_fraction),
+        "mean_feasibility_violation": float(
+            np.mean(feasibility_violations)
+        ),
         "mean_position_error_m": mean_position_error,
         "mean_orientation_error_rad": mean_orientation_error,
-        # Eq. (3) optimizes only this feasibility average. Residuals above
-        # are deterministic tie-break diagnostics, not additional terms.
+        # Eq. (3) optimizes only the keyframe feasibility average. Independent
+        # target feasibility and normalized violations make ties deterministic
+        # without letting sub-millimetre position differences select a
+        # physically nonsensical pelvis pose.
         "score": float(feasible_fraction),
     }
 
@@ -1925,9 +2308,18 @@ def retarget_with_pinocchio(
     source_height: int,
     hand_binary: dict[str, HandBinaryResult] | None = None,
     camera_origin: np.ndarray | None = None,
+    scale: float | None = None,
 ) -> PinocchioRetargetResult:
-    if camera_origin is None:
-        camera_origin = np.array([0.10, 0.0, 1.30], dtype=np.float64)
+    nominal_pelvis_height = _robot_nominal_pelvis_height(model)
+    spatial_alignment = _derive_spatial_alignment(
+        model,
+        trajectory,
+        nominal_pelvis_height=nominal_pelvis_height,
+        scale=scale,
+        camera_origin=camera_origin,
+    )
+    scale = spatial_alignment.scale
+    camera_origin = spatial_alignment.camera_origin
     left_visible = _visible(
         trajectory.left_pixels,
         trajectory.left_confidence,
@@ -1952,7 +2344,6 @@ def retarget_with_pinocchio(
         [trajectory.left_widths, trajectory.right_widths],
         axis=1,
     )
-    scale = ACTION_SCALE
 
     rigid_palm_mode = trajectory.target_mode == RIGID_PALM_TARGET
     if rigid_palm_mode:
@@ -2044,8 +2435,8 @@ def retarget_with_pinocchio(
         }
 
     # All input modes produce the same palm target arrays consumed by the same
-    # base search and 6D IK. Fingertip actions are converted through the robot
-    # TCP; explicit rigid-palm inputs map directly to the palm frame.
+    # pelvis-pose search and 6D IK. Fingertip actions are converted through the
+    # robot TCP; explicit rigid-palm inputs map directly to the palm frame.
     hand_tcp_translations, hand_tcp_rotations = _hand_tcp_transforms(
         model,
         hand_motor_commands,
@@ -2065,16 +2456,12 @@ def retarget_with_pinocchio(
         camera_origin,
         hand_tcp_translations,
         hand_tcp_rotations,
+        world_from_reference_camera=(
+            spatial_alignment.world_from_reference_camera
+        ),
     )
 
     keyframes = _representative_keyframes(
-        left_targets,
-        right_targets,
-        left_tracked,
-        right_tracked,
-    )
-    keyframe_positions = _keyframe_target_positions(
-        keyframes,
         left_targets,
         right_targets,
         left_tracked,
@@ -2096,16 +2483,41 @@ def retarget_with_pinocchio(
                 )
             )
         )
-    candidates = list(
-        _base_candidates(
-            keyframe_positions,
-            trajectory_centroid=centroid,
-            r_max=r_max,
-        )
+    shoulder_anchor = (
+        spatial_alignment.shoulder_anchor_reference_camera
     )
+    if np.isfinite(shoulder_anchor).all():
+        mapped_shoulder_center = camera_origin + (
+            spatial_alignment.world_from_reference_camera
+            @ (scale * shoulder_anchor)
+        )
+        candidates = list(
+            _shoulder_aligned_base_candidates(
+                mapped_shoulder_center,
+                spatial_alignment.robot_shoulder_center_from_pelvis,
+                trajectory_centroid=centroid,
+            )
+        )
+    else:
+        mapped_shoulder_center = np.full(3, np.nan, dtype=np.float64)
+        keyframe_positions = _keyframe_target_positions(
+            keyframes,
+            left_targets,
+            right_targets,
+            left_tracked,
+            right_tracked,
+        )
+        candidates = list(
+            _base_candidates(
+                keyframe_positions,
+                trajectory_centroid=centroid,
+                r_max=r_max,
+                base_height=nominal_pelvis_height,
+            )
+        )
     if not candidates:
         raise RuntimeError(
-            "Base grid contains no candidate within the robot reach"
+            "Pelvis-pose grid contains no candidate within the G1 reach"
         )
     search_results = [
         _evaluate_candidate(
@@ -2125,11 +2537,20 @@ def retarget_with_pinocchio(
     search_results.sort(
         key=lambda item: (
             -float(item["feasible_fraction"]),
+            -float(item["feasible_target_fraction"]),
+            float(item["mean_feasibility_violation"]),
             float(item["mean_position_error_m"]),
             float(item["mean_orientation_error_rad"]),
         )
     )
     best = search_results[0]
+    if float(best["feasible_fraction"]) == 0.0:
+        print(
+            "Warning: no pelvis candidate makes a complete representative "
+            "keyframe feasible; selecting the candidate with the best "
+            "independent end-effector feasibility and normalized residual",
+            file=sys.stderr,
+        )
     base_position = np.asarray(best["base_position"], dtype=np.float64)
     base_rotation = np.asarray(best["base_rotation"], dtype=np.float64)
 
@@ -2289,12 +2710,31 @@ def retarget_with_pinocchio(
         hand_action_diagnostics=hand_action_diagnostics,
         hand_tcp_translations=hand_tcp_translations,
         hand_tcp_rotations=hand_tcp_rotations,
+        base_frame=G1_BASE_FRAME,
+        nominal_pelvis_height=nominal_pelvis_height,
         base_position=base_position,
         base_rotation=base_rotation,
         base_search_keyframes=keyframes,
         base_search_centroid=centroid,
         maximum_reach=r_max,
         scale=scale,
+        scale_source=spatial_alignment.scale_source,
+        source_arm_lengths=spatial_alignment.source_arm_lengths,
+        robot_arm_lengths=spatial_alignment.robot_arm_lengths,
+        pelvis_anchor_reference_camera=(
+            spatial_alignment.pelvis_anchor_reference_camera
+        ),
+        shoulder_anchor_reference_camera=(
+            spatial_alignment.shoulder_anchor_reference_camera
+        ),
+        robot_shoulder_center_from_pelvis=(
+            spatial_alignment.robot_shoulder_center_from_pelvis
+        ),
+        mapped_shoulder_center=mapped_shoulder_center,
+        camera_origin=spatial_alignment.camera_origin,
+        world_from_reference_camera=(
+            spatial_alignment.world_from_reference_camera
+        ),
         search_results=search_results,
     )
 
@@ -2338,7 +2778,8 @@ def save_pinocchio_trajectory(
         _camera_poses(
             trajectory,
             result.scale,
-            np.array([0.10, 0.0, 1.30], dtype=np.float64),
+            result.camera_origin,
+            result.world_from_reference_camera,
         )
     )
     joint_steps = np.abs(np.diff(result.qpos, axis=0))
@@ -2575,6 +3016,26 @@ def save_pinocchio_trajectory(
             hand_action_report["diagnostics"] = (
                 result.hand_action_diagnostics
             )
+    shoulder_aligned = np.isfinite(result.mapped_shoulder_center).all()
+    resolved_shoulder_center = (
+        result.base_position
+        + result.base_rotation
+        @ result.robot_shoulder_center_from_pelvis
+    )
+    shoulder_alignment_error = (
+        float(
+            np.linalg.norm(
+                resolved_shoulder_center - result.mapped_shoulder_center
+            )
+        )
+        if shoulder_aligned
+        else float("nan")
+    )
+    base_placement_mode = (
+        "shoulder_center_aligned_yaw_search"
+        if shoulder_aligned
+        else "grounded_xyz_yaw_search"
+    )
     report: dict[str, object] = {
         "trajectory_schema_version": TRAJECTORY_SCHEMA_VERSION,
         "ik_solver": f"Pinocchio {pin.__version__}",
@@ -2593,6 +3054,85 @@ def save_pinocchio_trajectory(
                 result.base_rotation[0, 0],
             )
         ),
+        "base_placement": {
+            "mode": base_placement_mode,
+            "base_frame": result.base_frame,
+            "transform_semantics": "world_from_pelvis",
+            "candidate_translation_axes": (
+                []
+                if shoulder_aligned
+                else ["x", "y"]
+            ),
+            "pelvis_position_m": result.base_position.tolist(),
+            "nominal_grounded_pelvis_height_m": (
+                result.nominal_pelvis_height
+            ),
+            "pelvis_height_offset_from_grounded_m": float(
+                result.base_position[2] - result.nominal_pelvis_height
+            ),
+            "height_source": (
+                "source/G1 shoulder-center alignment"
+                if shoulder_aligned
+                else "neutral URDF pelvis-to-lowest-foot-support distance"
+            ),
+            "candidate_rotation_axes": ["yaw"],
+            "translation_policy": (
+                "p_pelvis = p_source_shoulder_center_world - "
+                "R_world_from_pelvis @ "
+                "p_g1_shoulder_center_from_pelvis"
+                if shoulder_aligned
+                else "grounded trajectory-centered grid"
+            ),
+            "shoulder_alignment_error_m": shoulder_alignment_error,
+            "waist_policy": (
+                "waist joints participate in IK with posture regularization"
+            ),
+            "leg_policy": (
+                "leg joints remain neutral and frozen; ground contact is not "
+                "enforced when shoulder alignment changes pelvis height"
+                if shoulder_aligned
+                else "leg joints remain neutral and frozen"
+            ),
+        },
+        "spatial_alignment": {
+            "mode": (
+                "episode_shoulder_center_to_g1_morphology"
+                if shoulder_aligned
+                else "episode_upper_body_to_g1_morphology"
+            ),
+            "scale": result.scale,
+            "scale_source": result.scale_source,
+            "source_arm_lengths_m": result.source_arm_lengths.tolist(),
+            "g1_arm_lengths_m": result.robot_arm_lengths.tolist(),
+            "source_pelvis_in_reference_camera_m": (
+                result.pelvis_anchor_reference_camera.tolist()
+            ),
+            "source_shoulder_center_in_reference_camera_m": (
+                result.shoulder_anchor_reference_camera.tolist()
+            ),
+            "mapped_source_shoulder_center_world_m": (
+                result.mapped_shoulder_center.tolist()
+            ),
+            "g1_neutral_shoulder_center_in_pelvis_m": (
+                result.robot_shoulder_center_from_pelvis.tolist()
+            ),
+            "camera_origin_m": result.camera_origin.tolist(),
+            "world_from_reference_camera_rotation": (
+                result.world_from_reference_camera.tolist()
+            ),
+            "camera_policy": (
+                "episode first-camera attitude leveled by the tracked body "
+                "up axis; the hip anchor defines the shared reference world, "
+                "then the G1 pelvis translation is solved from shoulder-center "
+                "alignment"
+                if shoulder_aligned
+                else (
+                    "episode first-camera attitude leveled by the tracked body "
+                    "up axis; translation maps the episode hip anchor to the "
+                    "grounded neutral G1 pelvis"
+                )
+            ),
+        },
         "scale": result.scale,
         "left_mean_error_m": float(np.nanmean(result.left_errors)),
         "left_max_error_m": float(np.nanmax(result.left_errors)),
@@ -2630,11 +3170,25 @@ def save_pinocchio_trajectory(
             "trajectory_centroid": result.base_search_centroid.tolist(),
             "maximum_reach_m": result.maximum_reach,
             "candidate_count": len(result.search_results),
+            "selection_status": (
+                "eq3_feasible"
+                if float(result.search_results[0]["feasible_fraction"]) > 0.0
+                else "partial_end_effector_feasibility_fallback"
+            ),
+            "best_feasible_keyframe_fraction": float(
+                result.search_results[0]["feasible_fraction"]
+            ),
+            "best_feasible_target_fraction": float(
+                result.search_results[0]["feasible_target_fraction"]
+            ),
             "position_tolerance_m": IK_FEASIBLE_POSITION_ERROR_M,
             "orientation_tolerance_deg": float(
                 np.degrees(IK_FEASIBLE_ORIENTATION_ERROR_RAD)
             ),
-            "grid_points_per_axis": BASE_GRID_POINTS_PER_AXIS,
+            "orientation_residual_weight": IK_ORIENTATION_WEIGHT,
+            "translation_grid_points_per_axis": (
+                1 if shoulder_aligned else BASE_GRID_POINTS_PER_AXIS
+            ),
             "yaw_offsets_deg": np.degrees(
                 BASE_YAW_OFFSETS_RAD
             ).tolist(),
@@ -2747,10 +3301,37 @@ def save_pinocchio_trajectory(
         ),
         base_position=result.base_position,
         base_rotation=result.base_rotation,
+        base_placement_mode=np.asarray(
+            base_placement_mode
+        ),
+        base_frame=np.asarray(result.base_frame),
+        nominal_pelvis_height=np.asarray(
+            result.nominal_pelvis_height,
+            dtype=np.float64,
+        ),
         base_search_keyframes=result.base_search_keyframes,
         base_search_centroid=result.base_search_centroid,
         maximum_reach=result.maximum_reach,
         scale=result.scale,
+        scale_source=np.asarray(result.scale_source),
+        source_arm_lengths=result.source_arm_lengths,
+        robot_arm_lengths=result.robot_arm_lengths,
+        pelvis_anchor_reference_camera=(
+            result.pelvis_anchor_reference_camera
+        ),
+        shoulder_anchor_reference_camera=(
+            result.shoulder_anchor_reference_camera
+        ),
+        robot_shoulder_center_from_pelvis=(
+            result.robot_shoulder_center_from_pelvis
+        ),
+        mapped_shoulder_center=result.mapped_shoulder_center,
+        shoulder_alignment_error=np.asarray(
+            shoulder_alignment_error,
+            dtype=np.float64,
+        ),
+        camera_origin=result.camera_origin,
+        world_from_reference_camera=result.world_from_reference_camera,
         camera_positions=camera_positions,
         camera_cv_rotations=camera_cv_rotations,
         camera_gl_quaternions=camera_gl_quaternions,
@@ -2783,6 +3364,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    output_root = args.output.resolve()
+    skip_report_path = output_root / EPISODE_SKIP_REPORT
+    skip_report_path.unlink(missing_ok=True)
     source_width, source_height, frame_count, _ = video_metadata(args.video)
     trajectory = load_hand_trajectory(args.hdf5)
     if trajectory.frame_count != frame_count:
@@ -2807,18 +3391,35 @@ def main() -> None:
                 f"articulated O6/continuous width mode: {error}",
                 file=sys.stderr,
             )
-    result = retarget_with_pinocchio(
-        model,
-        trajectory,
-        source_width=source_width,
-        source_height=source_height,
-        hand_binary=hand_binary,
-    )
+    try:
+        result = retarget_with_pinocchio(
+            model,
+            trajectory,
+            source_width=source_width,
+            source_height=source_height,
+            hand_binary=hand_binary,
+        )
+    except NoCommonBasePlacementError as error:
+        skip_report: dict[str, object] = {
+            "status": "skipped",
+            "reason_code": "no_common_base_search_region",
+            "reason": str(error),
+            "episode_path": str(args.hdf5.resolve()),
+            "video": str(args.video.resolve()),
+            "hdf5": str(args.hdf5.resolve()),
+        }
+        output_root.mkdir(parents=True, exist_ok=True)
+        skip_report_path.write_text(
+            json.dumps(skip_report, indent=2),
+            encoding="utf-8",
+        )
+        print(json.dumps(skip_report, indent=2))
+        return
     report = save_pinocchio_trajectory(
         model=model,
         trajectory=trajectory,
         result=result,
-        output_root=args.output.resolve(),
+        output_root=output_root,
     )
     print(json.dumps(report, indent=2))
 

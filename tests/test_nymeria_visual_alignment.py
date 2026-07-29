@@ -446,6 +446,22 @@ class NymeriaAdapterTests(unittest.TestCase):
             right = left.copy()
             left[:, :3, 3] = [0.1, 0.2, 1.0]
             right[:, :3, 3] = [0.1, -0.2, 1.0]
+            body_transforms = {}
+            for name, position in {
+                "hip": [0.0, 0.0, 0.3],
+                "neck4": [0.0, 0.0, 0.9],
+                "leftArm": [0.0, 0.2, 0.6],
+                "leftForearm": [0.1, 0.2, 0.8],
+                "rightArm": [0.0, -0.2, 0.6],
+                "rightForearm": [0.1, -0.2, 0.8],
+            }.items():
+                transforms = np.repeat(
+                    np.eye(4)[None],
+                    frame_count,
+                    axis=0,
+                )
+                transforms[:, :3, 3] = position
+                body_transforms[name] = transforms
             pair = ClipPair(
                 stem="recording_c000",
                 video=root / "recording_c000.mp4",
@@ -470,10 +486,12 @@ class NymeriaAdapterTests(unittest.TestCase):
                 ),
                 left_hands=left,
                 right_hands=right,
+                body_transforms=body_transforms,
                 left_confidence=np.ones(frame_count, dtype=np.float32),
                 right_confidence=np.ones(frame_count, dtype=np.float32),
                 body_times=np.arange(frame_count) / 15.0,
                 source_frame_indices=np.arange(frame_count),
+                participant_height_m=1.81,
             )
 
             keypoint_availability = hdf5_action_keypoint_availability(path)
@@ -494,6 +512,16 @@ class NymeriaAdapterTests(unittest.TestCase):
         )
         self.assertEqual(target_mode, RIGID_PALM_TARGET)
         self.assertEqual(trajectory.target_mode, RIGID_PALM_TARGET)
+        self.assertIsNotNone(trajectory.body_alignment)
+        assert trajectory.body_alignment is not None
+        self.assertEqual(
+            trajectory.body_alignment.source,
+            "nymeria_xsens_calibrated_upper_body",
+        )
+        np.testing.assert_array_equal(
+            trajectory.body_alignment.world_up,
+            [0.0, 0.0, 1.0],
+        )
         for side in ("left", "right"):
             for name in ("ThumbTip", "IndexFingerTip", "MiddleFingerTip"):
                 self.assertNotIn(f"transforms/{side}{name}", datasets)
