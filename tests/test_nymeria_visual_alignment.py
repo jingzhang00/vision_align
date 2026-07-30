@@ -20,7 +20,7 @@ from human_to_robot.trajectory import (
     hdf5_hand_target_mode,
     load_hand_trajectory,
 )
-from nymeria.visual_alignment import (
+from nymeria_scripts.visual_alignment import (
     ActivityAnnotation,
     CAMERA_RGB_FROM_VIDEO_CAMERA,
     CameraCalibration,

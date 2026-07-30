@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from nymeria.batch_undistort import (
+from nymeria_scripts.batch_undistort import (
     PinholeCalibration,
     build_pinhole_calibration,
     discover_episodes,

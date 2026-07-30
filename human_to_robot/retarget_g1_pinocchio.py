@@ -212,6 +212,13 @@ class _SpatialAlignment:
     world_from_reference_camera: np.ndarray
 
 
+@dataclass(frozen=True)
+class O6HandJointTrajectory:
+    joint_names: tuple[str, ...]
+    joint_positions: np.ndarray
+    diagnostics: dict[str, dict[str, object]]
+
+
 def build_pinocchio_g1(urdf_path: str | Path) -> pin.Model:
     resolved_urdf = Path(urdf_path).resolve()
     model = pin.buildModelFromUrdf(str(resolved_urdf))
@@ -1187,6 +1194,61 @@ def _retarget_articulated_hands(
         achieved_widths,
         profiles,
         diagnostics,
+    )
+
+
+def retarget_o6_hand_joints(
+    model: pin.Model,
+    hdf5_path: str | Path,
+    *,
+    scale: float,
+) -> O6HandJointTrajectory:
+    """Retarget a complete EgoDex hand track to the 22 O6 URDF joints."""
+
+    trajectory = load_hand_trajectory(hdf5_path)
+    if (
+        trajectory.left_articulated_hand is None
+        or trajectory.right_articulated_hand is None
+    ):
+        raise ValueError(
+            f"{hdf5_path} must contain complete 25-landmark tracks "
+            "for both hands"
+        )
+    human_widths = np.stack(
+        [trajectory.left_widths, trajectory.right_widths],
+        axis=1,
+    )
+    (
+        _,
+        motor_commands,
+        _,
+        _,
+        _,
+        diagnostics,
+    ) = _retarget_articulated_hands(
+        model,
+        trajectory,
+        human_widths,
+        scale=scale,
+    )
+
+    joint_positions = np.empty(
+        (trajectory.frame_count, len(HAND_JOINTS)),
+        dtype=np.float64,
+    )
+    for frame_index, commands in enumerate(motor_commands):
+        qpos = pin.neutral(model)
+        _set_hand_motor_configuration(model, qpos, commands)
+        for joint_index, joint_name in enumerate(HAND_JOINTS):
+            joint_id = model.getJointId(joint_name)
+            joint_positions[frame_index, joint_index] = qpos[
+                model.idx_qs[joint_id]
+            ]
+
+    return O6HandJointTrajectory(
+        joint_names=HAND_JOINTS,
+        joint_positions=joint_positions,
+        diagnostics=diagnostics,
     )
 
 

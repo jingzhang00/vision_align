@@ -12,7 +12,7 @@ outputs/
 assets/unitree_description/meshes/g1/*_tmp/
 .DS_Store
 ._*
-# Virtual environments
 .venv
 mano_v1_2/models/*.pkl
 output_new/
+nymeria_scripts
