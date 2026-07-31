@@ -16,15 +16,13 @@ WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
 if str(WORKSPACE_ROOT) not in sys.path:
     sys.path.insert(0, str(WORKSPACE_ROOT))
 
-from repaint.traj_replay import (  # noqa: E402
+from repaint.trajectory_io import (  # noqa: E402
+    DEFAULT_DATASET,
     DEFAULT_G1_URDF,
     SUPPORTED_FIELDS,
     Trajectory,
     load_trajectory,
 )
-
-
-DEFAULT_DATASET = WORKSPACE_ROOT / "output_new/basic_pick_place"
 
 
 def parse_args() -> argparse.Namespace:
@@ -127,13 +125,18 @@ def replay(args: argparse.Namespace, trajectory: Trajectory) -> None:
             "renderer": "RaytracedLighting",
         }
     )
+    selection_guard = None
     try:
         import omni.kit.app
         import omni.usd
         from isaacsim.core.api import World
         from isaacsim.core.prims import Articulation
         from isaacsim.core.utils.viewports import set_camera_view
-        from pxr import Sdf, UsdLux
+        from omni.kit.viewport.utility import (
+            disable_selection,
+            get_active_viewport,
+        )
+        from pxr import Gf, PhysicsSchemaTools, Sdf, UsdLux
 
         extension_manager = (
             omni.kit.app.get_app().get_extension_manager()
@@ -147,12 +150,29 @@ def replay(args: argparse.Namespace, trajectory: Trajectory) -> None:
         context = omni.usd.get_context()
         context.new_stage()
         simulation_app.update()
+        selection = context.get_selection()
+        selection.clear_selected_prim_paths()
+        selection.clear_selected_prim_paths(
+            omni.usd.Selection.SourceType.FABRIC
+        )
+        if not args.headless:
+            viewport = get_active_viewport()
+            if viewport is not None:
+                selection_guard = disable_selection(viewport)
+
         world = World(
             stage_units_in_meters=1.0,
             physics_dt=1.0 / trajectory.fps,
             rendering_dt=1.0 / trajectory.fps,
         )
-        world.scene.add_default_ground_plane()
+        PhysicsSchemaTools.addGroundPlane(
+            context.get_stage(),
+            "/World/GroundPlane",
+            "Z",
+            10.0,
+            Gf.Vec3f(0.0),
+            Gf.Vec3f(0.35),
+        )
 
         robot_path = import_g1(args.urdf)
         robot = world.scene.add(
@@ -175,8 +195,9 @@ def replay(args: argparse.Namespace, trajectory: Trajectory) -> None:
             camera_prim_path="/OmniverseKit_Persp",
         )
 
+        world.get_physics_context().set_gravity(0.0)
         world.reset()
-        world.pause()
+        world.play()
         joint_order = isaac_joint_order(
             list(robot.dof_names),
             trajectory.joint_names,
@@ -192,6 +213,7 @@ def replay(args: argparse.Namespace, trajectory: Trajectory) -> None:
         )
 
         zero_velocity = np.zeros((1, len(joint_order)), dtype=np.float32)
+        zero_root_velocity = np.zeros((1, 6), dtype=np.float32)
         repeat = not (args.headless or args.once)
         while simulation_app.is_running():
             deadline = time.perf_counter()
@@ -210,13 +232,16 @@ def replay(args: argparse.Namespace, trajectory: Trajectory) -> None:
                     ][None].astype(np.float32)
                 )
                 robot.set_joint_velocities(zero_velocity)
-                world.render()
+                robot.set_velocities(zero_root_velocity)
+                world.step(render=True)
 
                 deadline += 1.0 / trajectory.fps
                 time.sleep(max(0.0, deadline - time.perf_counter()))
             if not repeat:
                 break
     finally:
+        if selection_guard is not None:
+            del selection_guard
         simulation_app.close()
 
 

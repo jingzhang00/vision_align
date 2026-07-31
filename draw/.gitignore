@@ -1,0 +1,6 @@
+.venv_powerpaint/
+output/
+mesh_output*/
+insert_output*/
+hybrid_output*/
+__pycache__/

@@ -1,0 +1,8 @@
+# PowerPaint's upstream-compatible inference stack.
+# PyTorch/CUDA is inherited from the existing isaac_sim environment.
+diffusers==0.27.0
+huggingface-hub==0.23.4
+mmengine==0.10.4
+tokenizers==0.13.3
+transformers==4.28.0
+

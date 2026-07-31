@@ -8,6 +8,7 @@ dependencies = [
     "addict>=2.4.0",
     "av>=15.0.0",
     "einops>=0.8.1",
+    "easydict>=1.13",
     "ftfy==6.1.1",
     "h5py>=3.16.0",
     "huggingface-hub",

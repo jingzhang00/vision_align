@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-commit_message="${*:-update}"
+commit_message="${*:-ts}"
 
 git rev-parse --is-inside-work-tree >/dev/null
 git add -A
