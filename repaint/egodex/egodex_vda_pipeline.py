@@ -4,8 +4,6 @@
 The orchestrator deliberately keeps all video timing and image geometry out of
 task configuration.  Source metadata is probed from every MP4, the LeRobot and
 prepared stages retain it, and the final Isaac recording is checked against it.
-Child-process output is written to per-stage logs so the terminal shows exactly
-one aggregate progress bar for each task.
 """
 
 from __future__ import annotations
@@ -21,16 +19,21 @@ from typing import Any, Iterable, Sequence
 
 from tqdm import tqdm
 
-from repaint.robot_camera import BEINGBEYOND_HEAD_CAMERA_PROFILE
-from repaint.scene_hand_alignment import (
+SCRIPT_PATH = Path(__file__).resolve()
+WORKSPACE_ROOT = SCRIPT_PATH.parents[2]
+if str(WORKSPACE_ROOT) not in sys.path:
+    sys.path.insert(0, str(WORKSPACE_ROOT))
+
+from repaint.robot_camera import BEINGBEYOND_HEAD_CAMERA_PROFILE  # noqa: E402
+from repaint.scene_hand_alignment import (  # noqa: E402
     HAND_TCP_ALIGNMENT_METHOD,
     HAND_TCP_ALIGNMENT_STAGE,
 )
-from repaint.scene_leveling import (
+from repaint.scene_leveling import (  # noqa: E402
     SUPPORT_PLANE_LEVELING_METHOD,
     SUPPORT_PLANE_LEVELING_STAGE,
 )
-from repaint.vda_pipeline_common import (
+from repaint.vda_pipeline_common import (  # noqa: E402
     VideoMetadata,
     build_command as _stage_command,
     format_elapsed as _format_elapsed,
@@ -44,8 +47,6 @@ from repaint.vda_pipeline_common import (
     write_json_atomic as _write_json_atomic,
 )
 
-
-WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_TASKS = (
     "basic_pick_place",
     "flip_coin",
@@ -80,7 +81,6 @@ class TaskPaths:
     handless: Path
     prepared: Path
     final: Path
-    logs: Path
     report: Path
 
     @classmethod
@@ -91,7 +91,6 @@ class TaskPaths:
             handless=root / "handless",
             prepared=root / "prepared",
             final=root / "final",
-            logs=root / "logs",
             report=root / "pipeline_report.json",
         )
 
@@ -119,7 +118,6 @@ class Stage:
     name: str
     episode_index: int | None
     command: tuple[str, ...]
-    log_path: Path
     artifact_paths: tuple[Path, ...]
     dependencies: tuple[str, ...] = ()
 
@@ -212,7 +210,6 @@ def build_task_plan(task: str, config: PipelineConfig) -> TaskPlan:
             name="retarget",
             episode_index=None,
             command=retarget_command,
-            log_path=task_paths.logs / "00_retarget.log",
             artifact_paths=(
                 task_paths.lerobot / "meta/info.json",
                 task_paths.lerobot / "meta/egodex.json",
@@ -234,7 +231,6 @@ def build_task_plan(task: str, config: PipelineConfig) -> TaskPlan:
             name="repaint",
             episode_index=None,
             command=repaint_command,
-            log_path=task_paths.logs / "01_repaint.log",
             artifact_paths=tuple(
                 (
                     task_paths.handless
@@ -284,10 +280,6 @@ def build_task_plan(task: str, config: PipelineConfig) -> TaskPlan:
                     WORKSPACE_ROOT / "repaint/rgbd_prepare.py",
                     *prepare_arguments,
                 ),
-                log_path=(
-                    task_paths.logs
-                    / f"02_prepare_episode_{episode.episode_index:06d}.log"
-                ),
                 artifact_paths=(
                     prepared_root / "episode_data.npz",
                     prepared_root / "prepare_report.json",
@@ -315,10 +307,6 @@ def build_task_plan(task: str, config: PipelineConfig) -> TaskPlan:
                     python,
                     WORKSPACE_ROOT / "repaint/vda_scene_isaac.py",
                     *render_arguments,
-                ),
-                log_path=(
-                    task_paths.logs
-                    / f"03_render_episode_{episode.episode_index:06d}.log"
                 ),
                 artifact_paths=(
                     output_video,
@@ -1058,6 +1046,22 @@ def _clear_stage_output(stage: Stage, plan: TaskPlan) -> None:
         _remove_exact_path(target)
 
 
+def _clear_episode_intermediates(
+    plan: TaskPlan,
+    episode_index: int,
+) -> None:
+    _remove_exact_path(
+        plan.paths.prepared / f"episode_{episode_index:06d}"
+    )
+    _remove_exact_path(
+        plan.paths.handless
+        / "videos"
+        / VIDEO_KEY
+        / f"chunk-{episode_index // LEROBOT_CHUNKS_SIZE:03d}"
+        / f"file-{episode_index % LEROBOT_CHUNKS_SIZE:03d}.mp4"
+    )
+
+
 def _command_text(command: Sequence[str]) -> str:
     return shlex.join(command)
 
@@ -1090,8 +1094,11 @@ def _new_report(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
             "final_video": str(
                 plan.paths.final / "episode_XXXXXX/g1_view.mp4"
             ),
-            "logs": str(plan.paths.logs),
         },
+        "intermediate_retention": (
+            "handless and prepared episode artifacts are removed after render; "
+            "only LeRobot, final outputs, and this report are retained"
+        ),
         "video_metadata_policy": {
             "source": "ffprobe each source MP4",
             "fps": "inherited from source; never task-hardcoded",
@@ -1114,6 +1121,10 @@ def _new_report(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
         ],
         "resume": config.resume,
         "overwrite": config.overwrite,
+        "episode_failure_policy": (
+            "repaint manifest failures are terminal skips on resume; "
+            "prepare/render exceptions are retried on the next run"
+        ),
         "started_at": _utc_now(),
         "updated_at": _utc_now(),
         "elapsed_seconds": 0.0,
@@ -1130,7 +1141,6 @@ def _stage_report(stage: Stage) -> dict[str, Any]:
         "status": "pending",
         "command": list(stage.command),
         "command_shell_escaped": _command_text(stage.command),
-        "log": str(stage.log_path),
         "artifacts": [str(path) for path in stage.artifact_paths],
         "dependencies": list(stage.dependencies),
         "started_at": None,
@@ -1159,7 +1169,6 @@ def _run_stage_process(
 
     _run_process(
         command=stage.command,
-        log_path=stage.log_path,
         stage_id=stage.stage_id,
         stage_name=stage.name,
         item_key="episode",
@@ -1181,7 +1190,7 @@ def execute_task(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
             f"Task output already exists and resume is disabled: "
             f"{plan.paths.root}"
         )
-    plan.paths.logs.mkdir(parents=True, exist_ok=True)
+    _remove_exact_path(plan.paths.root / "logs")
 
     previous_stages = _load_previous_stages(plan.paths.report)
     report = _new_report(plan, config)
@@ -1241,7 +1250,7 @@ def execute_task(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
         failure_status: str = "exception",
     ) -> None:
         source = plan.episodes[episode_index]
-        skipped_by_episode.setdefault(
+        skipped = skipped_by_episode.setdefault(
             episode_index,
             {
                 **_source_report(source),
@@ -1249,7 +1258,6 @@ def execute_task(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
                 "failure_status": failure_status,
                 "failed_stage": stage.stage_id,
                 "error": error,
-                "log": str(stage.log_path),
                 "stage_paths": {
                     "lerobot_root": str(plan.paths.lerobot),
                     "handless_root": str(plan.paths.handless),
@@ -1266,7 +1274,33 @@ def execute_task(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
                 "recorded_at": _utc_now(),
             },
         )
+        try:
+            if stage.name == "render":
+                _clear_stage_output(stage, plan)
+            _clear_episode_intermediates(plan, episode_index)
+        except Exception as exc:
+            skipped.setdefault("cleanup_errors", []).append(
+                {
+                    "stage": stage.stage_id,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
         report["skipped_episodes"] = list(skipped_by_episode.values())
+
+    def cleanup_completed_episode(stage: Stage) -> None:
+        assert stage.episode_index is not None
+        try:
+            _clear_episode_intermediates(plan, stage.episode_index)
+        except Exception as exc:
+            report.setdefault("cleanup_errors", []).append(
+                {
+                    "stage": stage.stage_id,
+                    "episode_index": stage.episode_index,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            report["updated_at"] = _utc_now()
+            _write_json_atomic(plan.paths.report, report)
 
     _write_json_atomic(plan.paths.report, report)
 
@@ -1393,6 +1427,8 @@ def execute_task(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
                         time.perf_counter() - task_started
                     )
                     _write_json_atomic(plan.paths.report, report)
+                    if stage.name == "render":
+                        cleanup_completed_episode(stage)
                     continue
 
                 invalidate_stage_and_dependents(stage.stage_id)
@@ -1502,6 +1538,8 @@ def execute_task(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
                 report["elapsed_seconds"] = time.perf_counter() - task_started
                 _write_json_atomic(plan.paths.report, report)
                 progress.update(1)
+                if stage.name == "render":
+                    cleanup_completed_episode(stage)
 
             final_videos = []
             for episode in plan.episodes:
@@ -1533,8 +1571,28 @@ def execute_task(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
                 updated_at=_utc_now(),
                 elapsed_seconds=time.perf_counter() - task_started,
                 final_videos=final_videos,
+                successful_episode_count=len(final_videos),
+                skipped_episode_count=len(skipped_by_episode),
             )
             _write_json_atomic(plan.paths.report, report)
+            for target in (
+                plan.paths.handless,
+                plan.paths.prepared,
+                plan.paths.root / "logs",
+            ):
+                try:
+                    _remove_exact_path(target)
+                except Exception as exc:
+                    report.setdefault("cleanup_errors", []).append(
+                        {
+                            "stage": "finalize",
+                            "path": str(target),
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                    )
+            if report.get("cleanup_errors"):
+                report["updated_at"] = _utc_now()
+                _write_json_atomic(plan.paths.report, report)
             progress.set_postfix(
                 stage=str(report["status"]),
                 episode="all",

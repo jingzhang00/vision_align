@@ -9,10 +9,15 @@ import h5py
 import numpy as np
 from scipy.spatial.transform import Rotation
 
+from human_to_robot.trajectory import (
+    HAND_TARGET_MODE_ATTRIBUTE,
+    RIGID_PALM_TARGET,
+)
 from repaint.robot_camera import (
+    ROBOT_PALM_OFFSETS_LOCAL_M,
     ROBOT_WRIST_FRAMES,
     load_source_hand_tcp_points_camera_cv,
-    load_source_wrist_points_camera_cv,
+    load_source_palm_points_camera_cv,
     robot_frame_points_in_camera_cv,
     robot_hand_tcp_points_in_camera_cv,
 )
@@ -25,11 +30,13 @@ HAND_TCP_ALIGNMENT_METHOD = (
 HAND_TCP_ALIGNMENT_STAGE = (
     "semantic-fingertip-tcp-constant-xyz-translation"
 )
-WRIST_ALIGNMENT_METHOD = (
-    "initial bilateral source/G1 wrist midpoint, "
+PALM_ALIGNMENT_METHOD = (
+    "initial bilateral rigid-palm action-frame midpoint, "
     "robust constant world translation"
 )
-WRIST_ALIGNMENT_STAGE = "semantic-wrist-midpoint-constant-xyz-translation"
+PALM_ALIGNMENT_STAGE = (
+    "semantic-rigid-palm-action-frame-constant-xyz-translation"
+)
 MAXIMUM_SCENE_AFFINE_CONDITION_NUMBER = 10.0
 
 
@@ -419,10 +426,10 @@ def estimate_initial_hand_tcp_midpoint_translation(
     return translation_world, report
 
 
-def estimate_initial_wrist_midpoint_translation(
+def estimate_initial_palm_midpoint_translation(
     *,
-    source_wrist_camera_cv: np.ndarray,
-    robot_wrist_camera_cv: np.ndarray,
+    source_palm_camera_cv: np.ndarray,
+    robot_palm_camera_cv: np.ndarray,
     scene_camera_pose_cv_xyzw: np.ndarray,
     scene_scale: float,
     max_translation_m: float = 0.3,
@@ -430,18 +437,18 @@ def estimate_initial_wrist_midpoint_translation(
     scene_world_linear: np.ndarray | None = None,
     scene_world_pivot: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict[str, object]]:
-    """Fit one XYZ translation from calibrated source/G1 wrist origins."""
+    """Fit one XYZ translation between matching rigid-palm action frames."""
 
-    source = np.asarray(source_wrist_camera_cv, dtype=np.float64)
+    source = np.asarray(source_palm_camera_cv, dtype=np.float64)
     translation_world, report, _ = (
         _estimate_initial_bilateral_midpoint_translation(
             source_anchor_camera_cv=source,
-            robot_anchor_camera_cv=robot_wrist_camera_cv,
+            robot_anchor_camera_cv=robot_palm_camera_cv,
             scene_camera_pose_cv_xyzw=scene_camera_pose_cv_xyzw,
             scene_scale=scene_scale,
             frame_validity=np.ones(len(source), dtype=bool),
-            anchor_name="wrist",
-            require_positive_source_depth=False,
+            anchor_name="palm",
+            require_positive_source_depth=True,
             max_translation_m=max_translation_m,
             max_inlier_p95_m=max_inlier_p95_m,
             scene_world_linear=scene_world_linear,
@@ -450,43 +457,50 @@ def estimate_initial_wrist_midpoint_translation(
     )
     report.update(
         {
-            "method": WRIST_ALIGNMENT_METHOD,
+            "method": PALM_ALIGNMENT_METHOD,
             "estimator": (
-                "per-frame equal-left/right wrist-origin midpoint residual, "
+                "per-frame equal-left/right rigid-palm midpoint residual, "
                 "temporal coordinate median with MAD outlier rejection"
             ),
             "formula": (
-                "delta_world = median(G1_wrist_midpoint_world - "
-                "affine(source_wrist_midpoint_scene_world))"
+                "delta_world = median(G1_palm_midpoint_world - "
+                "affine(source_palm_midpoint_scene_world))"
             ),
             "anchor_semantics": {
                 "source_transform_origins": [
                     "transforms/leftHand",
                     "transforms/rightHand",
                 ],
-                "robot_frame_origins": list(ROBOT_WRIST_FRAMES),
-                "bilateral_aggregation": (
-                    "equal-weight midpoint of left and right wrists"
+                "source_action_mode": RIGID_PALM_TARGET,
+                "robot_parent_frame_origins": list(ROBOT_WRIST_FRAMES),
+                "robot_palm_local_offsets_m": (
+                    ROBOT_PALM_OFFSETS_LOCAL_M.tolist()
                 ),
-                "matches_retarget_wrist_anchors": True,
+                "robot_action_frames": ["left_palm", "right_palm"],
+                "bilateral_aggregation": (
+                    "equal-weight midpoint of left and right palms"
+                ),
+                "matches_retarget_rigid_palm_action_frames": True,
                 "uses_fingertips": False,
                 "uses_hand_base_origins": False,
-                "uses_synthetic_palm_offset": False,
             },
             "height_policy": (
-                "world Z is estimated from the same 3-D wrist residual; "
+                "world Z is estimated from the same 3-D palm residual; "
                 "no fixed scene or table height is used"
             ),
-            "validity_gate": "finite bilateral source/G1 3-D wrist origins",
+            "validity_gate": (
+                "finite bilateral source/G1 3-D palm origins with positive "
+                "source camera depth"
+            ),
             "source_visibility_confidence_used": False,
             "source_visibility_confidence_semantics": (
                 "Nymeria hand confidence is projection visibility, not "
-                "3-D wrist tracking confidence"
+                "3-D rigid-palm tracking confidence"
             ),
-            "individual_wrist_residual_after_m": report.pop(
+            "individual_palm_residual_after_m": report.pop(
                 "individual_anchor_residual_after_m"
             ),
-            "individual_wrist_residual_is_diagnostic_only": True,
+            "individual_palm_residual_is_diagnostic_only": True,
         }
     )
     return translation_world, report
@@ -601,7 +615,7 @@ def align_scene_camera_poses_to_initial_hand_tcp(
     )
 
 
-def align_scene_camera_poses_to_initial_wrists(
+def align_scene_camera_poses_to_initial_palms(
     *,
     source_hdf5: Path,
     frame_indices: np.ndarray,
@@ -617,7 +631,7 @@ def align_scene_camera_poses_to_initial_wrists(
     scene_world_linear: np.ndarray | None = None,
     scene_world_pivot: np.ndarray | None = None,
 ) -> SceneHandAlignment:
-    """Place a scene from calibrated bilateral source/G1 wrist midpoints."""
+    """Place a scene from matching source/G1 rigid-palm action frames."""
 
     if window_frames <= 0:
         raise ValueError("--scene-alignment-window-frames must be positive")
@@ -626,23 +640,36 @@ def align_scene_camera_poses_to_initial_wrists(
     selected_count = min(int(window_frames), len(frame_indices))
     if selected_count < 3:
         raise ValueError("Prepared sequence has fewer than three frames")
+    source_hdf5 = source_hdf5.resolve()
+    with h5py.File(source_hdf5, "r") as handle:
+        target_mode = handle.attrs.get(HAND_TARGET_MODE_ATTRIBUTE)
+    if isinstance(target_mode, (bytes, np.bytes_)):
+        target_mode = target_mode.decode("utf-8")
+    if target_mode != RIGID_PALM_TARGET:
+        raise ValueError(
+            "initial-palms requires source HDF5 "
+            f"{HAND_TARGET_MODE_ATTRIBUTE}={RIGID_PALM_TARGET!r}, "
+            f"got {target_mode!r}"
+        )
+
     initial_indices = frame_indices[:selected_count]
     initial_camera_pose = camera_pose[:selected_count]
-    source_wrist = load_source_wrist_points_camera_cv(
+    source_palm = load_source_palm_points_camera_cv(
         source_hdf5,
         initial_indices,
     )
-    robot_wrist = robot_frame_points_in_camera_cv(
+    robot_palm = robot_frame_points_in_camera_cv(
         urdf_path=urdf_path,
         joint_names=joint_names,
         joint_positions=np.asarray(joint_positions)[:selected_count],
         root_pose_xyzw=np.asarray(root_pose_xyzw)[:selected_count],
         camera_pose_cv_xyzw=initial_camera_pose,
         frame_names=ROBOT_WRIST_FRAMES,
+        frame_local_offsets_m=ROBOT_PALM_OFFSETS_LOCAL_M,
     )
-    translation_world, report = estimate_initial_wrist_midpoint_translation(
-        source_wrist_camera_cv=source_wrist,
-        robot_wrist_camera_cv=robot_wrist,
+    translation_world, report = estimate_initial_palm_midpoint_translation(
+        source_palm_camera_cv=source_palm,
+        robot_palm_camera_cv=robot_palm,
         scene_camera_pose_cv_xyzw=initial_camera_pose,
         scene_scale=scene_scale,
         max_translation_m=max_translation_m,
@@ -652,16 +679,22 @@ def align_scene_camera_poses_to_initial_wrists(
     )
     report.update(
         {
-            "source_hdf5": str(source_hdf5.resolve()),
+            "source_hdf5": str(source_hdf5),
+            "source_hand_target_mode": target_mode,
             "g1_urdf": str(urdf_path.resolve()),
             "window_local_frame_start": 0,
             "window_local_frame_end_exclusive": selected_count,
             "window_source_frame_indices": initial_indices.tolist(),
             "hand_frame_mapping": {
-                "source": "leftHand/rightHand transform origins",
-                "robot": "left/right wrist_yaw_link frame origins",
+                "source": (
+                    "leftHand/rightHand rigid-palm action-frame origins"
+                ),
+                "robot": (
+                    "left/right wrist_yaw_link plus the canonical retarget "
+                    "palm offset"
+                ),
                 "aggregation": (
-                    "equal bilateral wrist midpoint; no local offset"
+                    "equal bilateral rigid-palm midpoint"
                 ),
             },
             "camera_pose_output_semantics": (

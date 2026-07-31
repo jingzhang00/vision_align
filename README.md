@@ -22,8 +22,9 @@ calibration files for camera alignment.
 
 EgoDex first levels the support surface, then aligns the exact bilateral
 retarget TCP (`0.5*thumb + 0.35*index + 0.15*middle`) in XYZ. Nymeria keeps
-support-plane leveling and wrist-derived scene translation disabled, preserving
-the calibrated scene coordinates while replaying the G1 robot camera.
+support-plane leveling disabled, then aligns the bilateral
+`leftHand/rightHand` rigid-palm action frames to the matching replayed G1
+canonical palms with one XYZ scene translation.
 
 ## Run the four EgoDex tasks
 
@@ -64,7 +65,7 @@ To inspect a prepared episode interactively:
   --loop \
   --no-headless \
   --scene-leveling none \
-  --scene-alignment none
+  --scene-alignment initial-palms
 ```
 
 To render one prepared episode directly:

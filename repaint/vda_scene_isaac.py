@@ -45,9 +45,9 @@ from repaint.robot_camera import (  # noqa: E402
 )
 from repaint.scene_hand_alignment import (  # noqa: E402
     HAND_TCP_ALIGNMENT_STAGE,
-    WRIST_ALIGNMENT_STAGE,
+    PALM_ALIGNMENT_STAGE,
     align_scene_camera_poses_to_initial_hand_tcp,
-    align_scene_camera_poses_to_initial_wrists,
+    align_scene_camera_poses_to_initial_palms,
 )
 from repaint.scene_leveling import (  # noqa: E402
     SUPPORT_PLANE_LEVELING_STAGE,
@@ -1111,11 +1111,11 @@ def render(args: argparse.Namespace) -> dict[str, object]:
         )
     scene_anchor_description = {
         "initial-hands": "bilateral exact fingertip-TCP XYZ anchor",
-        "initial-wrists": "bilateral source/G1 wrist-midpoint XYZ anchor",
+        "initial-palms": "bilateral rigid-palm action-frame XYZ anchor",
     }.get(args.scene_alignment)
     scene_alignment_stage = {
         "initial-hands": HAND_TCP_ALIGNMENT_STAGE,
-        "initial-wrists": WRIST_ALIGNMENT_STAGE,
+        "initial-palms": PALM_ALIGNMENT_STAGE,
     }.get(args.scene_alignment)
 
     scene_leveling_linear_world = np.eye(3, dtype=np.float64)
@@ -1206,7 +1206,7 @@ def render(args: argparse.Namespace) -> dict[str, object]:
                 confidence_threshold=args.scene_hand_confidence,
             )
         else:
-            alignment = align_scene_camera_poses_to_initial_wrists(
+            alignment = align_scene_camera_poses_to_initial_palms(
                 **alignment_kwargs,
             )
         scene_alignment_report = alignment.report
@@ -1430,6 +1430,12 @@ def render(args: argparse.Namespace) -> dict[str, object]:
             "renderer": "RaytracedLighting",
             "width": render_width,
             "height": render_height,
+            "enable_crashreporter": False,
+            "extra_args": [
+                "--/log/enabled=false",
+                "--/log/file=/dev/null",
+                "--/app/enableStdoutOutput=0",
+            ],
         }
     )
     writer: cv2.VideoWriter | None = None
@@ -2335,14 +2341,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--scene-alignment",
-        choices=("initial-hands", "initial-wrists", "none"),
+        choices=("initial-hands", "initial-palms", "none"),
         default="initial-hands",
         help=(
             "At replay start, place the complete scene with one robust "
             "source/G1 bilateral semantic-anchor XYZ translation after "
             "optional support-plane leveling: exact fingertip TCPs for "
-            "initial-hands, wrist origins for initial-wrists, or disable "
-            "it for legacy data (default: initial-hands)"
+            "initial-hands, rigid-palm action frames for initial-palms, "
+            "or disable it for legacy data (default: initial-hands)"
         ),
     )
     parser.add_argument(
@@ -2368,7 +2374,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Minimum weighted source-HDF5 fingertip confidence for both "
             "retarget TCPs in initial-hands mode (default: 0.5; absent "
-            "confidences mean 1; unused by initial-wrists)"
+            "confidences mean 1; unused by initial-palms)"
         ),
     )
     parser.add_argument(

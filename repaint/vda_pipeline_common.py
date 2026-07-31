@@ -9,7 +9,6 @@ import math
 import os
 from pathlib import Path
 import re
-import shlex
 import shutil
 import signal
 import subprocess
@@ -213,21 +212,9 @@ def format_elapsed(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
-def tail(path: Path, line_count: int = 30) -> str:
-    try:
-        lines = path.read_text(
-            encoding="utf-8",
-            errors="replace",
-        ).splitlines()
-    except OSError:
-        return ""
-    return "\n".join(lines[-line_count:])
-
-
 def run_stage_process(
     *,
     command: Sequence[str],
-    log_path: Path,
     stage_id: str,
     stage_name: str,
     item_key: str,
@@ -239,56 +226,49 @@ def run_stage_process(
 ) -> None:
     """Run one pipeline stage and keep its aggregate progress bar current."""
 
-    log_path.parent.mkdir(parents=True, exist_ok=True)
     stage_started = time.perf_counter()
     environment = os.environ.copy()
     environment["PYTHONUNBUFFERED"] = "1"
-    with log_path.open("w", encoding="utf-8") as log:
-        log.write(f"$ {shlex.join(command)}\n\n")
-        log.flush()
-        process = subprocess.Popen(
-            list(command),
-            cwd=cwd,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            text=True,
-            env=environment,
-            start_new_session=True,
-        )
-        try:
-            while True:
-                try:
-                    return_code = process.wait(timeout=poll_seconds)
-                except subprocess.TimeoutExpired:
-                    return_code = None
-                now = time.perf_counter()
-                progress.set_postfix(
-                    stage=stage_name,
-                    **{
-                        item_key: item_label,
-                        "stage_elapsed": format_elapsed(now - stage_started),
-                        "total_elapsed": format_elapsed(now - pipeline_started),
-                        "refresh": True,
-                    },
-                )
-                if return_code is not None:
-                    break
-        except BaseException:
+    process = subprocess.Popen(
+        list(command),
+        cwd=cwd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=environment,
+        start_new_session=True,
+    )
+    try:
+        while True:
             try:
-                os.killpg(process.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            try:
-                process.wait(timeout=5)
+                return_code = process.wait(timeout=poll_seconds)
             except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                process.wait()
-            raise
+                return_code = None
+            now = time.perf_counter()
+            progress.set_postfix(
+                stage=stage_name,
+                **{
+                    item_key: item_label,
+                    "stage_elapsed": format_elapsed(now - stage_started),
+                    "total_elapsed": format_elapsed(now - pipeline_started),
+                    "refresh": True,
+                },
+            )
+            if return_code is not None:
+                break
+    except BaseException:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+        raise
     if return_code != 0:
-        raise RuntimeError(
-            f"{stage_id} failed with exit code {return_code}; "
-            f"log={log_path}\n{tail(log_path)}"
-        )
+        raise RuntimeError(f"{stage_id} failed with exit code {return_code}")

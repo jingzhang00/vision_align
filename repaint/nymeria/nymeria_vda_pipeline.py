@@ -11,8 +11,8 @@ native inputs:
       -> source-sized Isaac robot-camera replay
 
 Camera translation follows the EgoDex camera-relative-to-hip mapping.  Nymeria
-does not contain articulated fingertips, so its calibrated scene coordinates
-are kept unchanged instead of fabricating a semantic scene anchor.
+does not contain articulated fingertips, so scene placement aligns its
+declared rigid-palm action frames to the matching replayed G1 palms.
 """
 
 from __future__ import annotations
@@ -51,6 +51,11 @@ from repaint.nymeria.nymeria_to_lerobot import (  # noqa: E402
 )
 from repaint.robot_camera import (  # noqa: E402
     BEINGBEYOND_HEAD_CAMERA_PROFILE,
+    ROBOT_PALM_OFFSETS_LOCAL_M,
+)
+from repaint.scene_hand_alignment import (  # noqa: E402
+    PALM_ALIGNMENT_METHOD,
+    PALM_ALIGNMENT_STAGE,
 )
 from repaint.vda_depth import (  # noqa: E402
     DEFAULT_CHECKPOINT,
@@ -103,7 +108,6 @@ class PipelinePaths:
     handless: Path
     prepared: Path
     final: Path
-    logs: Path
     report: Path
 
     @classmethod
@@ -116,7 +120,6 @@ class PipelinePaths:
             handless=root / "handless",
             prepared=root / "prepared",
             final=root / "final",
-            logs=root / "logs",
             report=root / "pipeline_report.json",
         )
 
@@ -146,7 +149,6 @@ class Stage:
     stage_id: str
     name: str
     command: tuple[str, ...] | None
-    log_path: Path
     dependencies: tuple[str, ...] = ()
     session: str | None = None
     episode_index: int | None = None
@@ -210,11 +212,10 @@ def _update_path_fingerprint(
                     digest.update(chunk)
 
 
-def _update_repaint_episode_fingerprint(
-    digest: Any,
+def _repaint_episode_video_paths(
     plan: PipelinePlan,
     episode_index: int,
-) -> None:
+) -> tuple[Path, Path]:
     paths = plan.config.paths
     info = _read_json(paths.lerobot / "meta/info.json")
     chunks_size = int(info.get("chunks_size", 1000))
@@ -225,8 +226,20 @@ def _update_repaint_episode_fingerprint(
         chunk_index=episode_index // chunks_size,
         file_index=episode_index % chunks_size,
     ))
-    source_video = (paths.lerobot / relative_video).resolve()
-    output_video = paths.handless / relative_video
+    return paths.lerobot / relative_video, paths.handless / relative_video
+
+
+def _update_repaint_episode_fingerprint(
+    digest: Any,
+    plan: PipelinePlan,
+    episode_index: int,
+) -> None:
+    paths = plan.config.paths
+    source_video, output_video = _repaint_episode_video_paths(
+        plan,
+        episode_index,
+    )
+    source_video = source_video.resolve()
     _update_path_fingerprint(digest, output_video)
 
     manifest = _read_json(paths.handless / "manifest.json")
@@ -454,7 +467,6 @@ def build_plan(
                 stage_id=stage_id,
                 name="alignment",
                 command=command,
-                log_path=config.paths.logs / f"00_{stage_id}.log",
                 session=session,
                 clip_stems=tuple(clip.stem for clip in session_clips),
             )
@@ -488,7 +500,6 @@ def build_plan(
                     ),
                     *arguments,
                 ),
-                log_path=config.paths.logs / "01_retarget.log",
                 dependencies=tuple(alignment_ids),
             )
         )
@@ -508,7 +519,6 @@ def build_plan(
                     "--min_coverage",
                     "0",
                 ),
-                log_path=config.paths.logs / "02_repaint.log",
                 dependencies=("retarget",),
             )
         )
@@ -548,18 +558,12 @@ def build_plan(
                         WORKSPACE_ROOT / "repaint/rgbd_prepare.py",
                         *arguments,
                     ),
-                    log_path=(
-                        config.paths.logs
-                        / f"03_prepare_{clip.episode_index:06d}.log"
-                    ),
                     dependencies=("retarget", "repaint"),
                     episode_index=clip.episode_index,
                 )
             )
-
-    if _stage_enabled(config.stop_after, "render"):
-        for clip in clips:
-            label = f"episode_{clip.episode_index:06d}"
+            if not _stage_enabled(config.stop_after, "render"):
+                continue
             output_video = config.paths.final / label / "g1_view.mp4"
             stages.append(
                 Stage(
@@ -575,7 +579,7 @@ def build_plan(
                         "--capture-view",
                         "robot-camera",
                         "--scene-alignment",
-                        "none",
+                        "initial-palms",
                         "--scene-leveling",
                         "none",
                         (
@@ -583,10 +587,6 @@ def build_plan(
                             if config.headless
                             else "--no-headless"
                         ),
-                    ),
-                    log_path=(
-                        config.paths.logs
-                        / f"04_render_{clip.episode_index:06d}.log"
                     ),
                     dependencies=(f"prepare_{clip.episode_index:06d}",),
                     episode_index=clip.episode_index,
@@ -1304,12 +1304,24 @@ def _validate_render(stage: Stage, plan: PipelinePlan) -> None:
     alignment = report.get("scene_alignment")
     if (
         not isinstance(alignment, dict)
-        or alignment.get("method") != "disabled"
-        or alignment.get("requested_mode") != "none"
-        or int(alignment.get("application_count", -1)) != 0
+        or int(alignment.get("schema_version", -1)) < 2
+        or alignment.get("method") != PALM_ALIGNMENT_METHOD
+        or alignment.get("requested_mode") != "initial-palms"
+        or int(alignment.get("pipeline_order", -1)) != 2
+        or int(alignment.get("application_count", -1)) != 1
+        or alignment.get("source_hand_target_mode") != "rigid_palm"
+        or alignment.get("source_visibility_confidence_used") is not False
+        or any(
+            bool(alignment.get(key, True))
+            for key in (
+                "fits_rotation",
+                "fits_scale",
+                "fits_linear_leveling",
+            )
+        )
     ):
         raise ValueError(
-            "Nymeria final render must disable scene alignment"
+            "Nymeria final render must apply rigid-palm scene alignment"
         )
     translation = np.asarray(
         alignment.get("world_translation_xyz_m"),
@@ -1318,11 +1330,34 @@ def _validate_render(stage: Stage, plan: PipelinePlan) -> None:
     if (
         translation.shape != (3,)
         or not np.isfinite(translation).all()
-        or not np.array_equal(translation, np.zeros(3, dtype=np.float64))
     ):
-        raise ValueError("Disabled Nymeria scene alignment must be identity")
+        raise ValueError("Nymeria palm scene-alignment translation is invalid")
+    semantics = alignment.get("anchor_semantics")
+    palm_offsets = np.asarray(
+        semantics.get("robot_palm_local_offsets_m")
+        if isinstance(semantics, dict)
+        else None,
+        dtype=np.float64,
+    )
+    if (
+        not isinstance(semantics, dict)
+        or semantics.get("source_transform_origins")
+        != ["transforms/leftHand", "transforms/rightHand"]
+        or semantics.get("robot_parent_frame_origins")
+        != ["left_wrist_yaw_link", "right_wrist_yaw_link"]
+        or palm_offsets.shape != ROBOT_PALM_OFFSETS_LOCAL_M.shape
+        or not np.array_equal(
+            palm_offsets,
+            ROBOT_PALM_OFFSETS_LOCAL_M,
+        )
+        or semantics.get("matches_retarget_rigid_palm_action_frames")
+        is not True
+        or semantics.get("uses_fingertips") is not False
+        or semantics.get("uses_hand_base_origins") is not False
+    ):
+        raise ValueError("Nymeria rigid-palm scene-alignment audit is invalid")
     operation_order = report.get("operation_order")
-    if operation_order != []:
+    if operation_order != [PALM_ALIGNMENT_STAGE]:
         raise ValueError("Nymeria scene-placement order is invalid")
     leveling = report.get("scene_leveling")
     if (
@@ -1377,6 +1412,24 @@ def _clear_stage(stage: Stage, plan: PipelinePlan) -> None:
         _remove_exact(paths.final / f"episode_{stage.episode_index:06d}")
 
 
+def _clear_episode_intermediates(
+    plan: PipelinePlan,
+    episode_index: int,
+) -> None:
+    _remove_exact(
+        plan.config.paths.prepared / f"episode_{episode_index:06d}"
+    )
+    _, handless_video = _repaint_episode_video_paths(plan, episode_index)
+    _remove_exact(handless_video)
+    if not plan.config.alignment_is_external:
+        clip = _clip_by_index(plan, episode_index)
+        _remove_exact(
+            plan.config.alignment_root
+            / clip.session
+            / f"{clip.stem}.hdf5"
+        )
+
+
 def _run_stage(
     stage: Stage,
     progress: tqdm[Any],
@@ -1387,7 +1440,6 @@ def _run_stage(
     assert stage.command is not None
     _run_process(
         command=stage.command,
-        log_path=stage.log_path,
         stage_id=stage.stage_id,
         stage_name=stage.name,
         item_key="item",
@@ -1434,8 +1486,9 @@ def _new_report(plan: PipelinePlan) -> dict[str, Any]:
             "visuals are hidden"
         ),
         "scene_alignment_policy": (
-            "support-plane leveling and wrist-derived scene translation are "
-            "disabled; calibrated Nymeria scene coordinates stay unchanged"
+            "support-plane leveling disabled; one constant XYZ translation "
+            "aligns Nymeria leftHand/rightHand rigid-palm action frames to "
+            "the matching replayed G1 canonical palm frames"
         ),
         "video_metadata_policy": (
             "ffprobe decoded/displayed frame count, source FPS and source "
@@ -1444,6 +1497,15 @@ def _new_report(plan: PipelinePlan) -> dict[str, Any]:
         "stop_after": config.stop_after,
         "resume": config.resume,
         "overwrite": config.overwrite,
+        "episode_failure_policy": (
+            "repaint manifest failures are terminal skips on resume; "
+            "prepare/render exceptions are retried on the next run"
+        ),
+        "intermediate_retention": (
+            "handless, prepared, and pipeline-owned alignment artifacts are "
+            "removed after render; only LeRobot, final outputs, and this "
+            "report are retained"
+        ),
         "selected_clips": [
             {
                 "episode_index": clip.episode_index,
@@ -1468,9 +1530,6 @@ def _new_report(plan: PipelinePlan) -> dict[str, Any]:
                 "command": (
                     None if stage.command is None else list(stage.command)
                 ),
-                "log": (
-                    None if stage.command is None else str(stage.log_path)
-                ),
                 "dependencies": list(stage.dependencies),
                 "input_fingerprint": None,
                 "validation": None,
@@ -1491,7 +1550,7 @@ def _initialize_output(plan: PipelinePlan) -> None:
         paths.handless,
         paths.prepared,
         paths.final,
-        paths.logs,
+        paths.root / "logs",
         paths.report,
     ]
     if not config.alignment_is_external:
@@ -1509,7 +1568,7 @@ def _initialize_output(plan: PipelinePlan) -> None:
                 + ", ".join(str(path) for path in existing)
             )
     paths.root.mkdir(parents=True, exist_ok=True)
-    paths.logs.mkdir(parents=True, exist_ok=True)
+    _remove_exact(paths.root / "logs")
 
 
 def execute(plan: PipelinePlan) -> dict[str, Any]:
@@ -1581,7 +1640,7 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
         clip = _clip_by_index(plan, episode_index)
         source = clip.source
         session_root = plan.config.src_root / clip.session
-        skipped_by_episode.setdefault(
+        skipped = skipped_by_episode.setdefault(
             episode_index,
             {
                 "episode_index": episode_index,
@@ -1617,11 +1676,6 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
                 "failure_status": failure_status,
                 "failed_stage": stage.stage_id,
                 "error": error,
-                "log": (
-                    None
-                    if stage.command is None
-                    else str(stage.log_path)
-                ),
                 "stage_paths": {
                     "lerobot_root": str(plan.config.paths.lerobot),
                     "handless_root": str(plan.config.paths.handless),
@@ -1638,7 +1692,33 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
                 "recorded_at": _utc_now(),
             },
         )
+        try:
+            if stage.name == "render":
+                _clear_stage(stage, plan)
+            _clear_episode_intermediates(plan, episode_index)
+        except Exception as exc:
+            skipped.setdefault("cleanup_errors", []).append(
+                {
+                    "stage": stage.stage_id,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
         report["skipped_episodes"] = list(skipped_by_episode.values())
+
+    def cleanup_completed_episode(stage: Stage) -> None:
+        assert stage.episode_index is not None
+        try:
+            _clear_episode_intermediates(plan, stage.episode_index)
+        except Exception as exc:
+            report.setdefault("cleanup_errors", []).append(
+                {
+                    "stage": stage.stage_id,
+                    "episode_index": stage.episode_index,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            report["updated_at"] = _utc_now()
+            _write_json_atomic(plan.config.paths.report, report)
 
     _write_json_atomic(plan.config.paths.report, report)
 
@@ -1810,6 +1890,8 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
                         time.perf_counter() - pipeline_started
                     )
                     _write_json_atomic(plan.config.paths.report, report)
+                    if stage.name == "render":
+                        cleanup_completed_episode(stage)
                     continue
                 if stage.command is None:
                     if not valid:
@@ -1963,6 +2045,8 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
                 )
                 _write_json_atomic(plan.config.paths.report, report)
                 progress.update(1)
+                if stage.name == "render":
+                    cleanup_completed_episode(stage)
 
             report.update(
                 status=(
@@ -1991,7 +2075,40 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
                     for clip in plan.clips
                     if clip.episode_index in completed_render_indices
                 ]
+                report["successful_episode_count"] = len(
+                    report["final_videos"]
+                )
+            report["skipped_episode_count"] = len(skipped_by_episode)
             _write_json_atomic(plan.config.paths.report, report)
+            cleanup_targets = [plan.config.paths.root / "logs"]
+            if plan.config.stop_after == "render":
+                cleanup_targets.extend(
+                    [
+                        plan.config.paths.handless,
+                        plan.config.paths.prepared,
+                    ]
+                )
+                if not plan.config.alignment_is_external:
+                    cleanup_targets.extend(
+                        [
+                            plan.config.paths.camera_alignment,
+                            plan.config.paths.alignment_reports,
+                        ]
+                    )
+            for target in cleanup_targets:
+                try:
+                    _remove_exact(target)
+                except Exception as exc:
+                    report.setdefault("cleanup_errors", []).append(
+                        {
+                            "stage": "finalize",
+                            "path": str(target),
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                    )
+            if report.get("cleanup_errors"):
+                report["updated_at"] = _utc_now()
+                _write_json_atomic(plan.config.paths.report, report)
             return report
         except BaseException:
             if report.get("status") == "running":

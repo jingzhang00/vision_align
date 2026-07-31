@@ -9,7 +9,10 @@ import numpy as np
 import pinocchio as pin
 from scipy.spatial.transform import Rotation
 
-from human_to_robot.retarget_g1_pinocchio import HAND_TIP_LOCAL_OFFSETS
+from human_to_robot.retarget_g1_pinocchio import (
+    HAND_TIP_LOCAL_OFFSETS,
+    PALM_OFFSET_FROM_WRIST,
+)
 
 
 # ROS camera links use X forward, Y left, Z up. OpenCV optical frames use
@@ -78,8 +81,13 @@ ROBOT_HAND_TCP_OFFSETS_LOCAL_M = np.asarray(
     ],
     dtype=np.float64,
 )
-SOURCE_WRIST_TRANSFORMS = ("leftHand", "rightHand")
+SOURCE_PALM_TRANSFORMS = ("leftHand", "rightHand")
 ROBOT_WRIST_FRAMES = ("left_wrist_yaw_link", "right_wrist_yaw_link")
+ROBOT_PALM_OFFSETS_LOCAL_M = np.repeat(
+    PALM_OFFSET_FROM_WRIST[None],
+    len(ROBOT_WRIST_FRAMES),
+    axis=0,
+)
 
 
 def _continuous_xyzw(quaternions: np.ndarray) -> np.ndarray:
@@ -297,11 +305,11 @@ def load_source_hand_tcp_points_camera_cv(
     return tcp, tcp_confidence
 
 
-def load_source_wrist_points_camera_cv(
+def load_source_palm_points_camera_cv(
     source_hdf5: Path,
     frame_indices: np.ndarray,
 ) -> np.ndarray:
-    """Return calibrated left/right wrist origins in each CV camera frame."""
+    """Return ``leftHand/rightHand`` under the rigid-palm action contract."""
 
     source_hdf5 = source_hdf5.resolve()
     if not source_hdf5.is_file():
@@ -318,8 +326,8 @@ def load_source_wrist_points_camera_cv(
             raise ValueError(
                 "transforms/camera must have shape [frames,4,4]"
             )
-        wrist_values: list[np.ndarray] = []
-        for name in SOURCE_WRIST_TRANSFORMS:
+        palm_values: list[np.ndarray] = []
+        for name in SOURCE_PALM_TRANSFORMS:
             key = f"transforms/{name}"
             transforms = np.asarray(handle[key], dtype=np.float64)
             if transforms.shape != camera.shape:
@@ -327,16 +335,16 @@ def load_source_wrist_points_camera_cv(
                     f"{key} must have shape {camera.shape}, "
                     f"got {transforms.shape}"
                 )
-            wrist_values.append(transforms[:, :3, 3])
+            palm_values.append(transforms[:, :3, 3])
 
     if int(frame_indices.max()) >= len(camera):
-        raise IndexError("source wrist frame index is out of range")
+        raise IndexError("source palm frame index is out of range")
     camera = camera[frame_indices]
-    wrists_world = np.stack(wrist_values, axis=1)[frame_indices]
+    palms_world = np.stack(palm_values, axis=1)[frame_indices]
     return np.einsum(
         "nji,nsj->nsi",
         camera[:, :3, :3],
-        wrists_world - camera[:, None, :3, 3],
+        palms_world - camera[:, None, :3, 3],
     )
 
 

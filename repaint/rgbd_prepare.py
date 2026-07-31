@@ -521,8 +521,7 @@ def prepare(args: argparse.Namespace) -> dict[str, object]:
             ),
             "prepared_alignment": "source extrinsic only",
             "replay_alignment": (
-                "disabled because Nymeria has rigid palms but no observed "
-                "fingertips"
+                "one initial bilateral rigid-palm midpoint translation"
                 if episode.source_dataset_kind == "nymeria"
                 else "one initial bilateral-hand midpoint translation"
             ),
