@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Visualize a LeRobot v3 G1 trajectory with Pinocchio kinematics."""
+"""Fast trajectory-only G1 replay using Pinocchio forward kinematics."""
 
 from __future__ import annotations
 
@@ -39,6 +39,7 @@ from repaint.trajectory_io import (  # noqa: E402
     DEFAULT_G1_URDF,
     SUPPORTED_FIELDS,
     Trajectory,
+    find_dataset_roots,
     list_episode_indices,
     load_trajectory,
 )
@@ -160,7 +161,7 @@ def plot_overview(
     fig.suptitle(
         f"G1 trajectory · episode {trajectory.episode_index} · "
         f"{frames} frames · {trajectory.fps:g} FPS\n"
-        "Kinematic inspection only; full replay belongs in Isaac",
+        "Kinematic inspection only; scene replay belongs in Isaac",
         color=FOREGROUND,
         fontsize=16,
         fontweight="bold",
@@ -176,7 +177,13 @@ def plot_animation(
     edges: list[tuple[int, int]],
     output_path: Path,
 ) -> None:
-    fig = plt.figure(figsize=(12.8, 7.2), dpi=100, facecolor=BACKGROUND)
+    width, height = trajectory.source_size
+    dpi = 100
+    fig = plt.figure(
+        figsize=(width / dpi, height / dpi),
+        dpi=dpi,
+        facecolor=BACKGROUND,
+    )
     axis = fig.add_subplot(111, projection="3d")
     style_3d_axis(axis)
     set_equal_3d_limits(axis, positions.reshape(-1, 3))
@@ -246,11 +253,21 @@ def plot_animation(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Create a Pinocchio-FK overview and 3D MP4 for a G1 "
-            "LeRobot v3 trajectory."
+            "Create a fast Pinocchio-FK overview and 3D MP4 for a G1 "
+            "LeRobot v3 trajectory. FPS and MP4 size come from the "
+            "episode source video."
         )
     )
-    parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
+    parser.add_argument(
+        "--dataset",
+        type=Path,
+        default=DEFAULT_DATASET,
+        help=(
+            "LeRobot root or folder recursively containing LeRobot datasets "
+            "(default: canonical "
+            "egodex/basic_pick_place/lerobot)."
+        ),
+    )
     parser.add_argument(
         "--episode",
         type=int,
@@ -284,7 +301,7 @@ def render_episode(args: argparse.Namespace, episode_index: int) -> None:
     )
     episode_dir = f"episode_{trajectory.episode_index:06d}"
     if args.output_dir is None:
-        output_dir = trajectory.dataset_root / "visualization" / episode_dir
+        output_dir = trajectory.dataset_root / "trajectory_check" / episode_dir
     elif args.episode is None:
         output_dir = args.output_dir / episode_dir
     else:
@@ -301,17 +318,26 @@ def render_episode(args: argparse.Namespace, episode_index: int) -> None:
 
 def main() -> None:
     args = parse_args()
-    episode_indices = (
-        (args.episode,)
-        if args.episode is not None
-        else list_episode_indices(args.dataset)
-    )
-    print(
-        f"Processing {len(episode_indices)} episode(s): "
-        + ", ".join(str(index) for index in episode_indices)
-    )
-    for episode_index in episode_indices:
-        render_episode(args, episode_index)
+    input_root = args.dataset.expanduser().resolve()
+    output_root = args.output_dir
+    dataset_roots = find_dataset_roots(input_root)
+    for dataset_root in dataset_roots:
+        args.dataset = dataset_root
+        if output_root is not None and len(dataset_roots) > 1:
+            args.output_dir = (
+                output_root / dataset_root.relative_to(input_root)
+            )
+        episode_indices = (
+            (args.episode,)
+            if args.episode is not None
+            else list_episode_indices(dataset_root)
+        )
+        print(
+            f"{dataset_root}: processing {len(episode_indices)} episode(s): "
+            + ", ".join(str(index) for index in episode_indices)
+        )
+        for episode_index in episode_indices:
+            render_episode(args, episode_index)
 
 
 if __name__ == "__main__":

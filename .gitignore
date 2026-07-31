@@ -17,3 +17,5 @@ mano_v1_2/models/*.pkl
 output_new/
 nymeria_scripts
 tests/
+/nymeria/vda/
+/egodex/

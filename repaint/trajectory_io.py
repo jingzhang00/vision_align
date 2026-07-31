@@ -1,4 +1,4 @@
-"""LeRobot v3 trajectory loading shared by the replay tools."""
+"""Minimal LeRobot v3 trajectory loading for the fast FK replay."""
 
 from __future__ import annotations
 
@@ -10,13 +10,16 @@ from typing import Any
 import numpy as np
 import pyarrow.parquet as pq
 
+from repaint.vda_pipeline_common import probe_video
+
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_DATASET = WORKSPACE_ROOT / "output_new/basic_pick_place"
+DEFAULT_DATASET = WORKSPACE_ROOT / "egodex/basic_pick_place/lerobot"
 DEFAULT_G1_URDF = (
     WORKSPACE_ROOT
     / "assets/unitree_description/urdf/g1/main_with_hand_new.urdf"
 )
+VIDEO_FEATURE = "observation.images.ego"
 SUPPORTED_FIELDS = ("observation.state", "action")
 
 
@@ -25,6 +28,8 @@ class Trajectory:
     dataset_root: Path
     episode_index: int
     fps: float
+    source_video: Path
+    source_size: tuple[int, int]
     field: str
     joint_names: tuple[str, ...]
     frame_indices: np.ndarray
@@ -60,8 +65,80 @@ def _episode_metadata_rows(dataset_root: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def find_dataset_roots(folder: Path) -> tuple[Path, ...]:
+    """Find LeRobot dataset roots recursively under a folder."""
+
+    folder = folder.expanduser().resolve()
+    if not folder.is_dir():
+        raise NotADirectoryError(folder)
+    roots = tuple(
+        sorted(info.parent.parent for info in folder.rglob("meta/info.json"))
+    )
+    if not roots:
+        raise FileNotFoundError(f"No LeRobot datasets under {folder}")
+    return roots
+
+
+def _episode_metadata_row(
+    dataset_root: Path,
+    episode_index: int,
+) -> dict[str, Any]:
+    matching = [
+        row
+        for row in _episode_metadata_rows(dataset_root)
+        if int(row["episode_index"]) == episode_index
+    ]
+    if len(matching) != 1:
+        available = sorted(
+            int(row["episode_index"])
+            for row in _episode_metadata_rows(dataset_root)
+        )
+        raise ValueError(
+            f"Episode {episode_index} was not found exactly once; "
+            f"available episodes: {available}"
+        )
+    return matching[0]
+
+
+def _source_video_metadata(path: Path) -> tuple[int, int, int, float]:
+    metadata = probe_video(path)
+    return (
+        metadata.width,
+        metadata.height,
+        metadata.frame_count,
+        metadata.fps,
+    )
+
+
+def _episode_source_video(
+    *,
+    dataset_root: Path,
+    info: dict[str, Any],
+    episode_row: dict[str, Any],
+) -> Path:
+    template = info.get("video_path")
+    if not isinstance(template, str) or not template:
+        raise ValueError("LeRobot metadata does not declare video_path")
+    chunk_key = f"videos/{VIDEO_FEATURE}/chunk_index"
+    file_key = f"videos/{VIDEO_FEATURE}/file_index"
+    if chunk_key not in episode_row or file_key not in episode_row:
+        raise KeyError(
+            f"Episode metadata does not locate {VIDEO_FEATURE!r}"
+        )
+    relative = template.format(
+        video_key=VIDEO_FEATURE,
+        chunk_index=int(episode_row[chunk_key]),
+        file_index=int(episode_row[file_key]),
+    )
+    path = dataset_root / relative
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing source video: {path}")
+    return path
+
+
 def list_episode_indices(dataset_root: Path) -> tuple[int, ...]:
     """Return every episode index declared by a LeRobot dataset."""
+
     indices = sorted(
         int(row["episode_index"])
         for row in _episode_metadata_rows(dataset_root.resolve())
@@ -80,6 +157,8 @@ def load_trajectory(
     start_frame: int,
     end_frame: int | None,
 ) -> Trajectory:
+    """Load one trajectory and derive playback metadata from its source MP4."""
+
     dataset_root = dataset_root.resolve()
     info = _read_json(dataset_root / "meta/info.json")
     if info.get("codebase_version") != "v3.0":
@@ -98,22 +177,22 @@ def load_trajectory(
     if not joint_names:
         raise ValueError(f"{field} does not declare any G1 joint names")
 
-    episode_rows = _episode_metadata_rows(dataset_root)
-    matching = [
-        row
-        for row in episode_rows
-        if int(row["episode_index"]) == episode_index
-    ]
-    if len(matching) != 1:
-        available = sorted(
-            int(row["episode_index"])
-            for row in episode_rows
-        )
+    episode_row = _episode_metadata_row(dataset_root, episode_index)
+    length = int(episode_row["length"])
+    source_video = _episode_source_video(
+        dataset_root=dataset_root,
+        info=info,
+        episode_row=episode_row,
+    )
+    width, height, source_frame_count, source_fps = (
+        _source_video_metadata(source_video)
+    )
+    if source_frame_count != length:
         raise ValueError(
-            f"Episode {episode_index} was not found exactly once; "
-            f"available episodes: {available}"
+            "Source video and trajectory lengths disagree: "
+            f"{source_frame_count} != {length}"
         )
-    episode_row = matching[0]
+
     data_path = dataset_root / str(info["data_path"]).format(
         chunk_index=int(episode_row["data/chunk_index"]),
         file_index=int(episode_row["data/file_index"]),
@@ -151,7 +230,6 @@ def load_trajectory(
         dtype=np.float64,
     )[mask][order]
 
-    length = int(episode_row["length"])
     if not np.array_equal(frame_indices, np.arange(length)):
         raise ValueError(
             f"Episode {episode_index} frame indices are not contiguous"
@@ -187,7 +265,9 @@ def load_trajectory(
     return Trajectory(
         dataset_root=dataset_root,
         episode_index=episode_index,
-        fps=float(info["fps"]),
+        fps=source_fps,
+        source_video=source_video,
+        source_size=(width, height),
         field=field,
         joint_names=joint_names,
         frame_indices=frame_indices[selection],

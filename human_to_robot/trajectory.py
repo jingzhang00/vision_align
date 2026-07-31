@@ -51,6 +51,7 @@ HAND_TARGET_MODES = frozenset(
         RIGID_PALM_TARGET,
     }
 )
+MIN_HAND_ACTION_FRAME_SINE = 0.25
 
 
 @dataclass(frozen=True)
@@ -393,7 +394,14 @@ def align_hand_action(
         & np.isfinite(y_norm)
         & (width > 1e-6)
         & (palm_length > 1e-6)
-        & (y_norm > 1e-6)
+        # The jaw and wrist-to-finger axes become an ill-conditioned frame
+        # when nearly parallel.  Use the dimensionless sine of their angle,
+        # rather than an absolute metric threshold, so a single degenerate
+        # frame is interpolated instead of producing a 50--110 degree flip.
+        & (
+            y_norm / np.maximum(palm_length, 1e-9)
+            >= MIN_HAND_ACTION_FRAME_SINE
+        )
     )
     position = _smooth_values(
         raw_position,

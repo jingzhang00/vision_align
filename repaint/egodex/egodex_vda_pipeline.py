@@ -1,0 +1,1629 @@
+#!/usr/bin/env python3
+"""Run the canonical EgoDex-to-G1 Video Depth Anything pipeline.
+
+The orchestrator deliberately keeps all video timing and image geometry out of
+task configuration.  Source metadata is probed from every MP4, the LeRobot and
+prepared stages retain it, and the final Isaac recording is checked against it.
+Child-process output is written to per-stage logs so the terminal shows exactly
+one aggregate progress bar for each task.
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import asdict, dataclass
+import math
+from pathlib import Path
+import shlex
+import sys
+import time
+from typing import Any, Iterable, Sequence
+
+from tqdm import tqdm
+
+from repaint.robot_camera import BEINGBEYOND_HEAD_CAMERA_PROFILE
+from repaint.scene_hand_alignment import (
+    HAND_TCP_ALIGNMENT_METHOD,
+    HAND_TCP_ALIGNMENT_STAGE,
+)
+from repaint.scene_leveling import (
+    SUPPORT_PLANE_LEVELING_METHOD,
+    SUPPORT_PLANE_LEVELING_STAGE,
+)
+from repaint.vda_pipeline_common import (
+    VideoMetadata,
+    build_command as _stage_command,
+    format_elapsed as _format_elapsed,
+    load_previous_stages as _load_previous_stages,
+    natural_key as _natural_key,
+    probe_video,
+    read_json as _read_json_object,
+    remove_exact as _remove_exact_path,
+    run_stage_process as _run_process,
+    utc_now as _utc_now,
+    write_json_atomic as _write_json_atomic,
+)
+
+
+WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_TASKS = (
+    "basic_pick_place",
+    "flip_coin",
+    "insert_remove_usb",
+    "pour",
+)
+VIDEO_KEY = "observation.images.ego"
+LEROBOT_CHUNKS_SIZE = 1000
+BEINGBEYOND_REFERENCE_SIZE = (640, 480)
+BEINGBEYOND_RESET_GUARD_X_M = 0.005
+SCENE_GEOMETRY_OPERATION_ORDER = (
+    SUPPORT_PLANE_LEVELING_STAGE,
+    HAND_TCP_ALIGNMENT_STAGE,
+)
+
+
+@dataclass(frozen=True)
+class SourceEpisode:
+    """One naturally ordered same-stem EgoDex HDF5/MP4 pair."""
+
+    episode_index: int
+    stem: str
+    hdf5_path: Path
+    video_path: Path
+    video: VideoMetadata
+
+
+@dataclass(frozen=True)
+class TaskPaths:
+    root: Path
+    lerobot: Path
+    handless: Path
+    prepared: Path
+    final: Path
+    logs: Path
+    report: Path
+
+    @classmethod
+    def from_root(cls, root: Path) -> "TaskPaths":
+        return cls(
+            root=root,
+            lerobot=root / "lerobot",
+            handless=root / "handless",
+            prepared=root / "prepared",
+            final=root / "final",
+            logs=root / "logs",
+            report=root / "pipeline_report.json",
+        )
+
+
+@dataclass(frozen=True)
+class PipelineConfig:
+    """Inputs which may vary without encoding video geometry or timing."""
+
+    dataset_root: Path
+    output_root: Path
+    python_executable: Path
+    resume: bool = True
+    overwrite: bool = False
+    headless: bool = True
+    scene_scale: float | None = None
+    vda_checkpoint: Path | None = None
+    poll_seconds: float = 0.5
+
+
+@dataclass(frozen=True)
+class Stage:
+    """One resumable child command in a task pipeline."""
+
+    stage_id: str
+    name: str
+    episode_index: int | None
+    command: tuple[str, ...]
+    log_path: Path
+    artifact_paths: tuple[Path, ...]
+    dependencies: tuple[str, ...] = ()
+
+    @property
+    def episode_label(self) -> str:
+        if self.episode_index is None:
+            return "all"
+        return f"{self.episode_index:06d}"
+
+
+@dataclass(frozen=True)
+class TaskPlan:
+    task: str
+    source_root: Path
+    paths: TaskPaths
+    episodes: tuple[SourceEpisode, ...]
+    stages: tuple[Stage, ...]
+
+
+def discover_source_episodes(source_root: Path) -> tuple[SourceEpisode, ...]:
+    """Discover same-stem pairs using the retargeter's natural ordering."""
+
+    root = source_root.expanduser().resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(f"EgoDex task directory does not exist: {root}")
+    hdf5_paths = sorted(
+        {path.resolve() for path in root.rglob("*.hdf5")},
+        key=lambda path: _natural_key(str(path.relative_to(root))),
+    )
+    if not hdf5_paths:
+        raise FileNotFoundError(f"No EgoDex HDF5 files found under {root}")
+
+    episodes: list[SourceEpisode] = []
+    missing: list[Path] = []
+    for episode_index, hdf5_path in enumerate(hdf5_paths):
+        video_path = hdf5_path.with_suffix(".mp4")
+        if not video_path.is_file():
+            missing.append(video_path)
+            continue
+        stem = hdf5_path.relative_to(root).with_suffix("").as_posix()
+        episodes.append(
+            SourceEpisode(
+                episode_index=episode_index,
+                stem=stem,
+                hdf5_path=hdf5_path,
+                video_path=video_path,
+                video=probe_video(video_path),
+            )
+        )
+    if missing:
+        formatted = "\n".join(f"  - {path}" for path in missing)
+        raise FileNotFoundError(
+            "Each EgoDex HDF5 requires a same-stem MP4. Missing:\n"
+            f"{formatted}"
+        )
+    return tuple(episodes)
+
+
+def build_task_plan(task: str, config: PipelineConfig) -> TaskPlan:
+    """Build the canonical route and its output contract for one task."""
+
+    if (
+        not task
+        or task in {".", ".."}
+        or Path(task).name != task
+        or "/" in task
+        or "\\" in task
+    ):
+        raise ValueError(f"Task must be one safe directory name, got {task!r}")
+    source_root = (config.dataset_root / task).expanduser().resolve()
+    episodes = discover_source_episodes(source_root)
+    task_paths = TaskPaths.from_root(
+        (config.output_root / task).expanduser().resolve()
+    )
+    python = config.python_executable
+    stages: list[Stage] = []
+
+    retarget_command = _stage_command(
+        python,
+        WORKSPACE_ROOT / "repaint/egodex/egodex_to_robot.py",
+        "--src-root",
+        source_root,
+        "--output-root",
+        task_paths.lerobot,
+        "--no-overwrite",
+    )
+    stages.append(
+        Stage(
+            stage_id="retarget",
+            name="retarget",
+            episode_index=None,
+            command=retarget_command,
+            log_path=task_paths.logs / "00_retarget.log",
+            artifact_paths=(
+                task_paths.lerobot / "meta/info.json",
+                task_paths.lerobot / "meta/egodex.json",
+            ),
+        )
+    )
+
+    repaint_command = _stage_command(
+        python,
+        WORKSPACE_ROOT / "repaint/remove_hands.py",
+        "--input_dir",
+        task_paths.lerobot,
+        "--output_dir",
+        task_paths.handless,
+    )
+    stages.append(
+        Stage(
+            stage_id="repaint",
+            name="repaint",
+            episode_index=None,
+            command=repaint_command,
+            log_path=task_paths.logs / "01_repaint.log",
+            artifact_paths=tuple(
+                (
+                    task_paths.handless
+                    / "videos"
+                    / VIDEO_KEY
+                    / f"chunk-{episode.episode_index // LEROBOT_CHUNKS_SIZE:03d}"
+                    / f"file-{episode.episode_index % LEROBOT_CHUNKS_SIZE:03d}.mp4"
+                )
+                for episode in episodes
+            ),
+            dependencies=("retarget",),
+        )
+    )
+
+    for episode in episodes:
+        label = f"episode_{episode.episode_index:06d}"
+        prepared_root = task_paths.prepared / label
+        final_root = task_paths.final / label
+        prepare_arguments: list[str | Path] = [
+            "--dataset",
+            task_paths.lerobot,
+            "--source-root",
+            source_root,
+            "--removed-root",
+            task_paths.handless,
+            "--episode",
+            str(episode.episode_index),
+            "--output",
+            prepared_root,
+        ]
+        if config.scene_scale is not None:
+            prepare_arguments.extend(
+                ["--scene-scale", repr(float(config.scene_scale))]
+            )
+        if config.vda_checkpoint is not None:
+            prepare_arguments.extend(
+                ["--vda-checkpoint", config.vda_checkpoint]
+            )
+        prepare_id = f"prepare_{episode.episode_index:06d}"
+        stages.append(
+            Stage(
+                stage_id=prepare_id,
+                name="prepare",
+                episode_index=episode.episode_index,
+                command=_stage_command(
+                    python,
+                    WORKSPACE_ROOT / "repaint/rgbd_prepare.py",
+                    *prepare_arguments,
+                ),
+                log_path=(
+                    task_paths.logs
+                    / f"02_prepare_episode_{episode.episode_index:06d}.log"
+                ),
+                artifact_paths=(
+                    prepared_root / "episode_data.npz",
+                    prepared_root / "prepare_report.json",
+                ),
+                dependencies=("retarget", "repaint"),
+            )
+        )
+
+        output_video = final_root / "g1_view.mp4"
+        render_arguments: list[str | Path] = [
+            "--prepared",
+            prepared_root,
+            "--output",
+            output_video,
+            "--capture-view",
+            "robot-camera",
+            "--headless" if config.headless else "--no-headless",
+        ]
+        stages.append(
+            Stage(
+                stage_id=f"render_{episode.episode_index:06d}",
+                name="render",
+                episode_index=episode.episode_index,
+                command=_stage_command(
+                    python,
+                    WORKSPACE_ROOT / "repaint/vda_scene_isaac.py",
+                    *render_arguments,
+                ),
+                log_path=(
+                    task_paths.logs
+                    / f"03_render_episode_{episode.episode_index:06d}.log"
+                ),
+                artifact_paths=(
+                    output_video,
+                    output_video.with_suffix(".json"),
+                ),
+                dependencies=(prepare_id,),
+            )
+        )
+
+    return TaskPlan(
+        task=task,
+        source_root=source_root,
+        paths=task_paths,
+        episodes=episodes,
+        stages=tuple(stages),
+    )
+
+
+def _episode_for_stage(stage: Stage, plan: TaskPlan) -> SourceEpisode:
+    if stage.episode_index is None:
+        raise ValueError(f"{stage.stage_id} is not episode-specific")
+    return plan.episodes[stage.episode_index]
+
+
+def _validate_retarget(plan: TaskPlan) -> None:
+    info = _read_json_object(plan.paths.lerobot / "meta/info.json")
+    manifest = _read_json_object(plan.paths.lerobot / "meta/egodex.json")
+    if int(manifest.get("schema_version", -1)) < 6:
+        raise ValueError(
+            "LeRobot EgoDex manifest predates complete-O6 GMR and must be "
+            "regenerated"
+        )
+    if manifest.get("hand_target_adapter") != (
+        "source action -> inverse articulated O6 wrist/action transform -> "
+        "GMR wrist pose"
+    ):
+        raise ValueError(
+            "LeRobot EgoDex manifest has an unsupported hand target adapter"
+        )
+    gmr_robot_model = manifest.get("gmr_robot_model")
+    if not isinstance(gmr_robot_model, dict) or gmr_robot_model.get(
+        "kind"
+    ) != "main_with_hand_new.urdf:floating_o6":
+        raise ValueError(
+            "LeRobot EgoDex manifest was not solved with the complete O6 URDF"
+        )
+    if (
+        gmr_robot_model.get("floating_root") is not True
+        or gmr_robot_model.get("fixed_link_fusion") is not False
+        or int(gmr_robot_model.get("robot_joint_count", -1)) != 51
+        or int(gmr_robot_model.get("o6_hand_joint_count", -1)) != 22
+    ):
+        raise ValueError(
+            "LeRobot EgoDex manifest has an invalid complete-O6 GMR model"
+        )
+    mimic_constraints = gmr_robot_model.get("o6_mimic_constraints")
+    if not isinstance(mimic_constraints, dict) or int(
+        mimic_constraints.get("equation_count", -1)
+    ) != 10:
+        raise ValueError(
+            "LeRobot EgoDex manifest lacks validated O6 mimic constraints"
+        )
+    collision_avoidance = gmr_robot_model.get(
+        "cross_hand_collision_avoidance"
+    )
+    if not isinstance(collision_avoidance, dict) or int(
+        collision_avoidance.get("geometry_pairs", -1)
+    ) != 144:
+        raise ValueError(
+            "LeRobot EgoDex manifest lacks GMR cross-hand collision avoidance"
+        )
+    if (
+        collision_avoidance.get("solver")
+        != "Mink hard QP constraints; no post-GMR arm refinement"
+        or not math.isclose(
+            float(
+                collision_avoidance.get(
+                    "planning_clearance_m",
+                    float("nan"),
+                )
+            ),
+            0.015,
+            abs_tol=1e-12,
+        )
+    ):
+        raise ValueError(
+            "LeRobot EgoDex manifest has an obsolete GMR collision solver"
+        )
+    manifest_episodes = manifest.get("episodes")
+    if not isinstance(manifest_episodes, list):
+        raise ValueError("LeRobot EgoDex manifest has no episodes list")
+    if int(info.get("total_episodes", -1)) != len(plan.episodes):
+        raise ValueError("LeRobot total_episodes disagrees with the source task")
+    if len(manifest_episodes) != len(plan.episodes):
+        raise ValueError("LeRobot manifest episode count disagrees with source")
+    chunks_size = int(info.get("chunks_size", 1000))
+    if chunks_size <= 0:
+        raise ValueError("LeRobot chunks_size must be positive")
+
+    for source, recorded in zip(plan.episodes, manifest_episodes, strict=True):
+        if int(recorded.get("episode_index", -1)) != source.episode_index:
+            raise ValueError("LeRobot episode indices are not naturally ordered")
+        if str(recorded.get("source_stem")) != source.stem:
+            raise ValueError("LeRobot source_stem differs from the source task")
+        if int(recorded.get("frame_count", -1)) != source.video.frame_count:
+            raise ValueError("LeRobot frame_count differs from source MP4")
+        chunk_index = source.episode_index // chunks_size
+        file_index = source.episode_index % chunks_size
+        copied_video = (
+            plan.paths.lerobot
+            / "videos"
+            / VIDEO_KEY
+            / f"chunk-{chunk_index:03d}"
+            / f"file-{file_index:03d}.mp4"
+        )
+        copied_meta = probe_video(copied_video)
+        if not copied_meta.compatible_with(source.video):
+            raise ValueError(
+                f"LeRobot video metadata changed for episode "
+                f"{source.episode_index}"
+            )
+
+
+def _validate_repaint(plan: TaskPlan) -> None:
+    info = _read_json_object(plan.paths.lerobot / "meta/info.json")
+    chunks_size = int(info.get("chunks_size", LEROBOT_CHUNKS_SIZE))
+    if chunks_size <= 0:
+        raise ValueError("LeRobot chunks_size must be positive")
+    failed = _repaint_manifest_failures(plan)
+    for source in plan.episodes:
+        if source.episode_index in failed:
+            continue
+        output = (
+            plan.paths.handless
+            / "videos"
+            / VIDEO_KEY
+            / f"chunk-{source.episode_index // chunks_size:03d}"
+            / f"file-{source.episode_index % chunks_size:03d}.mp4"
+        )
+        output_meta = probe_video(output)
+        if not output_meta.compatible_with(source.video):
+            raise ValueError(
+                f"Handless video metadata changed for {source.stem}: "
+                f"{asdict(output_meta)} != {asdict(source.video)}"
+            )
+
+
+def _repaint_manifest_failures(
+    plan: TaskPlan,
+) -> dict[int, dict[str, Any]]:
+    info = _read_json_object(plan.paths.lerobot / "meta/info.json")
+    chunks_size = int(info.get("chunks_size", LEROBOT_CHUNKS_SIZE))
+    if chunks_size <= 0:
+        raise ValueError("LeRobot chunks_size must be positive")
+    manifest = _read_json_object(plan.paths.handless / "manifest.json")
+    entries = manifest.get("episodes")
+    if not isinstance(entries, list) or len(entries) != len(plan.episodes):
+        raise ValueError("Arm-removal manifest episode count is incorrect")
+
+    failures: dict[int, dict[str, Any]] = {}
+    successful = {"ok", "skipped", "passthrough_no_target"}
+    for source in plan.episodes:
+        input_video = (
+            plan.paths.lerobot
+            / "videos"
+            / VIDEO_KEY
+            / f"chunk-{source.episode_index // chunks_size:03d}"
+            / f"file-{source.episode_index % chunks_size:03d}.mp4"
+        ).resolve()
+        matches = [
+            entry
+            for entry in entries
+            if isinstance(entry, dict)
+            and Path(str(entry.get("source", ""))).expanduser().resolve()
+            == input_video
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                f"{source.stem} has {len(matches)} arm-removal entries"
+            )
+        entry = matches[0]
+        status = str(entry.get("status", ""))
+        if status not in successful:
+            failures[source.episode_index] = {
+                "status": status or "unknown",
+                "error": str(
+                    entry.get("error")
+                    or entry.get("note")
+                    or f"remove_hands status={status!r}"
+                ),
+            }
+            continue
+        expected_output = (
+            plan.paths.handless
+            / "videos"
+            / VIDEO_KEY
+            / f"chunk-{source.episode_index // chunks_size:03d}"
+            / f"file-{source.episode_index % chunks_size:03d}.mp4"
+        ).resolve()
+        if Path(str(entry.get("output", ""))).expanduser().resolve() != (
+            expected_output
+        ):
+            raise ValueError(
+                f"{source.stem} arm-removal output path is incorrect"
+            )
+    return failures
+
+
+def _numbered_png_count(path: Path) -> int:
+    if not path.is_dir():
+        raise FileNotFoundError(path)
+    indices = sorted(
+        int(item.stem)
+        for item in path.iterdir()
+        if item.is_file()
+        and item.suffix.lower() == ".png"
+        and item.stem.isdigit()
+    )
+    if indices != list(range(len(indices))):
+        raise ValueError(f"PNG frames in {path} are not contiguous from zero")
+    return len(indices)
+
+
+def _validate_prepared(stage: Stage, plan: TaskPlan) -> None:
+    import numpy as np
+
+    source = _episode_for_stage(stage, plan)
+    root = plan.paths.prepared / f"episode_{source.episode_index:06d}"
+    archive_path = root / "episode_data.npz"
+    if not (root / "prepare_report.json").is_file():
+        raise FileNotFoundError(root / "prepare_report.json")
+    with np.load(archive_path, allow_pickle=False) as archive:
+        frame_indices = np.asarray(archive["frame_indices"], dtype=np.int64)
+        source_size = tuple(
+            int(value) for value in np.asarray(archive["source_size"]).tolist()
+        )
+        fps = float(archive["fps"])
+    if len(frame_indices) != source.video.frame_count:
+        raise ValueError("Prepared frame count differs from source MP4")
+    if not np.array_equal(
+        frame_indices,
+        np.arange(source.video.frame_count, dtype=np.int64),
+    ):
+        raise ValueError("Prepared frame_indices are not the full source episode")
+    if source_size != (source.video.width, source.video.height):
+        raise ValueError("Prepared source_size differs from source MP4")
+    if abs(fps - source.video.fps) > 0.01:
+        raise ValueError("Prepared FPS differs from source MP4")
+    if _numbered_png_count(root / "rgb") != source.video.frame_count:
+        raise ValueError("Prepared RGB frame count differs from source MP4")
+    if _numbered_png_count(root / "depth_mm") != source.video.frame_count:
+        raise ValueError("Prepared depth frame count differs from source MP4")
+
+
+def _validate_render(stage: Stage, plan: TaskPlan) -> None:
+    source = _episode_for_stage(stage, plan)
+    output_video = (
+        plan.paths.final
+        / f"episode_{source.episode_index:06d}"
+        / "g1_view.mp4"
+    )
+    output_report = output_video.with_suffix(".json")
+    rendered = probe_video(output_video)
+    if not rendered.compatible_with(source.video):
+        raise ValueError(
+            "Final G1 video timing or resolution differs from source: "
+            f"{asdict(rendered)} != {asdict(source.video)}"
+        )
+    report = _read_json_object(output_report)
+    if str(report.get("capture_view")) != "robot-camera":
+        raise ValueError("Final Isaac report is not a robot-camera capture")
+    if int(report.get("frame_count", -1)) != source.video.frame_count:
+        raise ValueError("Final Isaac report frame_count differs from source")
+    output_size = (
+        source.video.width,
+        source.video.height,
+    )
+    if tuple(report.get("output_size", ())) != output_size:
+        raise ValueError("Final Isaac report output_size differs from source")
+    if abs(float(report.get("fps", -1.0)) - source.video.fps) > 0.01:
+        raise ValueError("Final Isaac report FPS differs from source")
+
+    # The active BeingBeyond camera is natively 4:3. Preserve that aspect
+    # ratio, then center-letterbox it into the source-sized output instead of
+    # independently scaling K along x/y.
+    unit_count = min(output_size[0] // 4, output_size[1] // 3)
+    if unit_count <= 0:
+        raise ValueError("Source video is too small for a 4:3 camera capture")
+    content_size = (4 * unit_count, 3 * unit_count)
+    horizontal_padding = output_size[0] - content_size[0]
+    vertical_padding = output_size[1] - content_size[1]
+    expected_offsets = {
+        "left": horizontal_padding // 2,
+        "top": vertical_padding // 2,
+        "right": horizontal_padding - horizontal_padding // 2,
+        "bottom": vertical_padding - vertical_padding // 2,
+    }
+    if tuple(report.get("render_size", ())) != content_size:
+        raise ValueError(
+            "Final Isaac report render_size is not the exact 4:3 content size"
+        )
+    letterbox = report.get("letterbox")
+    if not isinstance(letterbox, dict):
+        raise ValueError("Final Isaac report has no letterbox geometry")
+    if tuple(letterbox.get("output_size", ())) != output_size:
+        raise ValueError("Final Isaac letterbox output_size differs from source")
+    if tuple(letterbox.get("content_size", ())) != content_size:
+        raise ValueError("Final Isaac letterbox content_size is not exact 4:3")
+    if letterbox.get("offsets_px") != expected_offsets:
+        raise ValueError("Final Isaac letterbox offsets are not centered")
+
+    capture_camera = report.get("capture_camera")
+    if not isinstance(capture_camera, dict):
+        raise ValueError("Final Isaac report has no capture_camera metadata")
+    if capture_camera.get("profile") != BEINGBEYOND_HEAD_CAMERA_PROFILE:
+        raise ValueError(
+            "Final Isaac report does not use the exact BeingBeyond profile"
+        )
+    if tuple(capture_camera.get("reference_size", ())) != (
+        BEINGBEYOND_REFERENCE_SIZE
+    ):
+        raise ValueError("Final Isaac report has the wrong camera reference size")
+    if tuple(capture_camera.get("content_size", ())) != content_size:
+        raise ValueError("Final Isaac camera content_size differs from render")
+    if tuple(capture_camera.get("output_size", ())) != output_size:
+        raise ValueError("Final Isaac camera output_size differs from source")
+    if not bool(capture_camera.get("reset_guard_applied")):
+        raise ValueError("BeingBeyond 5 mm reset guard was not applied")
+    if (
+        abs(
+            float(capture_camera.get("reset_guard_forward_x_m", -1.0))
+            - BEINGBEYOND_RESET_GUARD_X_M
+        )
+        > 1e-9
+    ):
+        raise ValueError("BeingBeyond reset guard distance is incorrect")
+    hand_projection = capture_camera.get("hand_projection")
+    if not isinstance(hand_projection, dict):
+        raise ValueError("Final Isaac report has no hand projection diagnostic")
+    if int(hand_projection.get("frame_count", -1)) != source.video.frame_count:
+        raise ValueError("Hand projection diagnostic frame_count differs")
+
+    articulation_commit = report.get("articulation_commit")
+    if not isinstance(articulation_commit, dict):
+        raise ValueError("Final Isaac report has no articulation commit audit")
+    if int(articulation_commit.get("schema_version", -1)) < 2:
+        raise ValueError(
+            "Final Isaac report predates render-synchronized articulation "
+            "validation"
+        )
+    if not bool(articulation_commit.get("strict_validation_passed")):
+        raise ValueError("Isaac trajectory commit validation did not pass")
+    if (
+        int(articulation_commit.get("verified_application_count", -1))
+        != source.video.frame_count
+    ):
+        raise ValueError(
+            "Isaac trajectory commit count differs from source frame count"
+        )
+    render_sync = articulation_commit.get("render_sync_validation")
+    if not isinstance(render_sync, dict) or not bool(
+        render_sync.get("passed")
+    ):
+        raise ValueError("Isaac PhysX-to-Fabric render sync did not pass")
+    if not bool(render_sync.get("fabric_update_requested")):
+        raise ValueError("Isaac articulation was not explicitly synced to Fabric")
+    step_delta = render_sync.get("physics_step_index_delta")
+    if (
+        not isinstance(step_delta, dict)
+        or float(step_delta.get("min", 0.0)) <= 0.0
+    ):
+        raise ValueError(
+            "Isaac physics step did not advance before every rendered frame"
+        )
+
+    scene_leveling = report.get("scene_leveling")
+    if not isinstance(scene_leveling, dict):
+        raise ValueError("Final Isaac report has no scene-leveling audit")
+    if tuple(report.get("operation_order", ())) != (
+        SCENE_GEOMETRY_OPERATION_ORDER
+    ):
+        raise ValueError(
+            "Final Isaac scene operation_order must level before "
+            "fingertip-TCP placement"
+        )
+    if int(scene_leveling.get("schema_version", -1)) < 2:
+        raise ValueError("Final Isaac scene-leveling audit schema is obsolete")
+    if scene_leveling.get("method") != SUPPORT_PLANE_LEVELING_METHOD:
+        raise ValueError(
+            "Final Isaac scene did not use Z-only affine support-plane "
+            "leveling"
+        )
+    if scene_leveling.get("status") != "applied":
+        raise ValueError("Final Isaac support-plane leveling was not applied")
+    if int(scene_leveling.get("pipeline_order", -1)) != 1:
+        raise ValueError("Support-plane leveling is not pipeline operation 1")
+    if int(scene_leveling.get("application_count", -1)) != 1:
+        raise ValueError("Final Isaac scene-leveling application count is wrong")
+    quality_gates = scene_leveling.get("quality_gates")
+    if not isinstance(quality_gates, dict) or not bool(
+        quality_gates.get("passed")
+    ):
+        raise ValueError("Final Isaac scene-leveling quality gates did not pass")
+    if (
+        scene_leveling.get("fits_yaw") is not False
+        or scene_leveling.get("fits_scale") is not False
+    ):
+        raise ValueError("Scene leveling must not fit yaw or scale")
+    if scene_leveling.get("fits_rotation") is not False:
+        raise ValueError("Z-only affine scene leveling must not fit rotation")
+    if scene_leveling.get("fits_height_shear") is not True:
+        raise ValueError("Scene leveling did not fit the required Z-only shear")
+    if scene_leveling.get("fits_translation") is not False:
+        raise ValueError("Scene leveling must not fit a translation")
+    if scene_leveling.get("preserves_world_xy") is not True:
+        raise ValueError("Scene leveling must preserve world XY")
+    if scene_leveling.get("preserves_camera_orientation") is not True:
+        raise ValueError("Scene leveling must preserve camera orientation")
+    if scene_leveling.get("preserves_per_frame_camera_motion") is not True:
+        raise ValueError("Scene leveling must preserve source camera motion")
+
+    leveling_linear = scene_leveling.get("linear_world")
+    try:
+        linear = tuple(
+            tuple(float(value) for value in row)
+            for row in leveling_linear
+        )
+    except (TypeError, ValueError):
+        linear = ()
+    if (
+        len(linear) != 3
+        or any(len(row) != 3 for row in linear)
+        or not all(math.isfinite(value) for row in linear for value in row)
+    ):
+        raise ValueError("Scene-leveling linear_world is not a finite 3x3 matrix")
+    z_only_template = (
+        (1.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+    )
+    if any(
+        abs(linear[row][column] - z_only_template[row][column]) > 1e-9
+        for row in range(2)
+        for column in range(3)
+    ) or any(
+        abs(linear[2][column] - expected) > 1e-9
+        for column, expected in ((2, 1.0),)
+    ):
+        raise ValueError(
+            "Scene-leveling linear_world is not a world-Z-only affine "
+            "correction"
+        )
+
+    scene_alignment = report.get("scene_alignment")
+    if not isinstance(scene_alignment, dict):
+        raise ValueError("Final Isaac report has no scene-alignment audit")
+    if int(scene_alignment.get("schema_version", -1)) < 2:
+        raise ValueError("Final Isaac scene-alignment audit schema is obsolete")
+    if scene_alignment.get("method") != HAND_TCP_ALIGNMENT_METHOD:
+        raise ValueError(
+            "Final Isaac scene did not use semantic fingertip-TCP alignment"
+        )
+    if int(scene_alignment.get("pipeline_order", -1)) != 2:
+        raise ValueError("Fingertip-TCP placement is not pipeline operation 2")
+    if int(scene_alignment.get("application_count", -1)) != 1:
+        raise ValueError("Scene alignment must apply one constant translation")
+    if (
+        scene_alignment.get("fits_rotation") is not False
+        or scene_alignment.get("fits_scale") is not False
+        or scene_alignment.get("fits_linear_leveling") is not False
+    ):
+        raise ValueError(
+            "Fingertip-TCP scene alignment must fit only a translation"
+        )
+    translation = scene_alignment.get("world_translation_xyz_m")
+    if (
+        not isinstance(translation, (list, tuple))
+        or len(translation) != 3
+    ):
+        raise ValueError("Scene alignment has no constant XYZ translation")
+    try:
+        translation_xyz = tuple(float(value) for value in translation)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "Scene alignment XYZ translation is not numeric"
+        ) from exc
+    if not all(math.isfinite(value) for value in translation_xyz):
+        raise ValueError("Scene alignment XYZ translation is not finite")
+    try:
+        reported_translation_z = float(
+            scene_alignment.get("world_translation_z_m", float("nan"))
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "Scene alignment world_translation_z_m is not numeric"
+        ) from exc
+    if (
+        not math.isfinite(reported_translation_z)
+        or abs(reported_translation_z - translation_xyz[2]) > 1e-9
+    ):
+        raise ValueError(
+            "Scene alignment world_translation_z_m disagrees with its "
+            "constant translation"
+        )
+    support_height_before = float(
+        scene_alignment.get(
+            "support_height_before_anchor_m",
+            float("nan"),
+        )
+    )
+    support_height_after = float(
+        scene_alignment.get(
+            "support_height_after_anchor_m",
+            float("nan"),
+        )
+    )
+    if (
+        not math.isfinite(support_height_before)
+        or not math.isfinite(support_height_after)
+        or abs(
+            (support_height_after - support_height_before)
+            - translation_xyz[2]
+        )
+        > 1e-6
+    ):
+        raise ValueError(
+            "Scene support height was not updated by the fingertip-TCP "
+            "translation"
+        )
+    support_height_delta = float(
+        scene_alignment.get(
+            "support_height_delta_from_anchor_m",
+            float("nan"),
+        )
+    )
+    if (
+        not math.isfinite(support_height_delta)
+        or abs(support_height_delta - translation_xyz[2]) > 1e-9
+    ):
+        raise ValueError(
+            "Scene alignment support-height delta disagrees with its "
+            "fingertip-TCP Z translation"
+        )
+
+    anchor_semantics = scene_alignment.get("anchor_semantics")
+    if not isinstance(anchor_semantics, dict):
+        raise ValueError("Scene alignment has no anchor-semantics audit")
+    if anchor_semantics.get("matches_retarget_arm_ik_tcp") is not True:
+        raise ValueError("Scene alignment does not use the retarget semantic TCP")
+    if anchor_semantics.get("uses_hand_base_origins") is not False:
+        raise ValueError("Scene alignment must not use hand-base origins")
+    if anchor_semantics.get("uses_ring_or_little_fingertips") is not False:
+        raise ValueError(
+            "Scene alignment does not match the semantic retarget TCP"
+        )
+    height_policy = scene_alignment.get("height_policy")
+    if not isinstance(height_policy, str):
+        raise ValueError("Scene alignment has no explicit height policy")
+    normalized_height_policy = height_policy.lower()
+    if "same 3-d tcp residual" not in normalized_height_policy or (
+        "no fixed" not in normalized_height_policy
+    ):
+        raise ValueError(
+            "Scene alignment height policy must use the same 3-D TCP "
+            "residual with no fixed scene height"
+        )
+
+    alignment_affine = scene_alignment.get("scene_world_affine")
+    if not isinstance(alignment_affine, dict):
+        raise ValueError(
+            "Scene alignment does not record its preceding scene affine"
+        )
+    try:
+        alignment_linear = tuple(
+            tuple(float(value) for value in row)
+            for row in alignment_affine.get("linear", ())
+        )
+    except (TypeError, ValueError):
+        alignment_linear = ()
+    if (
+        len(alignment_linear) != 3
+        or any(len(row) != 3 for row in alignment_linear)
+        or any(
+            abs(alignment_linear[row][column] - linear[row][column]) > 1e-9
+            for row in range(3)
+            for column in range(3)
+        )
+    ):
+        raise ValueError(
+            "Scene alignment was not estimated after the reported leveling "
+            "affine"
+        )
+    leveling_pivot = scene_leveling.get("pivot_world_xyz_m")
+    alignment_pivot = alignment_affine.get("pivot_world_xyz_m")
+    try:
+        leveling_pivot_xyz = tuple(float(value) for value in leveling_pivot)
+        alignment_pivot_xyz = tuple(float(value) for value in alignment_pivot)
+    except (TypeError, ValueError):
+        leveling_pivot_xyz = ()
+        alignment_pivot_xyz = ()
+    if (
+        len(leveling_pivot_xyz) != 3
+        or len(alignment_pivot_xyz) != 3
+        or not all(math.isfinite(value) for value in leveling_pivot_xyz)
+        or not all(math.isfinite(value) for value in alignment_pivot_xyz)
+        or any(
+            abs(alignment_pivot_xyz[axis] - leveling_pivot_xyz[axis]) > 1e-9
+            for axis in range(3)
+        )
+    ):
+        raise ValueError(
+            "Scene alignment did not use the reported scene-leveling pivot"
+        )
+    if alignment_affine.get("application_order") != (
+        "source camera -> raw scene world -> scene affine -> "
+        "hand-TCP translation"
+    ):
+        raise ValueError(
+            "Scene alignment affine application order is not explicit"
+        )
+
+    scene_placement = report.get("scene_placement")
+    if not isinstance(scene_placement, dict):
+        raise ValueError("Final Isaac report has no scene-placement audit")
+    if tuple(scene_placement.get("operation_order", ())) != (
+        SCENE_GEOMETRY_OPERATION_ORDER
+    ):
+        raise ValueError(
+            "Scene-placement operation order differs from the top-level "
+            "level-then-anchor contract"
+        )
+    if int(scene_placement.get("application_count", -1)) != 2:
+        raise ValueError(
+            "Scene placement did not apply exactly leveling then anchoring"
+        )
+    try:
+        placement_translation = tuple(
+            float(value)
+            for value in scene_placement.get(
+                "anchor_translation_world_xyz_m",
+                (),
+            )
+        )
+        placement_height_after_leveling = float(
+            scene_placement.get(
+                "support_height_after_leveling_m",
+                float("nan"),
+            )
+        )
+        placement_height_final = float(
+            scene_placement.get(
+                "support_height_after_anchor_m",
+                float("nan"),
+            )
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "Scene-placement translation or support height is not numeric"
+        ) from exc
+    if (
+        len(placement_translation) != 3
+        or not all(math.isfinite(value) for value in placement_translation)
+        or any(
+            abs(placement_translation[axis] - translation_xyz[axis]) > 1e-9
+            for axis in range(3)
+        )
+    ):
+        raise ValueError(
+            "Scene-placement translation differs from scene alignment"
+        )
+    if (
+        not math.isfinite(placement_height_after_leveling)
+        or abs(placement_height_after_leveling - support_height_before) > 1e-9
+    ):
+        raise ValueError(
+            "Scene-placement post-leveling support height is inconsistent"
+        )
+    if (
+        not math.isfinite(placement_height_final)
+        or abs(placement_height_final - support_height_after) > 1e-9
+        or abs(
+            placement_height_final
+            - placement_height_after_leveling
+            - translation_xyz[2]
+        )
+        > 1e-6
+    ):
+        raise ValueError(
+            "Scene-placement final support height is inconsistent with the "
+            "fingertip-TCP Z translation"
+        )
+
+
+def validate_stage_artifacts(stage: Stage, plan: TaskPlan) -> tuple[bool, str]:
+    """Validate a stage's complete output, returning a resume-safe reason."""
+
+    try:
+        if stage.name == "retarget":
+            _validate_retarget(plan)
+        elif stage.name == "repaint":
+            _validate_repaint(plan)
+        elif stage.name == "prepare":
+            _validate_prepared(stage, plan)
+        elif stage.name == "render":
+            _validate_render(stage, plan)
+        else:
+            raise ValueError(f"Unknown pipeline stage {stage.name!r}")
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+    return True, "validated"
+
+
+def _clear_stage_output(stage: Stage, plan: TaskPlan) -> None:
+    if stage.name == "retarget":
+        targets = (plan.paths.lerobot,)
+    elif stage.name == "repaint":
+        targets = (plan.paths.handless,)
+    elif stage.name == "prepare":
+        assert stage.episode_index is not None
+        targets = (
+            plan.paths.prepared
+            / f"episode_{stage.episode_index:06d}",
+        )
+    elif stage.name == "render":
+        assert stage.episode_index is not None
+        final_video = (
+            plan.paths.final
+            / f"episode_{stage.episode_index:06d}"
+            / "g1_view.mp4"
+        )
+        targets = (
+            final_video,
+            final_video.with_suffix(".json"),
+        )
+    else:
+        raise ValueError(f"Unknown stage {stage.name!r}")
+    for target in targets:
+        _remove_exact_path(target)
+
+
+def _command_text(command: Sequence[str]) -> str:
+    return shlex.join(command)
+
+
+def _source_report(episode: SourceEpisode) -> dict[str, Any]:
+    return {
+        "episode_index": episode.episode_index,
+        "source_stem": episode.stem,
+        "hdf5": str(episode.hdf5_path),
+        "video": str(episode.video_path),
+        "video_metadata": asdict(episode.video),
+    }
+
+
+def _new_report(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
+    return {
+        "schema_version": 2,
+        "pipeline": (
+            "egodex_to_robot -> remove_hands -> rgbd_prepare(VDA) "
+            "-> vda_scene_isaac(robot-camera)"
+        ),
+        "task": plan.task,
+        "status": "running",
+        "source_root": str(plan.source_root),
+        "task_output_root": str(plan.paths.root),
+        "output_layout": {
+            "lerobot": str(plan.paths.lerobot),
+            "handless": str(plan.paths.handless),
+            "prepared": str(plan.paths.prepared / "episode_XXXXXX"),
+            "final_video": str(
+                plan.paths.final / "episode_XXXXXX/g1_view.mp4"
+            ),
+            "logs": str(plan.paths.logs),
+        },
+        "video_metadata_policy": {
+            "source": "ffprobe each source MP4",
+            "fps": "inherited from source; never task-hardcoded",
+            "frame_count": "inherited from source; never task-hardcoded",
+            "source_resolution": "inherited from source MP4",
+            "final_resolution": "prepared source_size, verified against source",
+            "robot_camera_profile": BEINGBEYOND_HEAD_CAMERA_PROFILE,
+            "robot_camera_geometry": (
+                "fixed 640x480 4:3 intrinsic uniformly scaled and centered "
+                "letterboxed into the source-sized output"
+            ),
+            "trajectory_commit_validation": (
+                "every G1 joint/root write is read back from Isaac"
+            ),
+            "fixed_render_size_argument": False,
+            "fixed_fps_argument": False,
+        },
+        "source_episodes": [
+            _source_report(episode) for episode in plan.episodes
+        ],
+        "resume": config.resume,
+        "overwrite": config.overwrite,
+        "started_at": _utc_now(),
+        "updated_at": _utc_now(),
+        "elapsed_seconds": 0.0,
+        "skipped_episodes": [],
+        "stages": [],
+    }
+
+
+def _stage_report(stage: Stage) -> dict[str, Any]:
+    return {
+        "stage_id": stage.stage_id,
+        "name": stage.name,
+        "episode_index": stage.episode_index,
+        "status": "pending",
+        "command": list(stage.command),
+        "command_shell_escaped": _command_text(stage.command),
+        "log": str(stage.log_path),
+        "artifacts": [str(path) for path in stage.artifact_paths],
+        "dependencies": list(stage.dependencies),
+        "started_at": None,
+        "finished_at": None,
+        "elapsed_seconds": None,
+        "validation": None,
+        "last_successful_command": None,
+    }
+
+
+def _report_stage_map(report: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        str(stage["stage_id"]): stage
+        for stage in report["stages"]
+    }
+
+
+def _run_stage_process(
+    stage: Stage,
+    progress: tqdm[Any],
+    *,
+    task_started: float,
+    poll_seconds: float,
+) -> None:
+    """Run one child while continuously refreshing the task's sole bar."""
+
+    _run_process(
+        command=stage.command,
+        log_path=stage.log_path,
+        stage_id=stage.stage_id,
+        stage_name=stage.name,
+        item_key="episode",
+        item_label=stage.episode_label,
+        progress=progress,
+        pipeline_started=task_started,
+        poll_seconds=poll_seconds,
+        cwd=WORKSPACE_ROOT,
+    )
+
+
+def execute_task(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
+    """Execute or resume one task with exactly one visible progress bar."""
+
+    if config.overwrite:
+        _remove_exact_path(plan.paths.root)
+    elif plan.paths.root.exists() and not config.resume:
+        raise FileExistsError(
+            f"Task output already exists and resume is disabled: "
+            f"{plan.paths.root}"
+        )
+    plan.paths.logs.mkdir(parents=True, exist_ok=True)
+
+    previous_stages = _load_previous_stages(plan.paths.report)
+    report = _new_report(plan, config)
+    report["stages"] = [_stage_report(stage) for stage in plan.stages]
+    report_by_id = _report_stage_map(report)
+    reusable_statuses = {
+        "completed",
+        "reused",
+        "completed_with_skips",
+        "reused_with_skips",
+    }
+    for stage_id, entry in report_by_id.items():
+        previous = previous_stages.get(stage_id, {})
+        last_command = previous.get("last_successful_command")
+        if (
+            last_command is None
+            and previous.get("status") in reusable_statuses
+        ):
+            last_command = previous.get("command")
+        entry["last_successful_command"] = last_command
+    task_started = time.perf_counter()
+    changed: set[str] = set()
+    skipped_by_episode: dict[int, dict[str, Any]] = {}
+    dependents: dict[str, list[str]] = {}
+    for planned_stage in plan.stages:
+        for dependency in planned_stage.dependencies:
+            dependents.setdefault(dependency, []).append(
+                planned_stage.stage_id
+            )
+
+    def invalidate_stage_and_dependents(stage_id: str) -> None:
+        pending = [stage_id]
+        invalidated: set[str] = set()
+        while pending:
+            current = pending.pop()
+            if current in invalidated:
+                continue
+            invalidated.add(current)
+            pending.extend(dependents.get(current, ()))
+        for invalidated_id in invalidated:
+            entry = report_by_id[invalidated_id]
+            entry["last_successful_command"] = None
+            if invalidated_id != stage_id:
+                entry.update(
+                    status="invalidated",
+                    started_at=None,
+                    finished_at=None,
+                    elapsed_seconds=None,
+                    validation=f"dependency {stage_id} will rerun",
+                )
+
+    def record_skipped_episode(
+        episode_index: int,
+        stage: Stage,
+        error: str,
+        *,
+        failure_status: str = "exception",
+    ) -> None:
+        source = plan.episodes[episode_index]
+        skipped_by_episode.setdefault(
+            episode_index,
+            {
+                **_source_report(source),
+                "status": "skipped",
+                "failure_status": failure_status,
+                "failed_stage": stage.stage_id,
+                "error": error,
+                "log": str(stage.log_path),
+                "stage_paths": {
+                    "lerobot_root": str(plan.paths.lerobot),
+                    "handless_root": str(plan.paths.handless),
+                    "prepared_episode": str(
+                        plan.paths.prepared
+                        / f"episode_{episode_index:06d}"
+                    ),
+                    "final_video": str(
+                        plan.paths.final
+                        / f"episode_{episode_index:06d}"
+                        / "g1_view.mp4"
+                    ),
+                },
+                "recorded_at": _utc_now(),
+            },
+        )
+        report["skipped_episodes"] = list(skipped_by_episode.values())
+
+    _write_json_atomic(plan.paths.report, report)
+
+    with tqdm(
+        total=len(plan.stages),
+        desc=plan.task,
+        unit="stage",
+        dynamic_ncols=True,
+        leave=True,
+    ) as progress:
+        try:
+            for stage in plan.stages:
+                stage_entry = report_by_id[stage.stage_id]
+                if (
+                    stage.episode_index is not None
+                    and stage.episode_index in skipped_by_episode
+                ):
+                    cleanup_error = None
+                    try:
+                        _clear_stage_output(stage, plan)
+                    except Exception as exc:
+                        cleanup_error = f"{type(exc).__name__}: {exc}"
+                        skipped_by_episode[stage.episode_index].setdefault(
+                            "cleanup_errors",
+                            [],
+                        ).append(
+                            {
+                                "stage": stage.stage_id,
+                                "error": cleanup_error,
+                            }
+                        )
+                    now = _utc_now()
+                    failed_stage = skipped_by_episode[
+                        stage.episode_index
+                    ]["failed_stage"]
+                    stage_entry.update(
+                        status="skipped",
+                        started_at=now,
+                        finished_at=now,
+                        elapsed_seconds=0.0,
+                        last_successful_command=None,
+                        validation=(
+                            f"episode skipped after {failed_stage} failed"
+                            + (
+                                f"; cleanup failed: {cleanup_error}"
+                                if cleanup_error
+                                else ""
+                            )
+                        ),
+                    )
+                    progress.update(1)
+                    report["updated_at"] = now
+                    report["elapsed_seconds"] = (
+                        time.perf_counter() - task_started
+                    )
+                    _write_json_atomic(plan.paths.report, report)
+                    continue
+
+                dependencies_changed = any(
+                    dependency in changed for dependency in stage.dependencies
+                )
+                if config.resume and not dependencies_changed:
+                    valid, validation_reason = validate_stage_artifacts(
+                        stage,
+                        plan,
+                    )
+                else:
+                    valid = False
+                    validation_reason = (
+                        "dependency changed"
+                        if dependencies_changed
+                        else "resume disabled"
+                    )
+                may_reuse = (
+                    config.resume
+                    and not dependencies_changed
+                    and valid
+                    and stage_entry["last_successful_command"]
+                    == list(stage.command)
+                )
+                if may_reuse:
+                    repaint_failures = (
+                        _repaint_manifest_failures(plan)
+                        if stage.name == "repaint"
+                        else {}
+                    )
+                    for episode_index, failure in repaint_failures.items():
+                        record_skipped_episode(
+                            episode_index,
+                            stage,
+                            failure["error"],
+                            failure_status=failure["status"],
+                        )
+                    now = _utc_now()
+                    stage_entry.update(
+                        status=(
+                            "reused_with_skips"
+                            if repaint_failures
+                            else "reused"
+                        ),
+                        started_at=now,
+                        finished_at=now,
+                        elapsed_seconds=0.0,
+                        last_successful_command=list(stage.command),
+                        validation=(
+                            f"validated with {len(repaint_failures)} "
+                            "skipped episode(s)"
+                            if repaint_failures
+                            else validation_reason
+                        ),
+                    )
+                    progress.set_postfix(
+                        stage=f"{stage.name}:{stage_entry['status']}",
+                        episode=stage.episode_label,
+                        stage_elapsed="00:00:00",
+                        total_elapsed=_format_elapsed(
+                            time.perf_counter() - task_started
+                        ),
+                        refresh=True,
+                    )
+                    progress.update(1)
+                    report["updated_at"] = _utc_now()
+                    report["elapsed_seconds"] = (
+                        time.perf_counter() - task_started
+                    )
+                    _write_json_atomic(plan.paths.report, report)
+                    continue
+
+                invalidate_stage_and_dependents(stage.stage_id)
+                changed.add(stage.stage_id)
+                stage_started = time.perf_counter()
+                stage_entry.update(
+                    status="running",
+                    started_at=_utc_now(),
+                    validation=(
+                        "dependency changed"
+                        if dependencies_changed
+                        else validation_reason
+                    ),
+                )
+                report["updated_at"] = _utc_now()
+                _write_json_atomic(plan.paths.report, report)
+                try:
+                    _clear_stage_output(stage, plan)
+                    _run_stage_process(
+                        stage,
+                        progress,
+                        task_started=task_started,
+                        poll_seconds=config.poll_seconds,
+                    )
+                    valid, validation_reason = validate_stage_artifacts(
+                        stage,
+                        plan,
+                    )
+                    if not valid:
+                        raise RuntimeError(
+                            f"{stage.stage_id} output validation failed: "
+                            f"{validation_reason}"
+                        )
+                except Exception as exc:
+                    error = f"{type(exc).__name__}: {exc}"
+                    stage_entry.update(
+                        status="failed",
+                        finished_at=_utc_now(),
+                        elapsed_seconds=time.perf_counter() - stage_started,
+                        validation=str(exc),
+                    )
+                    if stage.episode_index is not None:
+                        record_skipped_episode(
+                            stage.episode_index,
+                            stage,
+                            error,
+                        )
+                        report.update(
+                            updated_at=_utc_now(),
+                            elapsed_seconds=(
+                                time.perf_counter() - task_started
+                            ),
+                        )
+                        _write_json_atomic(plan.paths.report, report)
+                        progress.set_postfix(
+                            stage=f"{stage.name}:skipped",
+                            episode=stage.episode_label,
+                            stage_elapsed=_format_elapsed(
+                                time.perf_counter() - stage_started
+                            ),
+                            total_elapsed=_format_elapsed(
+                                time.perf_counter() - task_started
+                            ),
+                            refresh=True,
+                        )
+                        progress.update(1)
+                        continue
+                    report.update(
+                        status="failed",
+                        failed_stage=stage.stage_id,
+                        error=error,
+                        updated_at=_utc_now(),
+                        elapsed_seconds=time.perf_counter() - task_started,
+                    )
+                    _write_json_atomic(plan.paths.report, report)
+                    raise
+
+                repaint_failures = (
+                    _repaint_manifest_failures(plan)
+                    if stage.name == "repaint"
+                    else {}
+                )
+                for episode_index, failure in repaint_failures.items():
+                    record_skipped_episode(
+                        episode_index,
+                        stage,
+                        failure["error"],
+                        failure_status=failure["status"],
+                    )
+                stage_entry.update(
+                    status=(
+                        "completed_with_skips"
+                        if repaint_failures
+                        else "completed"
+                    ),
+                    finished_at=_utc_now(),
+                    elapsed_seconds=time.perf_counter() - stage_started,
+                    last_successful_command=list(stage.command),
+                    validation=(
+                        f"validated with {len(repaint_failures)} "
+                        "skipped episode(s)"
+                        if repaint_failures
+                        else validation_reason
+                    ),
+                )
+                report["updated_at"] = _utc_now()
+                report["elapsed_seconds"] = time.perf_counter() - task_started
+                _write_json_atomic(plan.paths.report, report)
+                progress.update(1)
+
+            final_videos = []
+            for episode in plan.episodes:
+                render_entry = report_by_id[
+                    f"render_{episode.episode_index:06d}"
+                ]
+                if render_entry["status"] not in {"completed", "reused"}:
+                    continue
+                video_path = (
+                    plan.paths.final
+                    / f"episode_{episode.episode_index:06d}"
+                    / "g1_view.mp4"
+                )
+                final_videos.append(
+                    {
+                        "episode_index": episode.episode_index,
+                        "source_stem": episode.stem,
+                        "path": str(video_path),
+                        "video_metadata": asdict(probe_video(video_path)),
+                    }
+                )
+            report.update(
+                status=(
+                    "completed_with_skips"
+                    if skipped_by_episode
+                    else "completed"
+                ),
+                finished_at=_utc_now(),
+                updated_at=_utc_now(),
+                elapsed_seconds=time.perf_counter() - task_started,
+                final_videos=final_videos,
+            )
+            _write_json_atomic(plan.paths.report, report)
+            progress.set_postfix(
+                stage=str(report["status"]),
+                episode="all",
+                stage_elapsed="00:00:00",
+                total_elapsed=_format_elapsed(
+                    time.perf_counter() - task_started
+                ),
+                refresh=True,
+            )
+            return report
+        except BaseException:
+            if report.get("status") == "running":
+                report.update(
+                    status="interrupted",
+                    updated_at=_utc_now(),
+                    elapsed_seconds=time.perf_counter() - task_started,
+                )
+                _write_json_atomic(plan.paths.report, report)
+            raise
+
+
+def run_pipeline(tasks: Iterable[str], config: PipelineConfig) -> list[dict[str, Any]]:
+    """Run tasks sequentially because Isaac and GPU models are process-global."""
+
+    reports: list[dict[str, Any]] = []
+    for task in tasks:
+        plan = build_task_plan(task, config)
+        reports.append(execute_task(plan, config))
+    return reports
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Canonical EgoDex -> G1 LeRobot -> handless repaint -> metric VDA "
+            "-> source-sized G1-camera Isaac pipeline. Source FPS, frame "
+            "count, and video dimensions are always discovered automatically."
+        )
+    )
+    parser.add_argument(
+        "--tasks",
+        nargs="+",
+        default=list(DEFAULT_TASKS),
+        help="Dataset directory names under --dataset-root.",
+    )
+    parser.add_argument(
+        "--dataset-root",
+        type=Path,
+        default=WORKSPACE_ROOT / "dataset",
+    )
+    parser.add_argument(
+        "--output-root",
+        type=Path,
+        default=WORKSPACE_ROOT / "egodex",
+    )
+    parser.add_argument(
+        "--headless",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Isaac batch mode window visibility (default: headless).",
+    )
+    return parser
+
+
+def _config_from_args(args: argparse.Namespace) -> PipelineConfig:
+    executable = Path(sys.executable).expanduser()
+    if not executable.is_absolute():
+        executable = Path.cwd() / executable
+    executable = executable.absolute()
+    if not executable.is_file():
+        raise FileNotFoundError(f"Python executable does not exist: {executable}")
+    return PipelineConfig(
+        dataset_root=args.dataset_root.expanduser().resolve(),
+        output_root=args.output_root.expanduser().resolve(),
+        python_executable=executable,
+        resume=True,
+        overwrite=False,
+        headless=bool(args.headless),
+        scene_scale=None,
+        vda_checkpoint=None,
+        poll_seconds=0.5,
+    )
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    config = _config_from_args(args)
+    run_pipeline(args.tasks, config)
+
+
+if __name__ == "__main__":
+    main()

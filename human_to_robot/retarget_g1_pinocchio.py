@@ -213,9 +213,12 @@ class _SpatialAlignment:
 
 
 @dataclass(frozen=True)
-class O6HandJointTrajectory:
+class O6HandRetargetTrajectory:
     joint_names: tuple[str, ...]
     joint_positions: np.ndarray
+    action_mode: str
+    source_action_transforms_reference_camera: np.ndarray
+    wrist_from_action_transforms: np.ndarray
     diagnostics: dict[str, dict[str, object]]
 
 
@@ -1197,40 +1200,70 @@ def _retarget_articulated_hands(
     )
 
 
-def retarget_o6_hand_joints(
+def retarget_o6_hands(
     model: pin.Model,
     hdf5_path: str | Path,
     *,
     scale: float,
-) -> O6HandJointTrajectory:
-    """Retarget a complete EgoDex hand track to the 22 O6 URDF joints."""
+) -> O6HandRetargetTrajectory:
+    """Retarget EgoDex hand articulation and preserve its action-frame pose.
+
+    The returned transforms make the hand mapping explicit:
+
+    - ``source_action_transforms_reference_camera`` is the source action frame
+      in the first camera frame. It is the semantic fingertip TCP for normal
+      EgoDex input and the tracked palm for explicit ``rigid_palm`` input.
+    - ``wrist_from_action_transforms`` is the corresponding robot action frame
+      expressed in the G1 wrist-yaw frame for the retargeted O6 state.
+
+    A body retargeter can therefore place the complete hand with
+    ``world_from_wrist = world_from_action @ inv(wrist_from_action)`` instead
+    of incorrectly treating the source Hand origin as the robot wrist.
+    """
 
     trajectory = load_hand_trajectory(hdf5_path)
-    if (
-        trajectory.left_articulated_hand is None
-        or trajectory.right_articulated_hand is None
-    ):
-        raise ValueError(
-            f"{hdf5_path} must contain complete 25-landmark tracks "
-            "for both hands"
+    rigid_palm_mode = trajectory.target_mode == RIGID_PALM_TARGET
+    if rigid_palm_mode:
+        motor_commands = np.repeat(
+            _open_hand_motor_commands(model)[None],
+            trajectory.frame_count,
+            axis=0,
         )
-    human_widths = np.stack(
-        [trajectory.left_widths, trajectory.right_widths],
-        axis=1,
-    )
-    (
-        _,
-        motor_commands,
-        _,
-        _,
-        _,
-        diagnostics,
-    ) = _retarget_articulated_hands(
-        model,
-        trajectory,
-        human_widths,
-        scale=scale,
-    )
+        diagnostics = {
+            side: {
+                "source": "rigid_palm_fixed_open",
+                "reason": (
+                    "rigid palm input has no articulated finger action"
+                ),
+            }
+            for side in ("left", "right")
+        }
+    else:
+        if (
+            trajectory.left_articulated_hand is None
+            or trajectory.right_articulated_hand is None
+        ):
+            raise ValueError(
+                f"{hdf5_path} must contain complete 25-landmark tracks "
+                "for both hands"
+            )
+        human_widths = np.stack(
+            [trajectory.left_widths, trajectory.right_widths],
+            axis=1,
+        )
+        (
+            _,
+            motor_commands,
+            _,
+            _,
+            _,
+            diagnostics,
+        ) = _retarget_articulated_hands(
+            model,
+            trajectory,
+            human_widths,
+            scale=scale,
+        )
 
     joint_positions = np.empty(
         (trajectory.frame_count, len(HAND_JOINTS)),
@@ -1245,9 +1278,71 @@ def retarget_o6_hand_joints(
                 model.idx_qs[joint_id]
             ]
 
-    return O6HandJointTrajectory(
+    action_positions = np.stack(
+        [
+            trajectory.left_action_reference_camera,
+            trajectory.right_action_reference_camera,
+        ],
+        axis=1,
+    )
+    action_rotations = np.stack(
+        [
+            trajectory.left_action_reference_rotations,
+            trajectory.right_action_reference_rotations,
+        ],
+        axis=1,
+    )
+    source_action_transforms = np.repeat(
+        np.eye(4, dtype=np.float64)[None, None],
+        trajectory.frame_count,
+        axis=0,
+    )
+    source_action_transforms = np.repeat(
+        source_action_transforms,
+        2,
+        axis=1,
+    )
+    source_action_transforms[:, :, :3, :3] = action_rotations
+    source_action_transforms[:, :, :3, 3] = action_positions
+
+    wrist_from_action = np.repeat(
+        np.eye(4, dtype=np.float64)[None, None],
+        trajectory.frame_count,
+        axis=0,
+    )
+    wrist_from_action = np.repeat(wrist_from_action, 2, axis=1)
+    if rigid_palm_mode:
+        wrist_from_action[:, :, :3, 3] = (
+            PALM_OFFSET_FROM_WRIST[None, None]
+        )
+    else:
+        tcp_translations, tcp_rotations = _hand_tcp_transforms(
+            model,
+            motor_commands,
+        )
+        wrist_from_action[:, :, :3, :3] = tcp_rotations[None]
+        wrist_from_action[:, :, :3, 3] = (
+            PALM_OFFSET_FROM_WRIST[None, None] + tcp_translations
+        )
+
+    if (
+        source_action_transforms.shape
+        != (trajectory.frame_count, 2, 4, 4)
+        or wrist_from_action.shape
+        != (trajectory.frame_count, 2, 4, 4)
+        or not np.isfinite(source_action_transforms).all()
+        or not np.isfinite(wrist_from_action).all()
+    ):
+        raise ValueError("Retargeted O6 action transforms are invalid")
+
+    return O6HandRetargetTrajectory(
         joint_names=HAND_JOINTS,
         joint_positions=joint_positions,
+        action_mode=trajectory.target_mode,
+        source_action_transforms_reference_camera=(
+            source_action_transforms
+        ),
+        wrist_from_action_transforms=wrist_from_action,
         diagnostics=diagnostics,
     )
 

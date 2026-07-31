@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
+"""Remove source human arms for both canonical VDA pipelines."""
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import os
 from pathlib import Path
+import shutil
 import sys
+import tempfile
 from typing import Any
 import warnings
 
@@ -42,16 +46,18 @@ PRETRAINED_DIR = INPAINT_DIR / "pretrained_models"
 DEFAULT_SAM_CHECKPOINT = PRETRAINED_DIR / "sam3.pt"
 DEFAULT_PROPAINTER_CHECKPOINTS = PRETRAINED_DIR / "propainter"
 
-for dependency_root in (PROPAINTER_DIR, INPAINT_DIR):
+for dependency_root in (WORKSPACE_ROOT, PROPAINTER_DIR, INPAINT_DIR):
     dependency = str(dependency_root)
     if dependency not in sys.path:
         sys.path.insert(0, dependency)
 
 import remove_hands as upstream  # noqa: E402
 from sam3_video_track import IMAGE_EXTS  # noqa: E402
+from repaint.vda_pipeline_common import probe_video  # noqa: E402
 
 
 _ACTIVE_PROGRESS: Any | None = None
+_LAST_TRACKED_PRESENCE: list[bool] | None = None
 
 
 def _set_progress_stage(stage: str) -> None:
@@ -77,6 +83,13 @@ def _disable_nested_progress() -> None:
     sam2_utils.tqdm = plain_iterable
 
 
+def _tracked_target_present(score: float, mask: np.ndarray) -> bool:
+    """Use SAM's native zero-logit decision boundary for target presence."""
+    if not np.isfinite(score):
+        raise ValueError("SAM object-presence score must be finite")
+    return score > 0.0 and bool(np.asarray(mask, dtype=bool).any())
+
+
 def _track_bidirectionally(
     predictor: Any,
     frame_dir: str,
@@ -85,6 +98,8 @@ def _track_bidirectionally(
     offload_to_cpu: bool,
 ) -> list[np.ndarray]:
     """Track one seed mask through all frames in both directions."""
+    global _LAST_TRACKED_PRESENCE
+
     state = predictor.init_state(
         video_path=frame_dir,
         offload_video_to_cpu=offload_to_cpu,
@@ -100,6 +115,9 @@ def _track_bidirectionally(
 
     frame_count = int(state["num_frames"])
     per_frame: dict[int, np.ndarray] = {}
+    per_frame_presence: dict[int, bool] = {}
+    height = int(state["video_height"])
+    width = int(state["video_width"])
 
     def collect(*, reverse: bool, preflight: bool) -> None:
         _set_progress_stage("tracking")
@@ -111,21 +129,29 @@ def _track_bidirectionally(
             propagate_preflight=preflight,
             tqdm_disable=True,
         )
-        for index, object_ids, _, masks, _ in outputs:
-            mask_index = (
-                object_ids.index(object_id)
-                if object_id in object_ids
-                else 0
-            )
+        for index, object_ids, _, masks, object_scores in outputs:
             frame_index = int(index)
             is_new_frame = frame_index not in per_frame
-            per_frame[frame_index] = (
-                (masks[mask_index] > 0.0)
-                .squeeze()
-                .cpu()
-                .numpy()
-                .astype(bool)
-            )
+            if object_id not in object_ids:
+                mask = np.zeros((height, width), dtype=bool)
+                present = False
+            else:
+                mask_index = object_ids.index(object_id)
+                mask = (
+                    (masks[mask_index] > 0.0)
+                    .squeeze()
+                    .cpu()
+                    .numpy()
+                    .astype(bool)
+                )
+                score = float(
+                    object_scores[mask_index].detach().float().item()
+                )
+                present = _tracked_target_present(score, mask)
+                if not present:
+                    mask.fill(False)
+            per_frame[frame_index] = mask
+            per_frame_presence[frame_index] = present
             if is_new_frame:
                 _advance_progress()
 
@@ -133,14 +159,15 @@ def _track_bidirectionally(
     if frame_idx > 0:
         collect(reverse=True, preflight=False)
 
-    height = int(state["video_height"])
-    width = int(state["video_width"])
     missing = sorted(set(range(frame_count)) - set(per_frame))
     if missing:
         raise RuntimeError(
             "Bidirectional SAM 3 tracking missed frame indices: "
             f"{missing[:10]}"
         )
+    _LAST_TRACKED_PRESENCE = [
+        per_frame_presence[index] for index in range(frame_count)
+    ]
     return [
         per_frame.get(index, np.zeros((height, width), dtype=bool))
         for index in range(frame_count)
@@ -155,7 +182,7 @@ def _seed_from_most_complete_probe(
     segmentor: Any,
     offload: bool,
 ) -> list[np.ndarray] | None:
-    """Pick the largest plausible text mask from several temporal probes."""
+    """Find the first target anywhere in the clip, then track both ways."""
     frame_paths = sorted(
         path
         for path in Path(frame_dir).iterdir()
@@ -164,17 +191,8 @@ def _seed_from_most_complete_probe(
     if not frame_paths:
         return None
 
-    fractions = (0.0, 0.1, 0.25, 0.5, 0.75)
-    probe_indices = sorted(
-        {
-            min(int(len(frame_paths) * fraction), len(frame_paths) - 1)
-            for fraction in fractions
-        }
-    )
-    best: tuple[int, int, np.ndarray] | None = None
-
-    for index in probe_indices:
-        frame = np.asarray(Image.open(frame_paths[index]).convert("RGB"))
+    for index, frame_path in enumerate(frame_paths):
+        frame = np.asarray(Image.open(frame_path).convert("RGB"))
         segmentor.set_image(frame)
         try:
             masks, _, _ = segmentor.predict_text(
@@ -186,57 +204,118 @@ def _seed_from_most_complete_probe(
         if len(masks) == 0:
             continue
 
-        union = np.any(masks, axis=0)
-        candidate = (int(union.sum()), index, union)
-        if best is None or candidate[0] > best[0]:
-            best = candidate
-
-    if best is None:
-        return None
-
-    _, seed_index, seed_mask = best
-    _set_progress_stage(
-        f"seed {seed_index}/{len(frame_paths) - 1}, "
-        f"coverage {seed_mask.mean():.1%}"
-    )
-    return _track_bidirectionally(
-        tracker,
-        frame_dir,
-        seed_mask,
-        seed_index,
-        offload,
-    )
+        seed_mask = np.any(masks, axis=0)
+        _set_progress_stage(
+            f"seed {index}/{len(frame_paths) - 1}, "
+            f"coverage {seed_mask.mean():.1%}"
+        )
+        return _track_bidirectionally(
+            tracker,
+            frame_dir,
+            seed_mask,
+            index,
+            offload,
+        )
+    return None
 
 
 _UPSTREAM_PROCESS_EPISODE = upstream.process_episode
 _UPSTREAM_WRITE_OUTPUT = upstream._write_output
 _UPSTREAM_WRITE_MASKS = upstream._write_masks
+_UPSTREAM_AS_FRAME_FOLDER = upstream._as_frame_folder
+_UPSTREAM_READ_FRAMES = upstream._read_frames
+
+
+def _displayed_video_frame_count(path: Path) -> int:
+    """Return decoded/displayed frames without container-duration padding."""
+
+    return probe_video(path).frame_count
 
 
 def _episode_frame_count(episode: Any) -> int:
     if not episode.is_video:
         return len(episode.frame_names)
+    return _displayed_video_frame_count(Path(episode.source))
 
-    import cv2
 
-    capture = cv2.VideoCapture(str(episode.source))
-    try:
-        frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
-    finally:
-        capture.release()
-    if frame_count <= 0:
-        import imageio.v2 as imageio_v2
+def _read_video_frames_without_cfr_padding(path: Path) -> list[Image.Image]:
+    """Decode the MP4 display timeline without duplicating its final frame."""
 
-        reader = imageio_v2.get_reader(str(episode.source))
-        try:
-            frame_count = int(reader.count_frames())
-        finally:
-            reader.close()
-    if frame_count <= 0:
+    frames = list(_iter_video_display_frames(path))
+    expected = _displayed_video_frame_count(path)
+    if len(frames) != expected:
         raise ValueError(
-            f"Could not determine frame count for {episode.source}"
+            f"Display-timeline decode mismatch for {path}: "
+            f"decoded={len(frames)}, expected={expected}"
         )
-    return frame_count
+    return frames
+
+
+def _iter_video_display_frames(path: Path) -> Any:
+    """Yield frames decoded by PyAV with native presentation timing."""
+
+    import av
+
+    with av.open(str(path)) as container:
+        streams = container.streams.video
+        if len(streams) != 1:
+            raise ValueError(
+                f"Expected one video stream in {path}, got {len(streams)}"
+            )
+        for frame in container.decode(streams[0]):
+            yield frame.to_image().convert("RGB")
+
+
+def _validate_display_frame_count(
+    path: Path,
+    *,
+    decoded: int,
+) -> None:
+    expected = _displayed_video_frame_count(path)
+    if decoded != expected:
+        raise ValueError(
+            f"Display-timeline decode mismatch for {path}: "
+            f"decoded={decoded}, expected={expected}"
+        )
+
+
+def _read_frames_on_display_timeline(episode: Any) -> list[Image.Image]:
+    if not episode.is_video:
+        return _UPSTREAM_READ_FRAMES(episode)
+    return _read_video_frames_without_cfr_padding(Path(episode.source))
+
+
+@contextmanager
+def _as_display_frame_folder(video_path: str) -> Any:
+    """Give SAM the same unpadded frame timeline used by the inpainter."""
+
+    source = Path(video_path)
+    if source.is_dir():
+        with _UPSTREAM_AS_FRAME_FOLDER(video_path) as frame_dir:
+            yield frame_dir
+        return
+
+    temporary = Path(tempfile.mkdtemp(prefix="ia_display_frames_"))
+    try:
+        frame_count = 0
+        for index, frame in enumerate(
+            _iter_video_display_frames(source)
+        ):
+            frame.save(
+                temporary / f"{index:05d}.jpg",
+                quality=95,
+            )
+            frame_count += 1
+        _validate_display_frame_count(source, decoded=frame_count)
+        yield str(temporary)
+    finally:
+        shutil.rmtree(temporary, ignore_errors=True)
+
+
+def _source_video_fps(path: Path) -> float:
+    """Read timing from the source video; never invent a fallback FPS."""
+
+    return probe_video(path).fps
 
 
 def _inpaint_step_count(frame_count: int, chunk_size: int) -> int:
@@ -245,15 +324,29 @@ def _inpaint_step_count(frame_count: int, chunk_size: int) -> int:
     return (frame_count + chunk_size - 1) // chunk_size
 
 
+def _is_nymeria_dataset_root(path: str | Path | None) -> bool:
+    if path is None:
+        return False
+    metadata_root = Path(path).expanduser().resolve() / "meta"
+    return (
+        (metadata_root / "nymeria.json").is_file()
+        and not (metadata_root / "egodex.json").exists()
+    )
+
+
 def _process_episode_with_one_progress(
     models: Any,
     episode: Any,
     args: Any,
 ) -> dict[str, Any]:
     """Wrap one upstream episode in a single aggregate progress bar."""
-    global _ACTIVE_PROGRESS
+    global _ACTIVE_PROGRESS, _LAST_TRACKED_PRESENCE
 
     frame_count = _episode_frame_count(episode)
+    is_nymeria = _is_nymeria_dataset_root(
+        getattr(args, "input_dir", None)
+    )
+    _LAST_TRACKED_PRESENCE = None
     total = (
         frame_count
         + _inpaint_step_count(frame_count, args.chunk_size)
@@ -270,6 +363,53 @@ def _process_episode_with_one_progress(
         _ACTIVE_PROGRESS = progress
         try:
             entry = _UPSTREAM_PROCESS_EPISODE(models, episode, args)
+            if (
+                entry.get("status") == "no_target"
+                and is_nymeria
+            ):
+                destination = Path(args.output_dir) / (
+                    episode.name + (".mp4" if episode.is_video else "")
+                )
+                if episode.is_video:
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(episode.source, destination)
+                else:
+                    destination.mkdir(parents=True, exist_ok=True)
+                    for frame_name in episode.frame_names:
+                        shutil.copy2(
+                            episode.source / frame_name,
+                            destination / frame_name,
+                        )
+                entry.update(
+                    status="passthrough_no_target",
+                    output=str(destination),
+                    frames=_episode_frame_count(episode),
+                    passthrough=True,
+                    note=(
+                        "Nymeria continuation policy: no removable target was "
+                        "detected, so the source was copied unchanged."
+                    ),
+                )
+            if is_nymeria:
+                if entry.get("status") == "passthrough_no_target":
+                    visibility = [False] * int(entry["frames"])
+                else:
+                    visibility = _LAST_TRACKED_PRESENCE
+                if visibility is None or len(visibility) != int(
+                    entry.get("frames", -1)
+                ):
+                    raise RuntimeError(
+                        "Nymeria SAM visibility timeline is missing or "
+                        "does not match the episode"
+                    )
+                entry.update(
+                    human_arm_visible=visibility,
+                    human_arm_visible_frames=int(sum(visibility)),
+                    human_arm_visibility_method=(
+                        "SAM 3 tracked target with its native positive "
+                        "object-presence logit and a nonempty mask"
+                    ),
+                )
             remaining = total - progress.n
             if remaining > 0:
                 progress.update(remaining)
@@ -348,6 +488,12 @@ def _write_output_without_resizing(
     import imageio
     import imageio.v2 as imageio_v2
 
+    expected_frame_count = _episode_frame_count(episode)
+    if len(out_frames) != expected_frame_count:
+        raise ValueError(
+            f"Repaint frame count differs from the source display timeline: "
+            f"{len(out_frames)} != {expected_frame_count}"
+        )
     destination.parent.mkdir(parents=True, exist_ok=True)
     try:
         metadata = imageio.v3.immeta(
@@ -357,7 +503,10 @@ def _write_output_without_resizing(
     except Exception:
         metadata = {}
 
-    fps = metadata.get("fps", args.fps)
+    fps = metadata.get("fps")
+    if fps is None or not np.isfinite(float(fps)) or float(fps) <= 0.0:
+        fps = _source_video_fps(Path(episode.source))
+    fps = float(fps)
     source_size = metadata.get("size") or metadata.get("source_size")
     if source_size is None:
         reader = imageio_v2.get_reader(str(episode.source))
@@ -386,6 +535,13 @@ def _write_output_without_resizing(
         quality=args.video_quality,
         macro_block_size=1,
     )
+    written_frame_count = _displayed_video_frame_count(destination)
+    if written_frame_count != expected_frame_count:
+        destination.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"Encoded video frame count changed for {destination}: "
+            f"{expected_frame_count} -> {written_frame_count}"
+        )
     _advance_progress()
 
 
@@ -442,6 +598,8 @@ def main() -> None:
 
     _disable_nested_progress()
     upstream._seed_masks = _seed_from_most_complete_probe
+    upstream._as_frame_folder = _as_display_frame_folder
+    upstream._read_frames = _read_frames_on_display_timeline
     upstream.process_episode = _process_episode_with_one_progress
     upstream._inpaint_chunked = _inpaint_chunked_with_one_progress
     upstream._write_output = _write_output_without_resizing

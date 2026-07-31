@@ -7,8 +7,7 @@ pipeline.  It keeps the two scale conversions separate:
 * source-camera meters -> robot/world scale, owned by the caller.
 
 The original-video estimate is transferred to the handless prediction using
-unchanged background pixels.  An optional DA3 depth directory is used only as
-an independent compatibility check, never as the primary metric anchor.
+unchanged background pixels.
 """
 
 from __future__ import annotations
@@ -850,19 +849,6 @@ def _project_landmarks(
     return pixels
 
 
-def _da3_depth_paths(
-    path: Path | None,
-    frame_indices: np.ndarray,
-) -> list[Path]:
-    if path is None:
-        return []
-    return _indexed_png_paths(
-        path,
-        frame_indices,
-        label="DA3 depth",
-    )
-
-
 def _seek_capture(
     capture: cv2.VideoCapture,
     *,
@@ -879,11 +865,6 @@ def _seek_capture(
         )
 
 
-def _depth_bin_name(depth_m: np.ndarray) -> np.ndarray:
-    edges = np.asarray([0.0, 0.5, 1.0, 2.0, 4.0, np.inf])
-    return np.digitize(depth_m, edges[1:-1], right=False)
-
-
 def _analyze(
     *,
     original_video: Path,
@@ -898,8 +879,6 @@ def _analyze(
     confidence: np.ndarray,
     labels: tuple[str, ...],
     frame_indices: np.ndarray | None = None,
-    da3_depth_dir: Path | None = None,
-    da3_scene_scale: float | None = None,
 ) -> dict[str, Any]:
     frame_count = int(original_depth.shape[0])
     selected = (
@@ -923,15 +902,6 @@ def _analyze(
     )
     pixels = _project_landmarks(points_camera, scaled_k)
     explicit_masks = _mask_paths(mask_dir, selected)
-    da3_paths = _da3_depth_paths(da3_depth_dir, selected)
-    if bool(da3_paths) != (da3_scene_scale is not None):
-        raise ValueError(
-            "DA3 depth directory and --da3-scene-scale must be supplied together"
-        )
-    if da3_scene_scale is not None and (
-        not np.isfinite(da3_scene_scale) or da3_scene_scale <= 0.0
-    ):
-        raise ValueError("--da3-scene-scale must be positive")
 
     original_capture = _open_video(original_video)
     handless_capture = _open_video(handless_video)
@@ -960,24 +930,8 @@ def _analyze(
         dtype=np.float64,
     )
     handless_background_raw_sample_count = 0
-    da3_frame_medians = np.full(frame_count, np.nan, dtype=np.float64)
-    da3_raw_sample_count = 0
     mask_coverages: list[float] = []
     unchanged_coverages: list[float] = []
-    da3_bin_frame_medians: dict[str, np.ndarray] = {
-        name: np.full(frame_count, np.nan, dtype=np.float64)
-        for name in (
-            "0.0-0.5m",
-            "0.5-1.0m",
-            "1.0-2.0m",
-            "2.0-4.0m",
-            "4.0m+",
-        )
-    }
-    da3_bin_raw_sample_counts = {
-        name: 0 for name in da3_bin_frame_medians
-    }
-    bin_names = tuple(da3_bin_frame_medians)
     try:
         for frame_id in range(frame_count):
             original_rgb = _read_resized_rgb(
@@ -1101,76 +1055,6 @@ def _analyze(
                     )
                 )
 
-            if da3_paths:
-                da3_mm = cv2.imread(
-                    str(da3_paths[frame_id]),
-                    cv2.IMREAD_UNCHANGED,
-                )
-                if da3_mm is None or da3_mm.ndim != 2:
-                    raise RuntimeError(
-                        f"Failed to read DA3 depth: {da3_paths[frame_id]}"
-                    )
-                da3_size = (int(da3_mm.shape[1]), int(da3_mm.shape[0]))
-                vda_da3 = cv2.resize(
-                    np.asarray(handless_depth[frame_id], dtype=np.float32),
-                    da3_size,
-                    interpolation=cv2.INTER_NEAREST,
-                )
-                background_da3 = cv2.resize(
-                    background.astype(np.uint8),
-                    da3_size,
-                    interpolation=cv2.INTER_NEAREST,
-                ).astype(bool)
-                da3_source_m = (
-                    da3_mm.astype(np.float64)
-                    / 1000.0
-                    / float(da3_scene_scale)
-                )
-                valid = (
-                    background_da3
-                    & (da3_mm > 0)
-                    & np.isfinite(vda_da3)
-                    & (vda_da3 > 0.0)
-                )
-                valid[1:, :] &= np.abs(
-                    da3_source_m[1:, :] - da3_source_m[:-1, :]
-                ) < 0.15
-                valid[:, 1:] &= np.abs(
-                    da3_source_m[:, 1:] - da3_source_m[:, :-1]
-                ) < 0.15
-                sampled = valid[::2, ::2]
-                ratios = (
-                    da3_source_m[::2, ::2][sampled]
-                    / vda_da3[::2, ::2][sampled]
-                )
-                ratios = ratios[
-                    np.isfinite(ratios)
-                    & (ratios > 0.0)
-                    & (ratios < 5.0)
-                ]
-                da3_raw_sample_count += int(ratios.size)
-                if ratios.size:
-                    da3_frame_medians[frame_id] = np.median(ratios)
-
-                sampled_depth = da3_source_m[::2, ::2][sampled]
-                sampled_vda = vda_da3[::2, ::2][sampled]
-                bin_ids = _depth_bin_name(sampled_depth)
-                bin_ratio = sampled_depth / sampled_vda
-                for bin_id, name in enumerate(bin_names):
-                    bin_selected = (
-                        (bin_ids == bin_id)
-                        & np.isfinite(bin_ratio)
-                        & (bin_ratio > 0.0)
-                        & (bin_ratio < 5.0)
-                    )
-                    if np.any(bin_selected):
-                        bin_values = bin_ratio[bin_selected]
-                        da3_bin_raw_sample_counts[name] += int(
-                            bin_values.size
-                        )
-                        da3_bin_frame_medians[name][frame_id] = np.median(
-                            bin_values
-                        )
     finally:
         original_capture.release()
         handless_capture.release()
@@ -1263,35 +1147,6 @@ def _analyze(
             "transfer_frame_medians": _distribution(transfer_frame_medians),
         },
     }
-    if da3_paths:
-        da3_summary, da3_frame_medians = (
-            _frame_equal_summary_from_medians(
-                da3_frame_medians,
-                raw_sample_count=da3_raw_sample_count,
-            )
-        )
-        da3_scale = da3_summary["p50"]
-        agreement = (
-            None
-            if handless_scale is None or da3_scale is None
-            else float(handless_scale) / float(da3_scale)
-        )
-        result["da3_compatibility"] = {
-            "scene_scale_removed": float(da3_scene_scale),
-            "vda_to_da3_source_metric_scale": da3_summary,
-            "hand_anchor_scale_over_da3_scale": agreement,
-            "absolute_log_disagreement": (
-                None if agreement is None else abs(math.log(agreement))
-            ),
-            "frame_medians": _distribution(da3_frame_medians),
-            "scale_by_da3_source_depth": {
-                name: _frame_equal_summary_from_medians(
-                    da3_bin_frame_medians[name],
-                    raw_sample_count=da3_bin_raw_sample_counts[name],
-                )[0]
-                for name in bin_names
-            },
-        }
     return result
 
 
@@ -1357,8 +1212,6 @@ def estimate_handless_metric_scale(
         confidence=confidence,
         labels=labels,
         frame_indices=selected,
-        da3_depth_dir=None,
-        da3_scene_scale=None,
     )
     decision = _quality_decision(
         analysis=analysis,
@@ -1519,21 +1372,6 @@ def _quality_decision(
     ):
         reasons.append("scale bootstrap relative 95% half-width exceeds 15%")
 
-    da3 = analysis.get("da3_compatibility")
-    agreement_status = "not_checked"
-    if da3 is not None:
-        ratio = da3["hand_anchor_scale_over_da3_scale"]
-        if ratio is None:
-            agreement_status = "unavailable"
-            reasons.append("DA3 compatibility scale unavailable")
-        elif abs(math.log(float(ratio))) <= math.log(1.2):
-            agreement_status = "within_20_percent"
-        else:
-            agreement_status = "conflict_over_20_percent"
-            reasons.append(
-                "hand-anchor and background DA3 scales disagree by over 20%"
-            )
-
     source_depth = analysis["estimated_metric_background_depth_m"]
     approximate_angle = (
         None
@@ -1547,16 +1385,7 @@ def _quality_decision(
     else:
         multiview = "potentially_observable"
 
-    if not reasons:
-        status = "validated"
-    elif (
-        len(reasons) == 1
-        and reasons[0]
-        == "hand-anchor and background DA3 scales disagree by over 20%"
-    ):
-        status = "rejected_single_global_scale"
-    else:
-        status = "needs_fallback_or_review"
+    status = "validated" if not reasons else "needs_fallback_or_review"
     return {
         "status": status,
         "reasons": reasons,
@@ -1565,7 +1394,6 @@ def _quality_decision(
             "minimum_hand_anchor_frames": minimum_anchor_frames,
             "minimum_background_transfer_frames": minimum_transfer_frames,
         },
-        "da3_agreement": agreement_status,
         "multiview_observability": {
             "status": multiview,
             "max_camera_baseline_m": max_camera_baseline_m,
@@ -1590,8 +1418,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--handless-video", type=Path, required=True)
     parser.add_argument("--hdf5", type=Path, required=True)
     parser.add_argument("--mask-dir", type=Path)
-    parser.add_argument("--da3-depth-dir", type=Path)
-    parser.add_argument("--da3-scene-scale", type=float)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
         "--checkpoint",
@@ -1614,11 +1440,6 @@ def main() -> None:
     mask_dir = (
         None if args.mask_dir is None else args.mask_dir.expanduser().resolve()
     )
-    da3_depth_dir = (
-        None
-        if args.da3_depth_dir is None
-        else args.da3_depth_dir.expanduser().resolve()
-    )
     output = args.output.expanduser().resolve()
     checkpoint = args.checkpoint.expanduser().resolve()
     for path in (original_video, handless_video, hdf5_path, checkpoint):
@@ -1626,8 +1447,6 @@ def main() -> None:
             raise FileNotFoundError(path)
     if mask_dir is not None and not mask_dir.is_dir():
         raise NotADirectoryError(mask_dir)
-    if da3_depth_dir is not None and not da3_depth_dir.is_dir():
-        raise NotADirectoryError(da3_depth_dir)
     output.mkdir(parents=True, exist_ok=True)
 
     (
@@ -1706,8 +1525,6 @@ def main() -> None:
         points_camera=points_camera,
         confidence=confidence,
         labels=labels,
-        da3_depth_dir=da3_depth_dir,
-        da3_scene_scale=args.da3_scene_scale,
     )
     decision = _quality_decision(
         analysis=analysis,
@@ -1728,8 +1545,6 @@ def main() -> None:
             "hdf5": hdf5_path,
             "hdf5_sha256": file_sha256(hdf5_path),
             "mask_dir": mask_dir,
-            "da3_depth_dir": da3_depth_dir,
-            "da3_scene_scale": args.da3_scene_scale,
             "frame_count": frame_count,
             "fps": original_fps,
             "source_size": source_size,
@@ -1764,11 +1579,6 @@ def main() -> None:
         "name": args.name,
         "recommended_handless_metric_scale": (
             analysis["recommended_handless_metric_scale"]
-        ),
-        "da3_scale": (
-            analysis.get("da3_compatibility", {})
-            .get("vda_to_da3_source_metric_scale", {})
-            .get("p50")
         ),
         "status": decision["status"],
         "reasons": decision["reasons"],

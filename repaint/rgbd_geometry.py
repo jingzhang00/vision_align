@@ -1,4 +1,4 @@
-"""Geometry helpers for the independent RGB-D Isaac repaint experiment."""
+"""Shared RGB-D geometry helpers for the canonical VDA-to-Isaac route."""
 
 from __future__ import annotations
 

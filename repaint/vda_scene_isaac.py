@@ -10,7 +10,7 @@ to one fixed-camera MP4 or viewed in an interactive Isaac viewport.
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 import json
 from pathlib import Path
 import sys
@@ -25,17 +25,56 @@ WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
 if str(WORKSPACE_ROOT) not in sys.path:
     sys.path.insert(0, str(WORKSPACE_ROOT))
 
-from repaint.isaac_replay import import_g1, isaac_joint_order  # noqa: E402
+from repaint.isaac_g1 import import_g1, isaac_joint_order  # noqa: E402
 from repaint.rgbd_geometry import (  # noqa: E402
     backproject_z_depth,
     camera_points_to_world,
     depth_grid_triangles,
     grid_uvs,
-    scale_intrinsic,
+)
+from repaint.robot_camera import (  # noqa: E402
+    BEINGBEYOND_HEAD_CAMERA_PARENT_FRAME,
+    BEINGBEYOND_HEAD_CAMERA_PROFILE,
+    BEINGBEYOND_HEAD_CAM_OFFSET_POS_ACTIVE,
+    BEINGBEYOND_HEAD_CAM_OFFSET_POS_BASE,
+    BEINGBEYOND_HEAD_CAM_OFFSET_ROT_WXYZ,
+    BEINGBEYOND_HEAD_CAM_RESET_GUARD_X_M,
+    beingbeyond_head_camera_poses_cv,
+    beingbeyond_head_camera_poses_world,
+    robot_frame_points_in_camera_cv,
 )
 from repaint.scene_hand_alignment import (  # noqa: E402
-    align_scene_camera_poses_to_initial_hands,
+    HAND_TCP_ALIGNMENT_STAGE,
+    WRIST_ALIGNMENT_STAGE,
+    align_scene_camera_poses_to_initial_hand_tcp,
+    align_scene_camera_poses_to_initial_wrists,
 )
+from repaint.scene_leveling import (  # noqa: E402
+    SUPPORT_PLANE_LEVELING_STAGE,
+    apply_world_affine_to_points,
+    level_scene_camera_poses_from_support_plane,
+)
+
+
+# Fixed ideal pinhole calibration from the active BeingBeyond CameraCfg.
+# It always stays 4:3 and is uniformly scaled into the largest centered 4:3
+# rectangle contained by the source video. Replay never consults a RealSense
+# device or profile.
+BEINGBEYOND_D435_REFERENCE_SIZE = (640, 480)
+BEINGBEYOND_D435_INTRINSIC = np.asarray(
+    [
+        [607.212158203125, 0.0, 311.9999084472656],
+        [0.0, 607.0084838867188, 261.152099609375],
+        [0.0, 0.0, 1.0],
+    ],
+    dtype=np.float64,
+)
+D435_DISTORTION = np.zeros(12, dtype=np.float64)
+ROBOT_HAND_FRAMES = ("left_hand_base_link", "right_hand_base_link")
+HAND_CAPTURE_WARNING_THRESHOLD = 0.8
+JOINT_COMMIT_ATOL_RAD = 1.0e-4
+ROOT_POSITION_COMMIT_ATOL_M = 1.0e-4
+ROOT_ORIENTATION_COMMIT_ATOL_RAD = 1.0e-4
 
 
 @dataclass(frozen=True)
@@ -52,6 +91,7 @@ class PreparedScene:
     intrinsic: np.ndarray
     mesh_intrinsic: np.ndarray
     camera_poses_cv_xyzw: np.ndarray
+    robot_arm_render: np.ndarray
     joint_names: tuple[str, ...]
     joint_positions: np.ndarray
     root_poses_xyzw: np.ndarray
@@ -84,6 +124,15 @@ class RunOptions:
     playback_fps: float
     output_video: Path | None
     report_path: Path | None
+
+
+@dataclass(frozen=True)
+class AlignmentWindow:
+    """A source-time request resolved to a bounded prepared-frame window."""
+
+    requested_seconds: float
+    resolved_frames: int
+    source: str
 
 
 def _numbered_png_paths(directory: Path) -> tuple[Path, ...]:
@@ -191,6 +240,22 @@ def load_prepared_scene(prepared_root: Path) -> PreparedScene:
             raise ValueError("camera_pose_cv_xyzw contains a zero quaternion")
         camera_poses[:, 3:7] /= quaternion_norms[:, None]
 
+        if "robot_arm_render" in archive:
+            robot_arm_render_raw = np.asarray(
+                archive["robot_arm_render"]
+            )
+            if (
+                robot_arm_render_raw.shape != (len(frame_indices),)
+                or robot_arm_render_raw.dtype.kind not in "biu"
+                or not np.isin(robot_arm_render_raw, (0, 1)).all()
+            ):
+                raise ValueError(
+                    "robot_arm_render must be a boolean [frame_count] vector"
+                )
+            robot_arm_render = robot_arm_render_raw.astype(bool)
+        else:
+            robot_arm_render = np.ones(len(frame_indices), dtype=bool)
+
         joint_names_array = np.asarray(archive["joint_names"])
         if joint_names_array.ndim != 1 or len(joint_names_array) == 0:
             raise ValueError("joint_names must be a non-empty vector")
@@ -276,6 +341,7 @@ def load_prepared_scene(prepared_root: Path) -> PreparedScene:
         intrinsic=intrinsic,
         mesh_intrinsic=mesh_intrinsic,
         camera_poses_cv_xyzw=camera_poses,
+        robot_arm_render=robot_arm_render,
         joint_names=joint_names,
         joint_positions=joint_positions,
         root_poses_xyzw=root_poses,
@@ -307,6 +373,9 @@ def scan_scene(
     *,
     absolute_threshold_m: float,
     relative_threshold: float,
+    scene_leveling_linear_world: np.ndarray,
+    scene_leveling_pivot_world_xyz_m: np.ndarray,
+    scene_translation_world_xyz_m: np.ndarray,
 ) -> SceneScan:
     """Validate all depth frames and collect bounds/topology diagnostics."""
 
@@ -329,6 +398,12 @@ def scan_scene(
             scene.camera_poses_cv_xyzw[frame_id],
         )
         valid = np.isfinite(points_world).all(axis=-1)
+        points_world[valid] = apply_world_affine_to_points(
+            points_world[valid],
+            linear_world=scene_leveling_linear_world,
+            pivot_world_xyz_m=scene_leveling_pivot_world_xyz_m,
+        )
+        points_world[valid] += scene_translation_world_xyz_m
         valid_points = points_world[valid]
         if len(valid_points) == 0:
             raise ValueError(f"Depth frame has no valid points: {depth_path}")
@@ -374,6 +449,473 @@ def _camera_projection(
     focal_length = fx / width * horizontal_aperture
     vertical_aperture = focal_length * height / fy
     return horizontal_aperture, vertical_aperture, focal_length
+
+
+def _resolve_d435_calibration(
+    source_size: tuple[int, int],
+) -> tuple[np.ndarray, tuple[int, int], str]:
+    """Uniformly scale the fixed 4:3 K into the source video frame."""
+
+    width, height = (int(source_size[0]), int(source_size[1]))
+    if min(width, height) <= 1:
+        raise ValueError("source_size dimensions must both exceed one pixel")
+    unit_count = min(width // 4, height // 3)
+    if unit_count <= 0:
+        raise ValueError(
+            "source_size is too small to contain an integer 4:3 capture"
+        )
+    content_size = (4 * unit_count, 3 * unit_count)
+    uniform_scale = (
+        content_size[0] / BEINGBEYOND_D435_REFERENCE_SIZE[0]
+    )
+    render_intrinsic = BEINGBEYOND_D435_INTRINSIC.copy()
+    render_intrinsic[0, :] *= uniform_scale
+    render_intrinsic[1, :] *= uniform_scale
+    calibration_source = (
+        "active BeingBeyond torso/head CameraCfg ideal pinhole calibration, "
+        f"uniformly scaled from {BEINGBEYOND_D435_REFERENCE_SIZE[0]}x"
+        f"{BEINGBEYOND_D435_REFERENCE_SIZE[1]} into the largest centered "
+        "4:3 capture contained by prepared source_size"
+    )
+    return render_intrinsic, content_size, calibration_source
+
+
+def _resolve_capture_calibration(
+    *,
+    capture_view: str,
+    source_size: tuple[int, int],
+    source_intrinsic: np.ndarray,
+) -> tuple[np.ndarray, tuple[int, int], str]:
+    """Resolve source-sized output and the selected camera's intrinsic."""
+
+    if capture_view == "robot-camera":
+        return _resolve_d435_calibration(source_size)
+    if capture_view != "scene":
+        raise ValueError(f"Unsupported capture view: {capture_view!r}")
+    intrinsic = np.asarray(source_intrinsic, dtype=np.float64)
+    if (
+        intrinsic.shape != (3, 3)
+        or not np.isfinite(intrinsic).all()
+        or intrinsic[0, 0] <= 0.0
+        or intrinsic[1, 1] <= 0.0
+    ):
+        raise ValueError("source_intrinsic must be a valid pinhole matrix")
+    return (
+        intrinsic.copy(),
+        tuple(int(value) for value in source_size),
+        "prepared source intrinsic at prepared source_size",
+    )
+
+
+def _centered_letterbox_offsets(
+    *,
+    output_size: tuple[int, int],
+    content_size: tuple[int, int],
+) -> tuple[int, int, int, int]:
+    """Return left, top, right, bottom padding for centered content."""
+
+    output_width, output_height = (int(value) for value in output_size)
+    content_width, content_height = (int(value) for value in content_size)
+    if min(
+        output_width,
+        output_height,
+        content_width,
+        content_height,
+    ) <= 0:
+        raise ValueError("output_size and content_size must be positive")
+    if (
+        content_width > output_width
+        or content_height > output_height
+    ):
+        raise ValueError("content_size must fit inside output_size")
+    horizontal = output_width - content_width
+    vertical = output_height - content_height
+    left = horizontal // 2
+    top = vertical // 2
+    return left, top, horizontal - left, vertical - top
+
+
+def _letterbox_rgb(
+    rgb: np.ndarray,
+    *,
+    output_size: tuple[int, int],
+    offsets: tuple[int, int, int, int],
+) -> np.ndarray:
+    """Place an RGB capture into a source-sized black output frame."""
+
+    rgb = np.asarray(rgb)
+    if rgb.ndim != 3 or rgb.shape[2] != 3:
+        raise ValueError("rgb must have shape [height, width, 3]")
+    output_width, output_height = (int(value) for value in output_size)
+    left, top, right, bottom = (int(value) for value in offsets)
+    if min(left, top, right, bottom) < 0:
+        raise ValueError("letterbox offsets must be non-negative")
+    if (
+        left + rgb.shape[1] + right != output_width
+        or top + rgb.shape[0] + bottom != output_height
+    ):
+        raise ValueError(
+            "letterbox offsets, content, and output_size do not agree"
+        )
+    output = np.zeros((output_height, output_width, 3), dtype=rgb.dtype)
+    output[top : top + rgb.shape[0], left : left + rgb.shape[1]] = rgb
+    return output
+
+
+def _camera_fov_degrees(
+    intrinsic: np.ndarray,
+    *,
+    image_size: tuple[int, int],
+) -> dict[str, float]:
+    """Return full pinhole FOV, respecting an off-center principal point."""
+
+    intrinsic = np.asarray(intrinsic, dtype=np.float64)
+    width, height = (int(value) for value in image_size)
+    if (
+        intrinsic.shape != (3, 3)
+        or not np.isfinite(intrinsic).all()
+        or min(width, height, intrinsic[0, 0], intrinsic[1, 1]) <= 0
+    ):
+        raise ValueError("intrinsic and image_size must be valid")
+    horizontal = np.arctan2(intrinsic[0, 2], intrinsic[0, 0])
+    horizontal += np.arctan2(
+        width - intrinsic[0, 2],
+        intrinsic[0, 0],
+    )
+    vertical = np.arctan2(intrinsic[1, 2], intrinsic[1, 1])
+    vertical += np.arctan2(
+        height - intrinsic[1, 2],
+        intrinsic[1, 1],
+    )
+    return {
+        "horizontal": float(np.degrees(horizontal)),
+        "vertical": float(np.degrees(vertical)),
+    }
+
+
+def _hand_projection_report(
+    *,
+    hand_points_camera_cv: np.ndarray,
+    intrinsic: np.ndarray,
+    capture_size: tuple[int, int],
+    warning_threshold: float = HAND_CAPTURE_WARNING_THRESHOLD,
+) -> dict[str, object]:
+    """Summarize whether the two G1 hands are visible to the head camera."""
+
+    points = np.asarray(hand_points_camera_cv, dtype=np.float64)
+    intrinsic = np.asarray(intrinsic, dtype=np.float64)
+    if (
+        points.ndim != 3
+        or points.shape[1:] != (2, 3)
+        or len(points) == 0
+        or not np.isfinite(points).all()
+    ):
+        raise ValueError("hand_points_camera_cv must be finite [N,2,3]")
+    if (
+        not np.isfinite(warning_threshold)
+        or not 0.0 <= warning_threshold <= 1.0
+    ):
+        raise ValueError("warning_threshold must lie in [0, 1]")
+    width, height = (int(value) for value in capture_size)
+    if intrinsic.shape != (3, 3) or min(width, height) <= 0:
+        raise ValueError("intrinsic and capture_size must be valid")
+
+    in_front = points[:, :, 2] > 0.0
+    pixels = np.full((len(points), 2, 2), np.nan, dtype=np.float64)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        pixels[:, :, 0] = (
+            intrinsic[0, 0] * points[:, :, 0] / points[:, :, 2]
+            + intrinsic[0, 2]
+        )
+        pixels[:, :, 1] = (
+            intrinsic[1, 1] * points[:, :, 1] / points[:, :, 2]
+            + intrinsic[1, 2]
+        )
+    in_capture = (
+        in_front
+        & (pixels[:, :, 0] >= 0.0)
+        & (pixels[:, :, 0] < width)
+        & (pixels[:, :, 1] >= 0.0)
+        & (pixels[:, :, 1] < height)
+    )
+    distances = np.linalg.norm(points, axis=2)
+    per_hand_fraction = {
+        name: float(np.mean(in_capture[:, hand_id]))
+        for hand_id, name in enumerate(("left", "right"))
+    }
+    warnings = [
+        (
+            f"{name} hand projected inside capture for "
+            f"{fraction:.1%} of frames, below "
+            f"{warning_threshold:.0%}"
+        )
+        for name, fraction in per_hand_fraction.items()
+        if fraction < warning_threshold
+    ]
+    return {
+        "hand_frames": list(ROBOT_HAND_FRAMES),
+        "frame_count": int(len(points)),
+        "capture_size": [width, height],
+        "fov_degrees": _camera_fov_degrees(
+            intrinsic,
+            image_size=capture_size,
+        ),
+        "in_front_fraction": {
+            name: float(np.mean(in_front[:, hand_id]))
+            for hand_id, name in enumerate(("left", "right"))
+        },
+        "in_capture_fraction": {
+            **per_hand_fraction,
+            "all_hand_samples": float(np.mean(in_capture)),
+            "both_hands_per_frame": float(
+                np.mean(np.all(in_capture, axis=1))
+            ),
+        },
+        "camera_to_hand_distance_m": {
+            name: _distribution(distances[:, hand_id])
+            for hand_id, name in enumerate(("left", "right"))
+        },
+        "warning_threshold": float(warning_threshold),
+        "warnings": warnings,
+        "status": "warning" if warnings else "ok",
+    }
+
+
+def _beingbeyond_capture_camera_report(
+    *,
+    content_intrinsic: np.ndarray,
+    output_intrinsic: np.ndarray,
+    content_size: tuple[int, int],
+    output_size: tuple[int, int],
+    letterbox: dict[str, object],
+    hand_projection: dict[str, object],
+) -> dict[str, object]:
+    """Build the stable, machine-checkable exact camera profile report."""
+
+    content_intrinsic = np.asarray(content_intrinsic, dtype=np.float64)
+    output_intrinsic = np.asarray(output_intrinsic, dtype=np.float64)
+    if (
+        content_intrinsic.shape != (3, 3)
+        or output_intrinsic.shape != (3, 3)
+        or not np.isfinite(content_intrinsic).all()
+        or not np.isfinite(output_intrinsic).all()
+    ):
+        raise ValueError("camera report intrinsics must be finite 3x3")
+    return {
+        "profile": BEINGBEYOND_HEAD_CAMERA_PROFILE,
+        "type": "G1 torso-mounted BeingBeyond ideal pinhole",
+        "parent_urdf_frame": BEINGBEYOND_HEAD_CAMERA_PARENT_FRAME,
+        "parent_prim": (
+            "/World/G1/torso_link (resolved through URDF FK)"
+        ),
+        "pose_source": (
+            "per-frame torso_link URDF forward kinematics from prepared "
+            "G1 root and joint trajectory, composed with the active "
+            "BeingBeyond CameraCfg offset"
+        ),
+        "set_world_pose_camera_axes": "world",
+        "offset_position_base_xyz_m": (
+            BEINGBEYOND_HEAD_CAM_OFFSET_POS_BASE.tolist()
+        ),
+        "reset_guard_forward_x_m": (
+            BEINGBEYOND_HEAD_CAM_RESET_GUARD_X_M
+        ),
+        "reset_guard_applied": True,
+        "reset_guard_reason": (
+            "zero-noise delta_x=0 is below the active 5 mm occlusion "
+            "reject threshold, so fallback clamps delta_x to +0.005 m"
+        ),
+        "offset_position_active_xyz_m": (
+            BEINGBEYOND_HEAD_CAM_OFFSET_POS_ACTIVE.tolist()
+        ),
+        "offset_rotation_world_wxyz": (
+            BEINGBEYOND_HEAD_CAM_OFFSET_ROT_WXYZ.tolist()
+        ),
+        "native_size": list(BEINGBEYOND_D435_REFERENCE_SIZE),
+        "reference_size": list(BEINGBEYOND_D435_REFERENCE_SIZE),
+        "content_size": [int(value) for value in content_size],
+        "output_size": [int(value) for value in output_size],
+        "letterbox": letterbox,
+        "reference_intrinsic": BEINGBEYOND_D435_INTRINSIC.tolist(),
+        "content_intrinsic": content_intrinsic.tolist(),
+        "output_intrinsic_after_letterbox": output_intrinsic.tolist(),
+        "intrinsic_scaling": "uniform x/y scale",
+        "distortion_model": "zero distortion",
+        "cv_pose_usage": (
+            "projection and visibility diagnostics only; rendering uses "
+            "the world-axis pose"
+        ),
+        "hand_projection": hand_projection,
+    }
+
+
+def _articulation_commit_errors(
+    *,
+    expected_joint_positions: np.ndarray,
+    actual_joint_positions: np.ndarray,
+    expected_root_pose_xyzw: np.ndarray,
+    actual_root_position: np.ndarray,
+    actual_root_orientation_wxyz: np.ndarray,
+) -> dict[str, float]:
+    """Measure one Isaac articulation commit against the requested frame."""
+
+    expected_joint = np.asarray(
+        expected_joint_positions,
+        dtype=np.float64,
+    ).reshape(-1)
+    actual_joint = np.asarray(
+        actual_joint_positions,
+        dtype=np.float64,
+    ).reshape(-1)
+    expected_root = np.asarray(
+        expected_root_pose_xyzw,
+        dtype=np.float64,
+    ).reshape(-1)
+    actual_position = np.asarray(
+        actual_root_position,
+        dtype=np.float64,
+    ).reshape(-1)
+    actual_wxyz = np.asarray(
+        actual_root_orientation_wxyz,
+        dtype=np.float64,
+    ).reshape(-1)
+    if expected_joint.shape != actual_joint.shape:
+        raise ValueError("expected and actual joints must have equal shape")
+    if (
+        expected_root.shape != (7,)
+        or actual_position.shape != (3,)
+        or actual_wxyz.shape != (4,)
+    ):
+        raise ValueError("root pose components have invalid shapes")
+    if not all(
+        np.isfinite(value).all()
+        for value in (
+            expected_joint,
+            actual_joint,
+            expected_root,
+            actual_position,
+            actual_wxyz,
+        )
+    ):
+        raise ValueError("articulation commit inputs must be finite")
+    expected_quaternion = expected_root[3:7]
+    actual_quaternion = actual_wxyz[[1, 2, 3, 0]]
+    expected_norm = float(np.linalg.norm(expected_quaternion))
+    actual_norm = float(np.linalg.norm(actual_quaternion))
+    if min(expected_norm, actual_norm) <= 1e-8:
+        raise ValueError("root orientation contains a zero quaternion")
+    quaternion_dot = float(
+        np.clip(
+            abs(
+                np.dot(
+                    expected_quaternion / expected_norm,
+                    actual_quaternion / actual_norm,
+                )
+            ),
+            0.0,
+            1.0,
+        )
+    )
+    joint_error = np.abs(expected_joint - actual_joint)
+    return {
+        "joint_max_abs_rad": float(
+            np.max(joint_error) if len(joint_error) else 0.0
+        ),
+        "joint_rmse_rad": float(
+            np.sqrt(np.mean(np.square(joint_error)))
+            if len(joint_error)
+            else 0.0
+        ),
+        "root_position_m": float(
+            np.linalg.norm(expected_root[:3] - actual_position)
+        ),
+        "root_orientation_rad": float(2.0 * np.arccos(quaternion_dot)),
+    }
+
+
+def _commit_articulation_for_render(
+    *,
+    world: object,
+    robot: object,
+    root_pose_xyzw: np.ndarray,
+    joint_positions: np.ndarray,
+    zero_joint_velocity: np.ndarray,
+    zero_root_velocity: np.ndarray,
+) -> int:
+    """Teleport one articulation frame and propagate it to the renderer.
+
+    Replicator pauses the timeline after every capture.  Isaac's
+    ``world.step(render=False)`` is a no-op while paused, even though direct
+    articulation readback already returns the newly written tensor values.
+    Resume first and request the physics-to-Fabric update explicitly so Hydra
+    sees the same link transforms as PhysX.
+    """
+
+    if not world.is_playing():
+        world.play()
+    step_before = int(world.current_time_step_index)
+    root_pose = np.asarray(root_pose_xyzw, dtype=np.float32)
+    joints = np.asarray(joint_positions, dtype=np.float32)
+    robot.set_world_poses(
+        positions=root_pose[None, :3],
+        orientations=root_pose[[6, 3, 4, 5]][None],
+    )
+    robot.set_joint_positions(joints[None])
+    robot.set_joint_velocities(zero_joint_velocity)
+    robot.set_velocities(zero_root_velocity)
+    world.step(render=False, update_fabric=True)
+    step_after = int(world.current_time_step_index)
+    step_delta = step_after - step_before
+    if step_delta <= 0:
+        raise RuntimeError(
+            "Isaac articulation render synchronization failed: the "
+            "physics-only commit did not advance after resuming the timeline"
+        )
+    return step_delta
+
+
+def _resolve_alignment_window(
+    *,
+    source_fps: float,
+    frame_count: int,
+    requested_seconds: float,
+    deprecated_frames: int | None = None,
+    option_name: str = "--scene-alignment-window-seconds",
+) -> AlignmentWindow:
+    """Convert a time window to source frames, bounded by the sequence."""
+
+    if (
+        not np.isfinite(source_fps)
+        or source_fps <= 0.0
+        or frame_count <= 0
+    ):
+        raise ValueError("source FPS and frame count must be positive")
+    if frame_count < 3:
+        raise ValueError(
+            "Prepared sequence has fewer than three frames for hand alignment"
+        )
+    if deprecated_frames is not None:
+        if deprecated_frames <= 0:
+            raise ValueError(
+                "--scene-alignment-window-frames must be positive"
+            )
+        seconds = float(deprecated_frames / source_fps)
+        requested_frames = int(deprecated_frames)
+        source = "deprecated --scene-alignment-window-frames"
+    else:
+        seconds = float(requested_seconds)
+        if not np.isfinite(seconds) or seconds <= 0.0:
+            raise ValueError(
+                f"{option_name} must be positive and finite"
+            )
+        requested_frames = int(np.floor(seconds * source_fps + 0.5))
+        source = option_name
+    resolved_frames = min(frame_count, max(3, requested_frames))
+    return AlignmentWindow(
+        requested_seconds=seconds,
+        resolved_frames=resolved_frames,
+        source=source,
+    )
 
 
 def _look_at_usd_wxyz(eye: np.ndarray, target: np.ndarray) -> np.ndarray:
@@ -489,16 +1031,9 @@ def _resolve_run_options(
         raise ValueError("--interactive requires --no-headless")
     if loop and not interactive:
         raise ValueError("--loop requires --interactive")
-    if args.playback_fps is not None and not interactive:
-        raise ValueError("--playback-fps is only valid with --interactive")
-
-    playback_fps = (
-        source_fps
-        if args.playback_fps is None
-        else float(args.playback_fps)
-    )
-    if not np.isfinite(playback_fps) or playback_fps <= 0.0:
-        raise ValueError("--playback-fps must be positive and finite")
+    if not np.isfinite(source_fps) or source_fps <= 0.0:
+        raise ValueError("Prepared source FPS must be positive and finite")
+    playback_fps = float(source_fps)
 
     if interactive:
         if args.output is not None:
@@ -553,46 +1088,6 @@ def _next_playback_frame(
 def render(args: argparse.Namespace) -> dict[str, object]:
     scene = load_prepared_scene(args.prepared)
     run_options = _resolve_run_options(args, source_fps=scene.fps)
-    if args.scene_alignment == "initial-hands":
-        if scene.source_hdf5 is None or scene.scene_scale is None:
-            raise ValueError(
-                "--scene-alignment initial-hands requires source_hdf5 and "
-                "scene_scale in prepared episode_data.npz; use "
-                "--scene-alignment none only for legacy prepared data"
-            )
-        alignment = align_scene_camera_poses_to_initial_hands(
-            source_hdf5=scene.source_hdf5,
-            frame_indices=scene.frame_indices,
-            scene_scale=scene.scene_scale,
-            scene_camera_pose_cv_xyzw=scene.camera_poses_cv_xyzw,
-            urdf_path=scene.g1_urdf,
-            joint_names=scene.joint_names,
-            joint_positions=scene.joint_positions,
-            root_pose_xyzw=scene.root_poses_xyzw,
-            window_frames=args.scene_alignment_window_frames,
-            confidence_threshold=args.scene_hand_confidence,
-        )
-        scene = replace(
-            scene,
-            camera_poses_cv_xyzw=alignment.camera_pose_cv_xyzw,
-        )
-        scene_alignment_report = alignment.report
-        scene_translation_world = alignment.translation_world_xyz_m
-        print(
-            "Initial hand-anchor scene placement: "
-            f"delta_world={scene_translation_world.tolist()} m, "
-            f"frames={scene_alignment_report['paired_frame_count']}",
-            flush=True,
-        )
-    else:
-        scene_translation_world = np.zeros(3, dtype=np.float64)
-        scene_alignment_report = {
-            "schema_version": 1,
-            "method": "disabled",
-            "requested_mode": "none",
-            "world_translation_xyz_m": [0.0, 0.0, 0.0],
-            "application_count": 0,
-        }
     if (
         not np.isfinite(args.depth_edge_absolute)
         or args.depth_edge_absolute < 0
@@ -605,25 +1100,277 @@ def render(args: argparse.Namespace) -> dict[str, object]:
         raise ValueError("--depth-edge-relative must be finite and non-negative")
     if args.rt_subframes <= 0:
         raise ValueError("--rt-subframes must be positive")
+    if (
+        args.scene_alignment != "none"
+        and (scene.source_hdf5 is None or scene.scene_scale is None)
+    ):
+        raise ValueError(
+            "--scene-alignment requires source_hdf5 and scene_scale in "
+            "prepared episode_data.npz; use "
+            "--scene-alignment none only for legacy prepared data"
+        )
+    scene_anchor_description = {
+        "initial-hands": "bilateral exact fingertip-TCP XYZ anchor",
+        "initial-wrists": "bilateral source/G1 wrist-midpoint XYZ anchor",
+    }.get(args.scene_alignment)
+    scene_alignment_stage = {
+        "initial-hands": HAND_TCP_ALIGNMENT_STAGE,
+        "initial-wrists": WRIST_ALIGNMENT_STAGE,
+    }.get(args.scene_alignment)
 
-    render_size = (
-        scene.source_size
-        if args.render_size is None
-        else tuple(int(value) for value in args.render_size)
-    )
-    if min(render_size) <= 1:
-        raise ValueError("--render-size dimensions must exceed one pixel")
-    if any(dimension % 2 for dimension in render_size):
-        raise ValueError("--render-size dimensions must be even")
-    render_intrinsic = scale_intrinsic(
-        scene.intrinsic,
+    scene_leveling_linear_world = np.eye(3, dtype=np.float64)
+    scene_leveling_pivot_world = np.zeros(3, dtype=np.float64)
+    if args.scene_leveling == "support-plane":
+        leveling_window = _resolve_alignment_window(
+            source_fps=scene.fps,
+            frame_count=scene.frame_count,
+            requested_seconds=args.scene_leveling_window_seconds,
+            option_name="--scene-leveling-window-seconds",
+        )
+        leveling = level_scene_camera_poses_from_support_plane(
+            depth_paths=scene.depth_paths,
+            mesh_size=scene.mesh_size,
+            mesh_intrinsic=scene.mesh_intrinsic,
+            camera_pose_cv_xyzw=scene.camera_poses_cv_xyzw,
+            window_frames=leveling_window.resolved_frames,
+        )
+        scene_leveling_linear_world = leveling.linear_world
+        scene_leveling_pivot_world = leveling.pivot_world_xyz_m
+        scene_leveling_report = leveling.report
+        scene_leveling_report.update(
+            {
+                "pipeline_order": 1,
+                "window_seconds_requested": (
+                    leveling_window.requested_seconds
+                ),
+                "window_frames_resolved": leveling_window.resolved_frames,
+                "window_resolution_source": leveling_window.source,
+                "window_source_fps": scene.fps,
+            }
+        )
+        print(
+            "Initial support-plane scene leveling: "
+            "mode=world-Z-only-affine, "
+            f"input_tilt={scene_leveling_report['correction_degrees']:.3f} "
+            "deg, support_height="
+            f"{scene_leveling_report['support_height_after_m']:.4f} m, "
+            f"temporal_p95="
+            f"{scene_leveling_report['temporal_normal_residual_degrees']['p95']:.3f} "
+            "deg",
+            flush=True,
+        )
+    else:
+        scene_leveling_report = {
+            "schema_version": 2,
+            "method": "disabled",
+            "requested_mode": "none",
+            "status": "disabled",
+            "linear_world": scene_leveling_linear_world.tolist(),
+            "pivot_world_xyz_m": scene_leveling_pivot_world.tolist(),
+            "correction_degrees": 0.0,
+            "fits_yaw": False,
+            "fits_rotation": False,
+            "fits_height_shear": False,
+            "fits_translation": False,
+            "fits_scale": False,
+            "application_count": 0,
+        }
+
+    if args.scene_alignment != "none":
+        assert scene.source_hdf5 is not None
+        assert scene.scene_scale is not None
+        assert scene_anchor_description is not None
+        assert scene_alignment_stage is not None
+        alignment_window = _resolve_alignment_window(
+            source_fps=scene.fps,
+            frame_count=scene.frame_count,
+            requested_seconds=args.scene_alignment_window_seconds,
+            deprecated_frames=args.scene_alignment_window_frames,
+        )
+        alignment_kwargs = {
+            "source_hdf5": scene.source_hdf5,
+            "frame_indices": scene.frame_indices,
+            "scene_scale": scene.scene_scale,
+            "scene_camera_pose_cv_xyzw": scene.camera_poses_cv_xyzw,
+            "urdf_path": scene.g1_urdf,
+            "joint_names": scene.joint_names,
+            "joint_positions": scene.joint_positions,
+            "root_pose_xyzw": scene.root_poses_xyzw,
+            "window_frames": alignment_window.resolved_frames,
+            "scene_world_linear": scene_leveling_linear_world,
+            "scene_world_pivot": scene_leveling_pivot_world,
+        }
+        if args.scene_alignment == "initial-hands":
+            alignment = align_scene_camera_poses_to_initial_hand_tcp(
+                **alignment_kwargs,
+                confidence_threshold=args.scene_hand_confidence,
+            )
+        else:
+            alignment = align_scene_camera_poses_to_initial_wrists(
+                **alignment_kwargs,
+            )
+        scene_alignment_report = alignment.report
+        scene_alignment_report.update(
+            {
+                "requested_mode": args.scene_alignment,
+                "pipeline_order": 2,
+                "window_seconds_requested": (
+                    alignment_window.requested_seconds
+                ),
+                "window_frames_resolved": alignment_window.resolved_frames,
+                "window_resolution_source": alignment_window.source,
+                "window_source_fps": scene.fps,
+            }
+        )
+        scene_translation_world = alignment.translation_world_xyz_m
+        support_height_after_leveling = scene_leveling_report.get(
+            "support_height_after_m"
+        )
+        if support_height_after_leveling is not None:
+            support_height_before_anchor = float(
+                support_height_after_leveling
+            )
+            support_height_final = (
+                support_height_before_anchor
+                + float(scene_translation_world[2])
+            )
+            scene_alignment_report.update(
+                {
+                    "support_height_before_anchor_m": (
+                        support_height_before_anchor
+                    ),
+                    "support_height_after_anchor_m": support_height_final,
+                    "support_height_delta_from_anchor_m": float(
+                        scene_translation_world[2]
+                    ),
+                }
+            )
+        print(
+            f"Initial {scene_anchor_description} placement "
+            "(after leveling): "
+            f"delta_world={scene_translation_world.tolist()} m, "
+            f"frames={scene_alignment_report['paired_frame_count']}"
+            + (
+                ", support_height="
+                f"{scene_alignment_report['support_height_after_anchor_m']:.4f} m"
+                if "support_height_after_anchor_m"
+                in scene_alignment_report
+                else ""
+            ),
+            flush=True,
+        )
+    else:
+        scene_translation_world = np.zeros(3, dtype=np.float64)
+        scene_alignment_report = {
+            "schema_version": 1,
+            "method": "disabled",
+            "requested_mode": "none",
+            "world_translation_xyz_m": [0.0, 0.0, 0.0],
+            "application_count": 0,
+        }
+
+    scene_operation_order: list[str] = []
+    if args.scene_leveling == "support-plane":
+        scene_operation_order.append(SUPPORT_PLANE_LEVELING_STAGE)
+    if scene_alignment_stage is not None:
+        scene_operation_order.append(scene_alignment_stage)
+    scene_placement_report: dict[str, object] = {
+        "schema_version": 2,
+        "method": (
+            "ordered optional support-plane leveling and bilateral "
+            "semantic-anchor XYZ scene placement"
+        ),
+        "operation_order": scene_operation_order,
+        "leveling_linear_world": (
+            scene_leveling_linear_world.tolist()
+        ),
+        "leveling_pivot_world_xyz_m": (
+            scene_leveling_pivot_world.tolist()
+        ),
+        "anchor_translation_world_xyz_m": (
+            scene_translation_world.tolist()
+        ),
+        "application_count": len(scene_operation_order),
+    }
+    if "support_height_after_m" in scene_leveling_report:
+        support_height_after_leveling = float(
+            scene_leveling_report["support_height_after_m"]
+        )
+        scene_placement_report.update(
+            {
+                "support_height_after_leveling_m": (
+                    support_height_after_leveling
+                ),
+                "support_height_after_anchor_m": (
+                    support_height_after_leveling
+                    + float(scene_translation_world[2])
+                ),
+            }
+        )
+
+    (
+        render_intrinsic,
+        render_size,
+        render_intrinsic_source,
+    ) = _resolve_capture_calibration(
+        capture_view=args.capture_view,
         source_size=scene.source_size,
-        target_size=render_size,
+        source_intrinsic=scene.intrinsic,
     )
+    output_size = tuple(int(value) for value in scene.source_size)
+    letterbox_offsets = _centered_letterbox_offsets(
+        output_size=output_size,
+        content_size=render_size,
+    )
+    (
+        letterbox_left,
+        letterbox_top,
+        letterbox_right,
+        letterbox_bottom,
+    ) = letterbox_offsets
+    output_intrinsic = render_intrinsic.copy()
+    output_intrinsic[0, 2] += letterbox_left
+    output_intrinsic[1, 2] += letterbox_top
+    robot_camera_poses_world_xyzw: np.ndarray | None = None
+    robot_camera_poses_cv_xyzw: np.ndarray | None = None
+    hand_projection_report: dict[str, object] | None = None
+    if args.capture_view == "robot-camera":
+        robot_camera_poses_world_xyzw = (
+            beingbeyond_head_camera_poses_world(
+                urdf_path=scene.g1_urdf,
+                joint_names=scene.joint_names,
+                joint_positions=scene.joint_positions,
+                root_pose_xyzw=scene.root_poses_xyzw,
+            )
+        )
+        robot_camera_poses_cv_xyzw = beingbeyond_head_camera_poses_cv(
+            urdf_path=scene.g1_urdf,
+            joint_names=scene.joint_names,
+            joint_positions=scene.joint_positions,
+            root_pose_xyzw=scene.root_poses_xyzw,
+        )
+        hand_points_camera = robot_frame_points_in_camera_cv(
+            urdf_path=scene.g1_urdf,
+            joint_names=scene.joint_names,
+            joint_positions=scene.joint_positions,
+            root_pose_xyzw=scene.root_poses_xyzw,
+            camera_pose_cv_xyzw=robot_camera_poses_cv_xyzw,
+            frame_names=ROBOT_HAND_FRAMES,
+        )
+        hand_projection_report = _hand_projection_report(
+            hand_points_camera_cv=hand_points_camera,
+            intrinsic=render_intrinsic,
+            capture_size=render_size,
+        )
+        for warning in hand_projection_report["warnings"]:
+            print(f"WARNING: {warning}", flush=True)
     scan = scan_scene(
         scene,
         absolute_threshold_m=args.depth_edge_absolute,
         relative_threshold=args.depth_edge_relative,
+        scene_leveling_linear_world=scene_leveling_linear_world,
+        scene_leveling_pivot_world_xyz_m=scene_leveling_pivot_world,
+        scene_translation_world_xyz_m=scene_translation_world,
     )
     scene_eye, scene_target, eye_source, target_source = (
         _resolve_scene_camera(
@@ -635,6 +1382,42 @@ def render(args: argparse.Namespace) -> dict[str, object]:
         )
     )
     render_width, render_height = render_size
+    output_width, output_height = output_size
+    letterbox_report = {
+        "output_size": [output_width, output_height],
+        "content_size": [render_width, render_height],
+        "offsets_px": {
+            "left": letterbox_left,
+            "top": letterbox_top,
+            "right": letterbox_right,
+            "bottom": letterbox_bottom,
+        },
+        "placement": "centered",
+        "fill_rgb": [0, 0, 0],
+    }
+    capture_camera_report: dict[str, object]
+    if args.capture_view == "robot-camera":
+        assert hand_projection_report is not None
+        capture_camera_report = _beingbeyond_capture_camera_report(
+            content_intrinsic=render_intrinsic,
+            output_intrinsic=output_intrinsic,
+            content_size=render_size,
+            output_size=output_size,
+            letterbox=letterbox_report,
+            hand_projection=hand_projection_report,
+        )
+    else:
+        capture_camera_report = {
+            "profile": "fixed_third_person_scene_camera_v1",
+            "type": "fixed third-person",
+            "eye_xyz_m": scene_eye.tolist(),
+            "eye_source": eye_source,
+            "target_xyz_m": scene_target.tolist(),
+            "target_source": target_source,
+            "content_size": list(render_size),
+            "output_size": list(output_size),
+            "letterbox": letterbox_report,
+        }
     if run_options.output_video is not None:
         run_options.output_video.parent.mkdir(parents=True, exist_ok=True)
 
@@ -686,6 +1469,15 @@ def render(args: argparse.Namespace) -> dict[str, object]:
         timeline = omni.timeline.get_timeline_interface()
 
         robot_path = import_g1(scene.g1_urdf)
+        robot_root_path = Sdf.Path(robot_path).GetParentPath()
+        robot_root = UsdGeom.Imageable(
+            stage.GetPrimAtPath(robot_root_path)
+        )
+        if not robot_root:
+            raise RuntimeError(
+                f"Imported G1 root is not Imageable: {robot_root_path}"
+            )
+        robot_visibility = robot_root.CreateVisibilityAttr()
         robot = world.scene.add(
             Articulation(
                 prim_paths_expr=robot_path,
@@ -777,14 +1569,22 @@ def render(args: argparse.Namespace) -> dict[str, object]:
             width=render_width,
             height=render_height,
         )
-        camera_path = "/World/VdaSceneCamera"
+        camera_path = (
+            "/World/G1D435Camera"
+            if args.capture_view == "robot-camera"
+            else "/World/VdaSceneCamera"
+        )
         camera_schema = UsdGeom.Camera.Define(stage, Sdf.Path(camera_path))
         camera_schema.CreateHorizontalApertureAttr(horizontal_aperture * 10.0)
         camera_schema.CreateVerticalApertureAttr(vertical_aperture * 10.0)
         camera_schema.CreateFocalLengthAttr(focal_length * 10.0)
         camera = Camera(
             prim_path=camera_path,
-            name="vda_scene_camera",
+            name=(
+                "g1_d435_camera"
+                if args.capture_view == "robot-camera"
+                else "vda_scene_camera"
+            ),
             resolution=(render_width, render_height),
         )
         camera.set_horizontal_aperture(
@@ -812,7 +1612,11 @@ def render(args: argparse.Namespace) -> dict[str, object]:
             0.01,
             max(
                 100.0,
-                np.linalg.norm(scene_eye - scene_target)
+                (
+                    np.linalg.norm(scene_eye - scene_target)
+                    if args.capture_view == "scene"
+                    else 0.0
+                )
                 + 3.0 * scene_diagonal,
             ),
         )
@@ -822,16 +1626,67 @@ def render(args: argparse.Namespace) -> dict[str, object]:
             cy=float(render_intrinsic[1, 2]),
             fx=float(render_intrinsic[0, 0]),
             fy=float(render_intrinsic[1, 1]),
-            pinhole=np.zeros(12, dtype=np.float64).tolist(),
+            pinhole=D435_DISTORTION.tolist(),
         )
-        camera.set_world_pose(
-            position=scene_eye.astype(np.float32),
-            orientation=_look_at_usd_wxyz(
-                scene_eye,
-                scene_target,
-            ).astype(np.float32),
-            camera_axes="usd",
+        (
+            resolved_cx,
+            resolved_cy,
+            resolved_fx,
+            resolved_fy,
+            resolved_distortion,
+        ) = camera.get_opencv_pinhole_properties()
+        resolved_intrinsic = np.asarray(
+            [
+                [resolved_fx, 0.0, resolved_cx],
+                [0.0, resolved_fy, resolved_cy],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
         )
+        if not np.allclose(
+            resolved_intrinsic,
+            render_intrinsic,
+            rtol=1e-6,
+            atol=1e-3,
+        ):
+            raise RuntimeError(
+                "Isaac camera intrinsic mismatch: "
+                f"expected={render_intrinsic.tolist()}, "
+                f"actual={resolved_intrinsic.tolist()}"
+            )
+        if not np.allclose(
+            np.asarray(
+                resolved_distortion[
+                    : len(D435_DISTORTION)
+                ],
+                dtype=np.float64,
+            ),
+            D435_DISTORTION,
+            rtol=1e-6,
+            atol=1e-8,
+        ):
+            raise RuntimeError(
+                "Isaac camera distortion differs from the required "
+                "zero-distortion pinhole model"
+            )
+        if robot_camera_poses_world_xyzw is not None:
+            camera_world_pose = robot_camera_poses_world_xyzw[0]
+            camera.set_world_pose(
+                position=camera_world_pose[:3].astype(np.float32),
+                orientation=camera_world_pose[[6, 3, 4, 5]].astype(
+                    np.float32
+                ),
+                camera_axes="world",
+            )
+        else:
+            camera.set_world_pose(
+                position=scene_eye.astype(np.float32),
+                orientation=_look_at_usd_wxyz(
+                    scene_eye,
+                    scene_target,
+                ).astype(np.float32),
+                camera_axes="usd",
+            )
 
         joint_order = isaac_joint_order(
             list(robot.dof_names),
@@ -842,6 +1697,11 @@ def render(args: argparse.Namespace) -> dict[str, object]:
             dtype=np.float32,
         )
         zero_root_velocity = np.zeros((1, 6), dtype=np.float32)
+        commit_joint_max_abs_rad: list[float] = []
+        commit_joint_rmse_rad: list[float] = []
+        commit_root_position_m: list[float] = []
+        commit_root_orientation_rad: list[float] = []
+        commit_physics_step_delta: list[int] = []
         print(
             f"Isaac G1 articulation: {robot_path} · "
             f"{len(joint_order)} DoF",
@@ -851,7 +1711,6 @@ def render(args: argparse.Namespace) -> dict[str, object]:
         def apply_frame(frame_id: int) -> None:
             if run_options.interactive:
                 timeline.set_auto_update(True)
-                world.play()
             rgb_path = scene.rgb_paths[frame_id]
             depth_path = scene.depth_paths[frame_id]
             depth_m = _load_depth_m(depth_path, scene.mesh_size)
@@ -864,6 +1723,12 @@ def render(args: argparse.Namespace) -> dict[str, object]:
                 scene.camera_poses_cv_xyzw[frame_id],
             )
             valid = np.isfinite(points_world).all(axis=-1)
+            points_world[valid] = apply_world_affine_to_points(
+                points_world[valid],
+                linear_world=scene_leveling_linear_world,
+                pivot_world_xyz_m=scene_leveling_pivot_world,
+            )
+            points_world[valid] += scene_translation_world
             points_world[~valid] = 0.0
             triangles = depth_grid_triangles(
                 depth_m,
@@ -898,29 +1763,141 @@ def render(args: argparse.Namespace) -> dict[str, object]:
             texture_file_input.Set(
                 Sdf.AssetPath(str(rgb_path.resolve()))
             )
+            robot_visibility.Set(
+                UsdGeom.Tokens.inherited
+                if scene.robot_arm_render[frame_id]
+                else UsdGeom.Tokens.invisible
+            )
 
             root_pose = scene.root_poses_xyzw[frame_id]
-            robot.set_world_poses(
-                positions=root_pose[None, :3].astype(np.float32),
-                orientations=root_pose[[6, 3, 4, 5]][None].astype(
-                    np.float32
+            expected_joint_positions = scene.joint_positions[
+                frame_id,
+                joint_order,
+            ]
+            commit_physics_step_delta.append(
+                _commit_articulation_for_render(
+                    world=world,
+                    robot=robot,
+                    root_pose_xyzw=root_pose,
+                    joint_positions=expected_joint_positions,
+                    zero_joint_velocity=zero_joint_velocity,
+                    zero_root_velocity=zero_root_velocity,
+                )
+            )
+            actual_joint_positions = robot.get_joint_positions()
+            (
+                actual_root_positions,
+                actual_root_orientations_wxyz,
+            ) = robot.get_world_poses()
+            commit_error = _articulation_commit_errors(
+                expected_joint_positions=expected_joint_positions,
+                actual_joint_positions=actual_joint_positions[0],
+                expected_root_pose_xyzw=root_pose,
+                actual_root_position=actual_root_positions[0],
+                actual_root_orientation_wxyz=(
+                    actual_root_orientations_wxyz[0]
                 ),
             )
-            robot.set_joint_positions(
-                scene.joint_positions[
-                    frame_id,
-                    joint_order,
-                ][None].astype(np.float32)
+            commit_joint_max_abs_rad.append(
+                commit_error["joint_max_abs_rad"]
             )
-            robot.set_joint_velocities(zero_joint_velocity)
-            robot.set_velocities(zero_root_velocity)
-            # Commit both the articulation tensor writes and mesh update before
-            # this frame is presented or captured.
-            world.step(render=False)
+            commit_joint_rmse_rad.append(
+                commit_error["joint_rmse_rad"]
+            )
+            commit_root_position_m.append(
+                commit_error["root_position_m"]
+            )
+            commit_root_orientation_rad.append(
+                commit_error["root_orientation_rad"]
+            )
+            commit_failures = {
+                "joint_max_abs_rad": (
+                    commit_error["joint_max_abs_rad"],
+                    JOINT_COMMIT_ATOL_RAD,
+                ),
+                "root_position_m": (
+                    commit_error["root_position_m"],
+                    ROOT_POSITION_COMMIT_ATOL_M,
+                ),
+                "root_orientation_rad": (
+                    commit_error["root_orientation_rad"],
+                    ROOT_ORIENTATION_COMMIT_ATOL_RAD,
+                ),
+            }
+            exceeded = {
+                name: {"actual": actual, "limit": limit}
+                for name, (actual, limit) in commit_failures.items()
+                if actual > limit
+            }
+            if exceeded:
+                raise RuntimeError(
+                    "Isaac articulation did not commit the requested "
+                    f"trajectory frame {frame_id}: {exceeded}"
+                )
+            if robot_camera_poses_world_xyzw is not None:
+                camera_world_pose = robot_camera_poses_world_xyzw[frame_id]
+                camera.set_world_pose(
+                    position=camera_world_pose[:3].astype(np.float32),
+                    orientation=camera_world_pose[
+                        [6, 3, 4, 5]
+                    ].astype(np.float32),
+                    camera_axes="world",
+                )
             if run_options.interactive:
                 world.pause()
                 timeline.set_auto_update(False)
                 timeline.commit()
+
+        def articulation_commit_report() -> dict[str, object]:
+            if not commit_joint_max_abs_rad:
+                raise RuntimeError(
+                    "No articulation trajectory frame was committed"
+                )
+            return {
+                "schema_version": 2,
+                "method": (
+                    "read back Isaac articulation joint/root state after "
+                    "each teleport; resume the Replicator-paused timeline, "
+                    "then world.step(render=False, update_fabric=True)"
+                ),
+                "verified_application_count": len(
+                    commit_joint_max_abs_rad
+                ),
+                "strict_validation_passed": True,
+                "render_sync_validation": {
+                    "passed": True,
+                    "condition": (
+                        "physics step index must advance for every frame "
+                        "before Hydra/RTX capture"
+                    ),
+                    "physics_step_index_delta": _distribution(
+                        np.asarray(
+                            commit_physics_step_delta,
+                            dtype=np.float64,
+                        )
+                    ),
+                    "fabric_update_requested": True,
+                },
+                "thresholds": {
+                    "joint_max_abs_rad": JOINT_COMMIT_ATOL_RAD,
+                    "root_position_m": ROOT_POSITION_COMMIT_ATOL_M,
+                    "root_orientation_rad": (
+                        ROOT_ORIENTATION_COMMIT_ATOL_RAD
+                    ),
+                },
+                "joint_max_abs_rad": _distribution(
+                    np.asarray(commit_joint_max_abs_rad)
+                ),
+                "joint_rmse_rad": _distribution(
+                    np.asarray(commit_joint_rmse_rad)
+                ),
+                "root_position_m": _distribution(
+                    np.asarray(commit_root_position_m)
+                ),
+                "root_orientation_rad": _distribution(
+                    np.asarray(commit_root_orientation_rad)
+                ),
+            }
 
         if run_options.interactive:
             from isaacsim.core.utils.viewports import set_camera_view
@@ -977,13 +1954,13 @@ def render(args: argparse.Namespace) -> dict[str, object]:
                     now = time.perf_counter()
                     if finished:
                         simulation_app.update()
-                        time.sleep(1.0 / 120.0)
+                        time.sleep(frame_period)
                         continue
                     if now < next_frame_at:
                         time.sleep(
                             min(
                                 next_frame_at - now,
-                                1.0 / 240.0,
+                                frame_period / 4.0,
                             )
                         )
                         continue
@@ -1011,7 +1988,7 @@ def render(args: argparse.Namespace) -> dict[str, object]:
                     apply_frame(current_frame)
                     # One normal viewport render both presents this RGB-D frame
                     # and processes GUI camera input. Avoid an additional Kit
-                    # update here: that would make 30 FPS playback miss its
+                    # update here: that can make source-rate playback miss its
                     # wall-clock deadline on otherwise capable hardware.
                     world.render()
                     after_render = time.perf_counter()
@@ -1023,7 +2000,7 @@ def render(args: argparse.Namespace) -> dict[str, object]:
                 pass
 
             report: dict[str, object] = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "method": (
                     "video-depth-anything-dynamic-rgbd-mesh"
                     "-plus-g1-articulation"
@@ -1037,6 +2014,18 @@ def render(args: argparse.Namespace) -> dict[str, object]:
                     "trajectory_source": (
                         "episode_data.npz joint_positions/root_pose_xyzw"
                     ),
+                    "visual_visibility": {
+                        "source": "episode_data.npz robot_arm_render",
+                        "visible_frames": int(
+                            scene.robot_arm_render.sum()
+                        ),
+                        "hidden_frames": int(
+                            (~scene.robot_arm_render).sum()
+                        ),
+                    },
+                    "articulation_commit": (
+                        articulation_commit_report()
+                    ),
                 },
                 "frame_count": scene.frame_count,
                 "source_fps": scene.fps,
@@ -1044,13 +2033,37 @@ def render(args: argparse.Namespace) -> dict[str, object]:
                 "loop": run_options.loop,
                 "completed_passes": completed_passes,
                 "last_local_frame": current_frame,
+                "source_size": list(scene.source_size),
                 "render_size": list(render_size),
+                "render_size_source": (
+                    "largest native-aspect capture contained by "
+                    "prepared source_size"
+                    if args.capture_view == "robot-camera"
+                    else "prepared source_size"
+                ),
+                "output_size": list(output_size),
+                "output_size_source": "prepared source_size",
+                "letterbox": letterbox_report,
+                "capture_view": args.capture_view,
+                "capture_intrinsic": render_intrinsic.tolist(),
+                "capture_intrinsic_source": render_intrinsic_source,
+                "capture_distortion": (
+                    D435_DISTORTION.tolist()
+                ),
                 "interactive_viewport_camera": str(viewport_camera_path),
+                "interactive_viewport_type": (
+                    "adjustable third-person debug view"
+                ),
                 "initial_view": {
                     "eye_xyz_m": scene_eye.tolist(),
                     "target_xyz_m": scene_target.tolist(),
                 },
+                "capture_camera": capture_camera_report,
+                "articulation_commit": articulation_commit_report(),
+                "scene_leveling": scene_leveling_report,
                 "scene_alignment": scene_alignment_report,
+                "scene_placement": scene_placement_report,
+                "operation_order": scene_operation_order,
                 "elapsed_seconds": time.perf_counter() - started,
             }
             print(json.dumps(report, indent=2), flush=True)
@@ -1066,7 +2079,7 @@ def render(args: argparse.Namespace) -> dict[str, object]:
             str(output_video),
             cv2.VideoWriter_fourcc(*"mp4v"),
             scene.fps,
-            render_size,
+            output_size,
         )
         if not writer.isOpened():
             raise RuntimeError(f"Failed to open MP4 writer: {output_video}")
@@ -1102,7 +2115,14 @@ def render(args: argparse.Namespace) -> dict[str, object]:
                 rgba,
                 (render_height, render_width, 3),
             )
-            writer.write(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+            output_rgb = _letterbox_rgb(
+                rgb,
+                output_size=output_size,
+                offsets=letterbox_offsets,
+            )
+            writer.write(
+                cv2.cvtColor(output_rgb, cv2.COLOR_RGB2BGR)
+            )
             print(
                 f"Isaac VDA + G1 rendered {frame_id + 1}/"
                 f"{scene.frame_count}",
@@ -1118,7 +2138,7 @@ def render(args: argparse.Namespace) -> dict[str, object]:
             / float(scene.mesh_size[0] * scene.mesh_size[1])
         )
         report: dict[str, object] = {
-            "schema_version": 1,
+            "schema_version": 2,
             "method": (
                 "video-depth-anything-dynamic-rgbd-mesh"
                 "-plus-g1-articulation"
@@ -1133,6 +2153,12 @@ def render(args: argparse.Namespace) -> dict[str, object]:
                 "trajectory_source": (
                     "episode_data.npz joint_positions/root_pose_xyzw"
                 ),
+                "visual_visibility": {
+                    "source": "episode_data.npz robot_arm_render",
+                    "visible_frames": int(scene.robot_arm_render.sum()),
+                    "hidden_frames": int((~scene.robot_arm_render).sum()),
+                },
+                "articulation_commit": articulation_commit_report(),
             },
             "frame_count": scene.frame_count,
             "fps": scene.fps,
@@ -1141,33 +2167,58 @@ def render(args: argparse.Namespace) -> dict[str, object]:
             "source_size": list(scene.source_size),
             "mesh_size": list(scene.mesh_size),
             "render_size": list(render_size),
+            "render_size_source": (
+                "largest native-aspect capture contained by prepared "
+                "source_size"
+                if args.capture_view == "robot-camera"
+                else "prepared source_size"
+            ),
+            "output_size": list(output_size),
+            "output_size_source": "prepared source_size",
+            "letterbox": letterbox_report,
+            "capture_view": args.capture_view,
             "source_intrinsic": scene.intrinsic.tolist(),
             "mesh_intrinsic": scene.mesh_intrinsic.tolist(),
             "render_intrinsic": render_intrinsic.tolist(),
+            "render_intrinsic_source": render_intrinsic_source,
+            "capture_distortion": D435_DISTORTION.tolist(),
             "mesh_pose_source": (
-                "prepared camera_pose_cv_xyzw plus one constant world "
-                "translation from initial bilateral hand midpoint"
-                if args.scene_alignment == "initial-hands"
-                else "prepared camera_pose_cv_xyzw"
+                "prepared camera_pose_cv_xyzw backprojection"
+                + (
+                    " followed by one constant world-Z-only affine "
+                    "support-plane correction applied to world points"
+                    if args.scene_leveling == "support-plane"
+                    else ""
+                )
+                + (
+                    " plus one constant world translation using the initial "
+                    f"{scene_anchor_description}"
+                    if scene_anchor_description is not None
+                    else ""
+                )
             ),
             "camera_axes": "prepared poses are OpenCV world-from-camera",
+            "scene_leveling": scene_leveling_report,
             "scene_alignment": scene_alignment_report,
-            "capture_camera": {
-                "type": "fixed third-person",
-                "eye_xyz_m": scene_eye.tolist(),
-                "eye_source": eye_source,
-                "target_xyz_m": scene_target.tolist(),
-                "target_source": target_source,
-            },
+            "scene_placement": scene_placement_report,
+            "operation_order": scene_operation_order,
+            "capture_camera": capture_camera_report,
+            "articulation_commit": articulation_commit_report(),
             "scene_bounds_xyz_m": {
                 "min": scan.bounds_min.tolist(),
                 "max": scan.bounds_max.tolist(),
-                "unaligned_min": (
+                "before_hand_anchor_translation_min": (
                     scan.bounds_min - scene_translation_world
                 ).tolist(),
-                "unaligned_max": (
+                "before_hand_anchor_translation_max": (
                     scan.bounds_max - scene_translation_world
                 ).tolist(),
+                "before_support_leveling": (
+                    "not represented by an axis-aligned bound because the "
+                    "inverse affine correction does not preserve AABB extrema"
+                    if args.scene_leveling == "support-plane"
+                    else "same as before_hand_anchor_translation"
+                ),
             },
             "depth_unit": "uint16 millimeters",
             "depth_edge_thresholds": {
@@ -1209,8 +2260,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Replay a prepared Video Depth Anything RGB-D scene and its "
-            "frame-aligned G1 trajectory, either to a fixed-camera MP4 or "
-            "in an adjustable interactive viewport."
+            "frame-aligned G1 trajectory, either to a source-sized G1 "
+            "head-camera MP4 or in an adjustable third-person viewport."
         )
     )
     parser.add_argument(
@@ -1230,11 +2281,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--render-size",
-        type=int,
-        nargs=2,
-        metavar=("WIDTH", "HEIGHT"),
-        help="Even render dimensions; default is the prepared source_size",
+        "--capture-view",
+        choices=("robot-camera", "scene"),
+        default="robot-camera",
+        help=(
+            "Batch capture camera: exact per-frame BeingBeyond "
+            "torso/head profile (default), or a fixed third-person "
+            "diagnostic view. Output size is always the prepared "
+            "source_size"
+        ),
     )
     parser.add_argument(
         "--scene-eye",
@@ -1242,7 +2297,8 @@ def build_parser() -> argparse.ArgumentParser:
         nargs=3,
         metavar=("X", "Y", "Z"),
         help=(
-            "Fixed batch camera or initial interactive eye; default fits bounds"
+            "Fixed --capture-view scene camera or initial interactive eye; "
+            "default fits bounds"
         ),
     )
     parser.add_argument(
@@ -1251,35 +2307,68 @@ def build_parser() -> argparse.ArgumentParser:
         nargs=3,
         metavar=("X", "Y", "Z"),
         help=(
-            "Fixed batch or initial interactive target; default is bounds center"
+            "Fixed --capture-view scene or initial interactive target; "
+            "default is bounds center"
+        ),
+    )
+    parser.add_argument(
+        "--scene-leveling",
+        choices=("support-plane", "none"),
+        default="support-plane",
+        help=(
+            "Estimate the dominant gravity-consistent support plane and "
+            "make it horizontal with one constant world-Z-only affine "
+            "height correction that preserves XY and source camera "
+            "orientation; applied before hand-anchor placement, or "
+            "disable it "
+            "(default: support-plane)"
+        ),
+    )
+    parser.add_argument(
+        "--scene-leveling-window-seconds",
+        type=float,
+        default=0.5,
+        help=(
+            "Initial source-time window used to estimate the stable support "
+            "plane; converted with the prepared source FPS (default: 0.5 s)"
         ),
     )
     parser.add_argument(
         "--scene-alignment",
-        choices=("initial-hands", "none"),
+        choices=("initial-hands", "initial-wrists", "none"),
         default="initial-hands",
         help=(
             "At replay start, place the complete scene with one robust "
-            "source/G1 bilateral-hand-midpoint translation, or disable it "
-            "for legacy data (default: initial-hands)"
+            "source/G1 bilateral semantic-anchor XYZ translation after "
+            "optional support-plane leveling: exact fingertip TCPs for "
+            "initial-hands, wrist origins for initial-wrists, or disable "
+            "it for legacy data (default: initial-hands)"
+        ),
+    )
+    parser.add_argument(
+        "--scene-alignment-window-seconds",
+        type=float,
+        default=0.5,
+        help=(
+            "Initial source-time window used once for semantic hand-anchor "
+            "XYZ placement; converted with the prepared source FPS "
+            "(default: 0.5 s)"
         ),
     )
     parser.add_argument(
         "--scene-alignment-window-frames",
         type=int,
-        default=15,
-        help=(
-            "Initial frames used once for hand-anchor scene placement "
-            "(default: 15, i.e. 0.5 s at 30 FPS)"
-        ),
+        default=None,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--scene-hand-confidence",
         type=float,
         default=0.5,
         help=(
-            "Minimum source-HDF5 confidence for both hands during initial "
-            "scene placement (default: 0.5; absent confidences mean 1)"
+            "Minimum weighted source-HDF5 fingertip confidence for both "
+            "retarget TCPs in initial-hands mode (default: 0.5; absent "
+            "confidences mean 1; unused by initial-wrists)"
         ),
     )
     parser.add_argument(
@@ -1312,13 +2401,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--loop",
         action="store_true",
         help="Loop the sequence in --interactive mode",
-    )
-    parser.add_argument(
-        "--playback-fps",
-        type=float,
-        help=(
-            "Interactive wall-clock playback rate; default is the prepared FPS"
-        ),
     )
     parser.add_argument(
         "--headless",
