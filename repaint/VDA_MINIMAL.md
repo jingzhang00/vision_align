@@ -77,11 +77,11 @@ configuration on the original and handless selections, anchors original depth
 to source-HDF5 hands, and transfers that scale through unchanged background.
 Only a calibration that passes the temporal/support quality gates is used.
 `scene_scale` remains a separate source-to-G1 conversion.
-The handless video and HDF5 must have the same total frame count. A longer
-original video is accepted only when the HDF5 declares that exact
-`source_video`; this supports a verified frame-zero prefix such as Nymeria
-c024 under the producer's frame-zero prefix contract. Shifted inputs must not
-be labeled with that contract.
+The handless video and HDF5 must have the same total frame count. If the
+original container declares a different count, the HDF5 must name that exact
+`source_video`. A genuinely longer decodable video also needs an explicit
+`source_frame_start=0`; Nymeria c024 instead declares 460 but decodes exactly
+the same 450 frames as its HDF5/handless sequence.
 
 Replay defaults to `--scene-alignment initial-hands`. Before Isaac starts, it
 uses the first 15 frames once, fits the robust world translation between the
@@ -128,7 +128,9 @@ human-to-G1 morphology/retarget diagnostic; scene placement does not pretend
 to repair that IK error.
 
 The same automatic scale estimator was also checked on the requested
-cross-task data:
+cross-task data. These reports were regenerated with cache manifests binding
+the source/handless videos, checkpoint, inference settings, and raw-depth
+files by SHA-256:
 
 | Task / episode | Automatic VDA scale | Quality result |
 |---|---:|---|

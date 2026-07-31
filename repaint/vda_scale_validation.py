@@ -81,6 +81,49 @@ def _declared_hdf5_source_video(path: Path) -> Path | None:
     return Path(unique.pop()).expanduser().resolve()
 
 
+def _declared_hdf5_source_frame_start(path: Path) -> int | None:
+    values: list[int] = []
+    attribute_names = (
+        "source_frame_start",
+        "source_video_frame_start",
+        "source_clip_frame_start",
+    )
+
+    def collect_attributes(attributes: h5py.AttributeManager) -> None:
+        for name in attribute_names:
+            if name in attributes:
+                values.append(int(attributes[name]))
+
+    with h5py.File(path, "r") as handle:
+        collect_attributes(handle.attrs)
+
+        def collect(_name: str, item: h5py.Group | h5py.Dataset) -> None:
+            collect_attributes(item.attrs)
+
+        handle.visititems(collect)
+    unique = set(values)
+    if len(unique) > 1:
+        raise ValueError(
+            f"{path} declares multiple source-frame starts: {sorted(unique)}"
+        )
+    return None if not unique else unique.pop()
+
+
+def _video_frame_is_decodable(path: Path, frame_index: int) -> bool:
+    capture = cv2.VideoCapture(str(path))
+    try:
+        if not capture.isOpened():
+            raise RuntimeError(f"Failed to open video: {path}")
+        capture.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index))
+        actual = int(capture.get(cv2.CAP_PROP_POS_FRAMES))
+        if actual != frame_index:
+            return False
+        ok, _frame = capture.read()
+        return bool(ok)
+    finally:
+        capture.release()
+
+
 def _validate_source_frame_provenance(
     *,
     original_video: Path,
@@ -103,10 +146,24 @@ def _validate_source_frame_provenance(
             "Selected frames are not covered by both the original video and "
             "source HDF5"
         )
+    declared_source = _declared_hdf5_source_video(source_hdf5)
+    if declared_source is not None and declared_source != original_video.resolve():
+        raise ValueError(
+            "Source HDF5 declares a different source_video: "
+            f"{declared_source} != {original_video.resolve()}"
+        )
+    if (
+        declared_source is None
+        and source_hdf5.stem != original_video.stem
+    ):
+        raise ValueError(
+            "Source HDF5 does not identify the original video: add a "
+            "source_video attribute or use matching HDF5/video stems "
+            f"({source_hdf5.stem!r} != {original_video.stem!r})"
+        )
     if original_frame_count == hdf5_frame_count:
         return
 
-    declared_source = _declared_hdf5_source_video(source_hdf5)
     if original_frame_count < hdf5_frame_count or declared_source is None:
         raise ValueError(
             "Original video and source HDF5 total frame counts disagree "
@@ -114,10 +171,16 @@ def _validate_source_frame_provenance(
             "allowed when the HDF5/handless sequence is a covered frame-zero "
             "prefix and the HDF5 declares source_video provenance"
         )
-    if declared_source != original_video.resolve():
+    # Some containers overstate their frame count (Nymeria c024 declares 460
+    # but decodes exactly 450). If a real extra frame is decodable, require an
+    # explicit frame-zero mapping rather than inferring a prefix from lengths.
+    if (
+        _video_frame_is_decodable(original_video, hdf5_frame_count)
+        and _declared_hdf5_source_frame_start(source_hdf5) != 0
+    ):
         raise ValueError(
-            "Source HDF5 declares a different source_video: "
-            f"{declared_source} != {original_video.resolve()}"
+            "Original video has decodable frames beyond the source HDF5; "
+            "the HDF5 must explicitly declare source_frame_start=0"
         )
 
 
@@ -183,16 +246,28 @@ def _frame_equal_summary(
         array = np.asarray(values)
         if array.size > 0:
             frame_medians[frame_id] = np.median(array)
-    valid_frame_medians = frame_medians[
-        np.isfinite(frame_medians) & (frame_medians > 0.0)
+    return _frame_equal_summary_from_medians(
+        frame_medians,
+        raw_sample_count=int(
+            sum(np.asarray(values).size for values in frame_values)
+        ),
+    )
+
+
+def _frame_equal_summary_from_medians(
+    frame_medians: np.ndarray,
+    *,
+    raw_sample_count: int,
+) -> tuple[dict[str, Any], np.ndarray]:
+    medians = np.asarray(frame_medians, dtype=np.float64)
+    valid_frame_medians = medians[
+        np.isfinite(medians) & (medians > 0.0)
     ]
     summary = _distribution(valid_frame_medians)
     summary["aggregation"] = "median within frame, then median across frames"
     summary["supporting_frames"] = int(valid_frame_medians.size)
-    summary["raw_sample_count"] = int(
-        sum(np.asarray(values).size for values in frame_values)
-    )
-    return summary, frame_medians
+    summary["raw_sample_count"] = int(raw_sample_count)
+    return summary, medians
 
 
 def _minimum_anchor_frame_count(selected_frame_count: int) -> int:
@@ -877,19 +952,32 @@ def _analyze(
     root_scale_frames_by_label: dict[str, list[np.ndarray]] = {
         label: [] for label in root_labels
     }
-    transfer_frames: list[np.ndarray] = []
-    handless_background_depth_frames: list[np.ndarray] = []
-    da3_scale_frames: list[np.ndarray] = []
+    transfer_frame_medians = np.full(frame_count, np.nan, dtype=np.float64)
+    transfer_raw_sample_count = 0
+    handless_background_frame_medians = np.full(
+        frame_count,
+        np.nan,
+        dtype=np.float64,
+    )
+    handless_background_raw_sample_count = 0
+    da3_frame_medians = np.full(frame_count, np.nan, dtype=np.float64)
+    da3_raw_sample_count = 0
     mask_coverages: list[float] = []
     unchanged_coverages: list[float] = []
-    da3_bins: dict[str, list[np.ndarray]] = {
-        "0.0-0.5m": [],
-        "0.5-1.0m": [],
-        "1.0-2.0m": [],
-        "2.0-4.0m": [],
-        "4.0m+": [],
+    da3_bin_frame_medians: dict[str, np.ndarray] = {
+        name: np.full(frame_count, np.nan, dtype=np.float64)
+        for name in (
+            "0.0-0.5m",
+            "0.5-1.0m",
+            "1.0-2.0m",
+            "2.0-4.0m",
+            "4.0m+",
+        )
     }
-    bin_names = tuple(da3_bins)
+    da3_bin_raw_sample_counts = {
+        name: 0 for name in da3_bin_frame_medians
+    }
+    bin_names = tuple(da3_bin_frame_medians)
     try:
         for frame_id in range(frame_count):
             original_rgb = _read_resized_rgb(
@@ -940,21 +1028,27 @@ def _analyze(
                     dtype=np.float64,
                 )[sampled_background]
             )
-            transfer_frames.append(
-                transfer_values[
-                    np.isfinite(transfer_values) & (transfer_values > 0.0)
-                ]
-            )
+            transfer_values = transfer_values[
+                np.isfinite(transfer_values) & (transfer_values > 0.0)
+            ]
+            transfer_raw_sample_count += int(transfer_values.size)
+            if transfer_values.size:
+                transfer_frame_medians[frame_id] = np.median(transfer_values)
             handless_background_values = np.asarray(
                 handless_depth[frame_id][::4, ::4],
                 dtype=np.float64,
             )[sampled_background]
-            handless_background_depth_frames.append(
-                handless_background_values[
-                    np.isfinite(handless_background_values)
-                    & (handless_background_values > 0.0)
-                ]
+            handless_background_values = handless_background_values[
+                np.isfinite(handless_background_values)
+                & (handless_background_values > 0.0)
+            ]
+            handless_background_raw_sample_count += int(
+                handless_background_values.size
             )
+            if handless_background_values.size:
+                handless_background_frame_medians[frame_id] = np.median(
+                    handless_background_values
+                )
 
             frame_scales: list[float] = []
             frame_root_scales: list[float] = []
@@ -1054,7 +1148,9 @@ def _analyze(
                     & (ratios > 0.0)
                     & (ratios < 5.0)
                 ]
-                da3_scale_frames.append(ratios)
+                da3_raw_sample_count += int(ratios.size)
+                if ratios.size:
+                    da3_frame_medians[frame_id] = np.median(ratios)
 
                 sampled_depth = da3_source_m[::2, ::2][sampled]
                 sampled_vda = vda_da3[::2, ::2][sampled]
@@ -1068,7 +1164,13 @@ def _analyze(
                         & (bin_ratio < 5.0)
                     )
                     if np.any(bin_selected):
-                        da3_bins[name].append(bin_ratio[bin_selected])
+                        bin_values = bin_ratio[bin_selected]
+                        da3_bin_raw_sample_counts[name] += int(
+                            bin_values.size
+                        )
+                        da3_bin_frame_medians[name][frame_id] = np.median(
+                            bin_values
+                        )
     finally:
         original_capture.release()
         handless_capture.release()
@@ -1082,11 +1184,15 @@ def _analyze(
         for label, frame_values in root_scale_frames_by_label.items()
     }
     hand_depth_summary, _ = _frame_equal_summary(hand_depth_frames)
-    transfer_summary, transfer_frame_medians = _frame_equal_summary(
-        transfer_frames
+    transfer_summary, transfer_frame_medians = (
+        _frame_equal_summary_from_medians(
+            transfer_frame_medians,
+            raw_sample_count=transfer_raw_sample_count,
+        )
     )
-    raw_background_summary, _ = _frame_equal_summary(
-        handless_background_depth_frames
+    raw_background_summary, _ = _frame_equal_summary_from_medians(
+        handless_background_frame_medians,
+        raw_sample_count=handless_background_raw_sample_count,
     )
     minimum_anchor_frames = _minimum_anchor_frame_count(len(selected))
     root_is_supported = _anchor_summary_is_supported(
@@ -1158,8 +1264,11 @@ def _analyze(
         },
     }
     if da3_paths:
-        da3_summary, da3_frame_medians = _frame_equal_summary(
-            da3_scale_frames
+        da3_summary, da3_frame_medians = (
+            _frame_equal_summary_from_medians(
+                da3_frame_medians,
+                raw_sample_count=da3_raw_sample_count,
+            )
         )
         da3_scale = da3_summary["p50"]
         agreement = (
@@ -1176,12 +1285,11 @@ def _analyze(
             ),
             "frame_medians": _distribution(da3_frame_medians),
             "scale_by_da3_source_depth": {
-                name: _distribution(
-                    np.concatenate(values)
-                    if values
-                    else np.empty(0, dtype=np.float64)
-                )
-                for name, values in da3_bins.items()
+                name: _frame_equal_summary_from_medians(
+                    da3_bin_frame_medians[name],
+                    raw_sample_count=da3_bin_raw_sample_counts[name],
+                )[0]
+                for name in bin_names
             },
         }
     return result
