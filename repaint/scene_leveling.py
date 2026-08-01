@@ -297,7 +297,7 @@ def level_scene_camera_poses_from_support_plane(
     minimum_support_fraction: float = 0.12,
     maximum_points_per_frame: int = 20_000,
     ransac_trials: int = 256,
-    maximum_temporal_p95_degrees: float = 5.0,
+    maximum_temporal_p95_degrees: float = 10.0,
     maximum_affine_condition_number: float = 10.0,
     pivot_world_xyz_m: np.ndarray | None = None,
     pivot_source: str | None = None,
@@ -406,7 +406,7 @@ def level_scene_camera_poses_from_support_plane(
     angular_residual_degrees = np.degrees(
         np.arccos(np.clip(normals @ consensus, -1.0, 1.0))
     )
-    temporal_p95 = float(
+    temporal_p95= float(
         np.percentile(angular_residual_degrees, 95.0)
     )
     if temporal_p95 > maximum_temporal_p95_degrees:

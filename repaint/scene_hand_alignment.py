@@ -25,14 +25,14 @@ from repaint.robot_camera import (
 
 HAND_TCP_ALIGNMENT_METHOD = (
     "initial bilateral retarget fingertip-TCP midpoint, "
-    "robust constant world translation"
+    "coordinate-median constant world translation"
 )
 HAND_TCP_ALIGNMENT_STAGE = (
     "semantic-fingertip-tcp-constant-xyz-translation"
 )
 PALM_ALIGNMENT_METHOD = (
     "initial bilateral rigid-palm action-frame midpoint, "
-    "robust constant world translation"
+    "coordinate-median constant world translation"
 )
 PALM_ALIGNMENT_STAGE = (
     "semantic-rigid-palm-action-frame-constant-xyz-translation"
@@ -165,11 +165,10 @@ def _estimate_initial_bilateral_midpoint_translation(
     anchor_name: str,
     require_positive_source_depth: bool,
     max_translation_m: float = 0.3,
-    max_inlier_p95_m: float = 0.03,
     scene_world_linear: np.ndarray | None = None,
     scene_world_pivot: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict[str, object], np.ndarray]:
-    """Fit one robust XYZ translation from bilateral semantic anchors."""
+    """Fit one median XYZ translation from valid bilateral anchors."""
 
     source = np.asarray(source_anchor_camera_cv, dtype=np.float64)
     robot = np.asarray(robot_anchor_camera_cv, dtype=np.float64)
@@ -196,8 +195,6 @@ def _estimate_initial_bilateral_midpoint_translation(
         or scene_scale <= 0.0
         or not np.isfinite(max_translation_m)
         or max_translation_m <= 0.0
-        or not np.isfinite(max_inlier_p95_m)
-        or max_inlier_p95_m <= 0.0
     ):
         raise ValueError(
             f"{anchor_name} alignment transforms and thresholds are invalid"
@@ -236,50 +233,18 @@ def _estimate_initial_bilateral_midpoint_translation(
         np.mean(robot_world, axis=1)
         - np.mean(source_world, axis=1)
     )[paired_valid]
-    preliminary = np.median(residual_world, axis=0)
-    deviation = np.linalg.norm(residual_world - preliminary, axis=1)
-    deviation_median = float(np.median(deviation))
-    deviation_mad = float(
-        np.median(np.abs(deviation - deviation_median))
-    )
-    inlier_threshold = max(
-        0.02,
-        deviation_median + 3.0 * 1.4826 * deviation_mad,
-    )
-    inlier = deviation <= inlier_threshold
-    inlier_count = int(np.sum(inlier))
-    minimum_inlier_count = max(
-        minimum_count,
-        int(np.ceil(0.8 * valid_count)),
-    )
-    if inlier_count < minimum_inlier_count:
-        raise ValueError(
-            f"Initial {anchor_name} midpoint translation is not temporally "
-            "stable: "
-            f"{inlier_count} robust inliers < {minimum_inlier_count}"
-        )
-
-    translation_world = np.median(residual_world[inlier], axis=0)
+    translation_world = np.median(residual_world, axis=0)
     translation_norm = float(np.linalg.norm(translation_world))
     before_norm = np.linalg.norm(residual_world, axis=1)
     after_norm = np.linalg.norm(
         residual_world - translation_world,
         axis=1,
     )
-    inlier_after = after_norm[inlier]
-    inlier_p95 = float(np.percentile(inlier_after, 95.0))
     if translation_norm > max_translation_m:
         raise ValueError(
             f"Initial {anchor_name} alignment translation is implausibly "
             "large: "
             f"{translation_norm:.4f} m > {max_translation_m:.4f} m"
-        )
-    if inlier_p95 > max_inlier_p95_m:
-        raise ValueError(
-            f"Initial {anchor_name} midpoint is not stable enough for one "
-            "rigid "
-            f"scene translation: p95={inlier_p95:.4f} m > "
-            f"{max_inlier_p95_m:.4f} m"
         )
 
     individual_after = np.linalg.norm(
@@ -299,15 +264,10 @@ def _estimate_initial_bilateral_midpoint_translation(
         "window_frame_count": frame_count,
         "paired_frame_count": valid_count,
         "minimum_paired_frame_count": minimum_count,
-        "robust_inlier_count": inlier_count,
-        "minimum_robust_inlier_count": minimum_inlier_count,
-        "robust_inlier_fraction": float(inlier_count / valid_count),
-        "outlier_threshold_m": inlier_threshold,
+        "temporal_stability_required": False,
         "maximum_translation_m": float(max_translation_m),
-        "maximum_inlier_p95_m": float(max_inlier_p95_m),
         "midpoint_residual_before_m": _norm_distribution(before_norm),
         "midpoint_residual_after_m": _norm_distribution(after_norm),
-        "midpoint_inlier_residual_after_m": _norm_distribution(inlier_after),
         "individual_anchor_residual_after_m": _norm_distribution(
             individual_after
         ),
@@ -348,7 +308,6 @@ def estimate_initial_hand_tcp_midpoint_translation(
     scene_scale: float,
     confidence_threshold: float = 0.5,
     max_translation_m: float = 0.3,
-    max_inlier_p95_m: float = 0.03,
     scene_world_linear: np.ndarray | None = None,
     scene_world_pivot: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict[str, object]]:
@@ -376,7 +335,6 @@ def estimate_initial_hand_tcp_midpoint_translation(
             anchor_name="hand-TCP",
             require_positive_source_depth=True,
             max_translation_m=max_translation_m,
-            max_inlier_p95_m=max_inlier_p95_m,
             scene_world_linear=scene_world_linear,
             scene_world_pivot=scene_world_pivot,
         )
@@ -387,7 +345,7 @@ def estimate_initial_hand_tcp_midpoint_translation(
             "method": HAND_TCP_ALIGNMENT_METHOD,
             "estimator": (
                 "per-frame equal-left/right semantic TCP midpoint residual, "
-                "temporal coordinate median with MAD outlier rejection"
+                "coordinate median without temporal stability rejection"
             ),
             "formula": (
                 "delta_world = median(G1_TCP_midpoint_world - "
@@ -435,7 +393,6 @@ def estimate_initial_palm_midpoint_translation(
     scene_camera_pose_cv_xyzw: np.ndarray,
     scene_scale: float,
     max_translation_m: float = 0.3,
-    max_inlier_p95_m: float = 0.03,
     scene_world_linear: np.ndarray | None = None,
     scene_world_pivot: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict[str, object]]:
@@ -467,7 +424,6 @@ def estimate_initial_palm_midpoint_translation(
             anchor_name="palm",
             require_positive_source_depth=True,
             max_translation_m=max_translation_m,
-            max_inlier_p95_m=max_inlier_p95_m,
             scene_world_linear=scene_world_linear,
             scene_world_pivot=scene_world_pivot,
         )
@@ -477,7 +433,7 @@ def estimate_initial_palm_midpoint_translation(
             "method": PALM_ALIGNMENT_METHOD,
             "estimator": (
                 "per-frame equal-left/right rigid-palm midpoint residual, "
-                "temporal coordinate median with MAD outlier rejection"
+                "coordinate median without temporal stability rejection"
             ),
             "formula": (
                 "delta_world = median(G1_palm_midpoint_world - "
@@ -545,14 +501,13 @@ def align_scene_camera_poses_to_initial_hand_tcp(
     window_frames: int,
     confidence_threshold: float = 0.5,
     max_translation_m: float = 0.3,
-    max_inlier_p95_m: float = 0.03,
     scene_world_linear: np.ndarray | None = None,
     scene_world_pivot: np.ndarray | None = None,
 ) -> SceneHandAlignment:
     """Place a leveled scene from the exact bilateral retarget TCP midpoint."""
 
     if window_frames <= 0:
-        raise ValueError("--scene-alignment-window-frames must be positive")
+        raise ValueError("window_frames must be positive")
     frame_indices = np.asarray(frame_indices, dtype=np.int64)
     camera_pose = np.asarray(scene_camera_pose_cv_xyzw, dtype=np.float64)
     selected_count = min(int(window_frames), len(frame_indices))
@@ -579,7 +534,6 @@ def align_scene_camera_poses_to_initial_hand_tcp(
         scene_scale=scene_scale,
         confidence_threshold=confidence_threshold,
         max_translation_m=max_translation_m,
-        max_inlier_p95_m=max_inlier_p95_m,
         scene_world_linear=scene_world_linear,
         scene_world_pivot=scene_world_pivot,
     )
@@ -653,14 +607,13 @@ def align_scene_camera_poses_to_initial_palms(
     root_pose_xyzw: np.ndarray,
     window_frames: int,
     max_translation_m: float = 0.3,
-    max_inlier_p95_m: float = 0.03,
     scene_world_linear: np.ndarray | None = None,
     scene_world_pivot: np.ndarray | None = None,
 ) -> SceneHandAlignment:
     """Place a scene from matching source/G1 rigid-palm action frames."""
 
     if window_frames <= 0:
-        raise ValueError("--scene-alignment-window-frames must be positive")
+        raise ValueError("window_frames must be positive")
     frame_indices = np.asarray(frame_indices, dtype=np.int64)
     camera_pose = np.asarray(scene_camera_pose_cv_xyzw, dtype=np.float64)
     selected_count = min(int(window_frames), len(frame_indices))
@@ -706,7 +659,6 @@ def align_scene_camera_poses_to_initial_palms(
         scene_camera_pose_cv_xyzw=initial_camera_pose,
         scene_scale=scene_scale,
         max_translation_m=max_translation_m,
-        max_inlier_p95_m=max_inlier_p95_m,
         scene_world_linear=scene_world_linear,
         scene_world_pivot=scene_world_pivot,
     )

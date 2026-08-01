@@ -83,6 +83,7 @@ HAND_CAPTURE_WARNING_THRESHOLD = 0.8
 JOINT_COMMIT_ATOL_RAD = 1.0e-4
 ROOT_POSITION_COMMIT_ATOL_M = 1.0e-4
 ROOT_ORIENTATION_COMMIT_ATOL_RAD = 1.0e-4
+INITIAL_HAND_ALIGNMENT_FRAME_COUNT = 5
 
 
 @dataclass(frozen=True)
@@ -887,7 +888,6 @@ def _resolve_alignment_window(
     source_fps: float,
     frame_count: int,
     requested_seconds: float,
-    deprecated_frames: int | None = None,
     option_name: str = "--scene-alignment-window-seconds",
 ) -> AlignmentWindow:
     """Convert a time window to source frames, bounded by the sequence."""
@@ -902,22 +902,13 @@ def _resolve_alignment_window(
         raise ValueError(
             "Prepared sequence has fewer than three frames for hand alignment"
         )
-    if deprecated_frames is not None:
-        if deprecated_frames <= 0:
-            raise ValueError(
-                "--scene-alignment-window-frames must be positive"
-            )
-        seconds = float(deprecated_frames / source_fps)
-        requested_frames = int(deprecated_frames)
-        source = "deprecated --scene-alignment-window-frames"
-    else:
-        seconds = float(requested_seconds)
-        if not np.isfinite(seconds) or seconds <= 0.0:
-            raise ValueError(
-                f"{option_name} must be positive and finite"
-            )
-        requested_frames = int(np.floor(seconds * source_fps + 0.5))
-        source = option_name
+    seconds = float(requested_seconds)
+    if not np.isfinite(seconds) or seconds <= 0.0:
+        raise ValueError(
+            f"{option_name} must be positive and finite"
+        )
+    requested_frames = int(np.floor(seconds * source_fps + 0.5))
+    source = option_name
     resolved_frames = min(frame_count, max(3, requested_frames))
     return AlignmentWindow(
         requested_seconds=seconds,
@@ -1189,11 +1180,15 @@ def render(args: argparse.Namespace) -> dict[str, object]:
         assert scene.scene_scale is not None
         assert scene_anchor_description is not None
         assert scene_alignment_stage is not None
-        alignment_window = _resolve_alignment_window(
-            source_fps=scene.fps,
-            frame_count=scene.frame_count,
-            requested_seconds=args.scene_alignment_window_seconds,
-            deprecated_frames=args.scene_alignment_window_frames,
+        alignment_window = AlignmentWindow(
+            requested_seconds=(
+                INITIAL_HAND_ALIGNMENT_FRAME_COUNT / scene.fps
+            ),
+            resolved_frames=min(
+                INITIAL_HAND_ALIGNMENT_FRAME_COUNT,
+                scene.frame_count,
+            ),
+            source="fixed first five frames",
         )
         alignment_kwargs = {
             "source_hdf5": scene.source_hdf5,
@@ -2348,28 +2343,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("initial-hands", "initial-palms", "none"),
         default="initial-hands",
         help=(
-            "At replay start, place the complete scene with one robust "
+            "At replay start, place the complete scene with one "
             "source/G1 bilateral semantic-anchor XYZ translation after "
             "optional support-plane leveling: exact fingertip TCPs for "
             "initial-hands, rigid-palm action frames for initial-palms, "
             "or disable it for legacy data (default: initial-hands)"
         ),
-    )
-    parser.add_argument(
-        "--scene-alignment-window-seconds",
-        type=float,
-        default=0.5,
-        help=(
-            "Initial source-time window used once for semantic hand-anchor "
-            "XYZ placement; converted with the prepared source FPS "
-            "(default: 0.5 s)"
-        ),
-    )
-    parser.add_argument(
-        "--scene-alignment-window-frames",
-        type=int,
-        default=None,
-        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--scene-hand-confidence",

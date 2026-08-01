@@ -1654,7 +1654,8 @@ def _new_report(plan: PipelinePlan) -> dict[str, Any]:
         "intermediate_retention": (
             "handless, prepared, and pipeline-owned alignment artifacts are "
             "removed after render; only LeRobot, final outputs, and this "
-            "report are retained; validated final outputs remain resumable"
+            "report are retained; failed prepare/render inputs are retained "
+            "for retry"
         ),
         "selected_clips": [
             {
@@ -1972,9 +1973,10 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
             },
         )
         try:
-            if stage.name == "render":
+            if stage.name in {"prepare", "render"}:
                 _clear_stage(stage, plan)
-            _clear_episode_intermediates(plan, episode_index)
+            else:
+                _clear_episode_intermediates(plan, episode_index)
         except Exception as exc:
             skipped.setdefault("cleanup_errors", []).append(
                 {
@@ -2456,7 +2458,12 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
                     ] = retained_fingerprint
             _write_json_atomic(plan.config.paths.report, report)
             cleanup_targets = [plan.config.paths.root / "logs"]
-            if plan.config.stop_after == "render":
+            retryable_failure = any(
+                report_by_id[skipped["failed_stage"]]["name"]
+                in {"prepare", "render"}
+                for skipped in skipped_by_episode.values()
+            )
+            if plan.config.stop_after == "render" and not retryable_failure:
                 cleanup_targets.extend(
                     [
                         plan.config.paths.handless,

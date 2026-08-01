@@ -1113,7 +1113,7 @@ def _new_report(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
         "intermediate_retention": (
             "handless and prepared episode artifacts are removed after render; "
             "only LeRobot, final outputs, and this report are retained; "
-            "validated final outputs remain resumable"
+            "failed prepare/render inputs are retained for retry"
         ),
         "video_metadata_policy": {
             "source": "ffprobe each source MP4",
@@ -1381,9 +1381,10 @@ def execute_task(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
             },
         )
         try:
-            if stage.name == "render":
+            if stage.name in {"prepare", "render"}:
                 _clear_stage_output(stage, plan)
-            _clear_episode_intermediates(plan, episode_index)
+            else:
+                _clear_episode_intermediates(plan, episode_index)
         except Exception as exc:
             skipped.setdefault("cleanup_errors", []).append(
                 {
@@ -1720,11 +1721,16 @@ def execute_task(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
                 skipped_episode_count=len(skipped_by_episode),
             )
             _write_json_atomic(plan.paths.report, report)
-            for target in (
-                plan.paths.handless,
-                plan.paths.prepared,
-                plan.paths.root / "logs",
+            cleanup_targets = [plan.paths.root / "logs"]
+            if not any(
+                report_by_id[skipped["failed_stage"]]["name"]
+                in {"prepare", "render"}
+                for skipped in skipped_by_episode.values()
             ):
+                cleanup_targets.extend(
+                    [plan.paths.handless, plan.paths.prepared]
+                )
+            for target in cleanup_targets:
                 try:
                     _remove_exact_path(
                         target,
