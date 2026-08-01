@@ -30,7 +30,3 @@ done
     --output-root "$WORKSPACE/egodex" \
     --headless
 
-"$PYTHON" -m repaint.nymeria.nymeria_vda_pipeline \
-    --dataset-root "$WORKSPACE/dataset/nymeria" \
-    --output-root "$WORKSPACE/nymeria/vda" \
-    --headless

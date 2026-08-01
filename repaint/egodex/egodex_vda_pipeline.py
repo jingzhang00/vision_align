@@ -1078,6 +1078,46 @@ def _source_report(episode: SourceEpisode) -> dict[str, Any]:
     }
 
 
+def _completion_path(plan: TaskPlan, episode_index: int) -> Path:
+    return (
+        plan.paths.final
+        / f"episode_{episode_index:06d}"
+        / "completion.json"
+    )
+
+
+def _write_completion(plan: TaskPlan, episode_index: int) -> None:
+    _write_json_atomic(
+        _completion_path(plan, episode_index),
+        {
+            "schema_version": 1,
+            "status": "completed",
+            "source_episode": _source_report(plan.episodes[episode_index]),
+            "updated_at": _utc_now(),
+        },
+    )
+
+
+def _completion_matches(
+    plan: TaskPlan,
+    episode_index: int,
+    previous_report: dict[str, Any],
+) -> bool:
+    expected = _source_report(plan.episodes[episode_index])
+    try:
+        if (
+            _read_json_object(_completion_path(plan, episode_index)).get(
+                "source_episode"
+            )
+            == expected
+        ):
+            return True
+    except Exception:
+        pass
+    previous_sources = previous_report.get("source_episodes")
+    return isinstance(previous_sources, list) and expected in previous_sources
+
+
 def _new_report(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
     return {
         "schema_version": 2,
@@ -1095,6 +1135,9 @@ def _new_report(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
             "prepared": str(plan.paths.prepared / "episode_XXXXXX"),
             "final_video": str(
                 plan.paths.final / "episode_XXXXXX/g1_view.mp4"
+            ),
+            "failed_episodes": str(
+                plan.paths.root / "failed_episodes.json"
             ),
         },
         "intermediate_retention": (
@@ -1203,6 +1246,14 @@ def execute_task(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
         plan.paths.root / "logs",
         owner_root=plan.paths.root,
     )
+    try:
+        previous_failures = _read_json_object(
+            plan.paths.root / "failed_episodes.json"
+        ).get("failed_episodes", [])
+    except Exception:
+        previous_failures = []
+    if not isinstance(previous_failures, list):
+        previous_failures = []
 
     previous_stages = _load_previous_stages(plan.paths.report)
     report = _new_report(plan, config)
@@ -1270,12 +1321,29 @@ def execute_task(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
                     and validate_stage_artifacts(stage, plan)[0]
                 ):
                     retained_render_indices.add(stage.episode_index)
+    if config.resume:
+        for stage in plan.stages:
+            if (
+                stage.name != "render"
+                or stage.episode_index is None
+                or stage.episode_index in retained_render_indices
+                or not _completion_matches(
+                    plan,
+                    stage.episode_index,
+                    previous_report,
+                )
+                or not validate_stage_artifacts(stage, plan)[0]
+            ):
+                continue
+            retained_render_indices.add(stage.episode_index)
+            _write_completion(plan, stage.episode_index)
+    all_episodes_retained = len(retained_render_indices) == len(plan.episodes)
     retained_stage_ids = {
         stage.stage_id
         for stage in plan.stages
         if (
-            stage.name == "repaint"
-            and len(retained_render_indices) == len(plan.episodes)
+            stage.name in {"retarget", "repaint"}
+            and all_episodes_retained
         )
         or (
             stage.name in {"prepare", "render"}
@@ -1394,9 +1462,41 @@ def execute_task(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
                 }
             )
             report["updated_at"] = _utc_now()
-            _write_json_atomic(plan.paths.report, report)
+            persist_report()
 
-    _write_json_atomic(plan.paths.report, report)
+    def persist_report() -> None:
+        _write_json_atomic(plan.paths.report, report)
+        failures_by_episode: dict[int, dict[str, Any]] = {}
+        if report["status"] not in {"completed", "completed_with_skips"}:
+            for failure in previous_failures:
+                if not isinstance(failure, dict):
+                    continue
+                try:
+                    episode_index = int(failure["episode_index"])
+                    if not 0 <= episode_index < len(plan.episodes):
+                        continue
+                    source = plan.episodes[episode_index]
+                except (KeyError, TypeError, ValueError, IndexError):
+                    continue
+                if failure.get("source_stem") == source.stem:
+                    failures_by_episode[episode_index] = failure
+        failures_by_episode.update(skipped_by_episode)
+        failures = [
+            failures_by_episode[index]
+            for index in sorted(failures_by_episode)
+        ]
+        _write_json_atomic(
+            plan.paths.root / "failed_episodes.json",
+            {
+                "schema_version": 1,
+                "task": plan.task,
+                "updated_at": report["updated_at"],
+                "failed_episode_count": len(failures),
+                "failed_episodes": failures,
+            },
+        )
+
+    persist_report()
 
     with tqdm(
         total=len(plan.stages),
@@ -1409,8 +1509,8 @@ def execute_task(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
             for stage in plan.stages:
                 stage_entry = report_by_id[stage.stage_id]
                 retained_stage = (
-                    stage.name == "repaint"
-                    and len(retained_render_indices) == len(plan.episodes)
+                    stage.name in {"retarget", "repaint"}
+                    and all_episodes_retained
                 ) or (
                     stage.name in {"prepare", "render"}
                     and stage.episode_index in retained_render_indices
@@ -1433,8 +1533,9 @@ def execute_task(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
                     report["elapsed_seconds"] = (
                         time.perf_counter() - task_started
                     )
-                    _write_json_atomic(plan.paths.report, report)
+                    persist_report()
                     if stage.name == "render":
+                        _write_completion(plan, stage.episode_index)
                         cleanup_completed_episode(stage)
                     continue
                 if (
@@ -1479,7 +1580,7 @@ def execute_task(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
                     report["elapsed_seconds"] = (
                         time.perf_counter() - task_started
                     )
-                    _write_json_atomic(plan.paths.report, report)
+                    persist_report()
                     continue
 
                 dependencies_changed = any(
@@ -1554,8 +1655,10 @@ def execute_task(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
                     report["elapsed_seconds"] = (
                         time.perf_counter() - task_started
                     )
-                    _write_json_atomic(plan.paths.report, report)
+                    persist_report()
                     if stage.name == "render":
+                        assert stage.episode_index is not None
+                        _write_completion(plan, stage.episode_index)
                         cleanup_completed_episode(stage)
                     continue
 
@@ -1572,7 +1675,7 @@ def execute_task(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
                     ),
                 )
                 report["updated_at"] = _utc_now()
-                _write_json_atomic(plan.paths.report, report)
+                persist_report()
                 try:
                     _clear_stage_output(stage, plan)
                     _run_stage_process(
@@ -1610,7 +1713,7 @@ def execute_task(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
                                 time.perf_counter() - task_started
                             ),
                         )
-                        _write_json_atomic(plan.paths.report, report)
+                        persist_report()
                         progress.set_postfix(
                             stage=f"{stage.name}:skipped",
                             episode=stage.episode_label,
@@ -1631,7 +1734,7 @@ def execute_task(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
                         updated_at=_utc_now(),
                         elapsed_seconds=time.perf_counter() - task_started,
                     )
-                    _write_json_atomic(plan.paths.report, report)
+                    persist_report()
                     raise
 
                 repaint_failures = (
@@ -1669,9 +1772,11 @@ def execute_task(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
                 )
                 report["updated_at"] = _utc_now()
                 report["elapsed_seconds"] = time.perf_counter() - task_started
-                _write_json_atomic(plan.paths.report, report)
+                persist_report()
                 progress.update(1)
                 if stage.name == "render":
+                    assert stage.episode_index is not None
+                    _write_completion(plan, stage.episode_index)
                     cleanup_completed_episode(stage)
 
             final_videos = []
@@ -1707,7 +1812,7 @@ def execute_task(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
                 successful_episode_count=len(final_videos),
                 skipped_episode_count=len(skipped_by_episode),
             )
-            _write_json_atomic(plan.paths.report, report)
+            persist_report()
             cleanup_targets = [plan.paths.root / "logs"]
             if not any(
                 report_by_id[skipped["failed_stage"]]["name"]
@@ -1733,7 +1838,7 @@ def execute_task(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
                     )
             if report.get("cleanup_errors"):
                 report["updated_at"] = _utc_now()
-                _write_json_atomic(plan.paths.report, report)
+                persist_report()
             progress.set_postfix(
                 stage=str(report["status"]),
                 episode="all",
@@ -1751,7 +1856,7 @@ def execute_task(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
                     updated_at=_utc_now(),
                     elapsed_seconds=time.perf_counter() - task_started,
                 )
-                _write_json_atomic(plan.paths.report, report)
+                persist_report()
             raise
 
 

@@ -1601,6 +1601,58 @@ def _run_stage(
     )
 
 
+def _clip_report(clip: SelectedClip) -> dict[str, Any]:
+    return {
+        "episode_index": clip.episode_index,
+        "session": clip.session,
+        "source_stem": clip.stem,
+        "source_video": str(clip.source.video_path),
+        "video": asdict(clip.video),
+    }
+
+
+def _completion_path(plan: PipelinePlan, episode_index: int) -> Path:
+    return (
+        plan.config.paths.final
+        / f"episode_{episode_index:06d}"
+        / "completion.json"
+    )
+
+
+def _write_completion(plan: PipelinePlan, episode_index: int) -> None:
+    _write_json_atomic(
+        _completion_path(plan, episode_index),
+        {
+            "schema_version": 1,
+            "status": "completed",
+            "source_episode": _clip_report(
+                _clip_by_index(plan, episode_index)
+            ),
+            "updated_at": _utc_now(),
+        },
+    )
+
+
+def _completion_matches(
+    plan: PipelinePlan,
+    episode_index: int,
+    previous_report: dict[str, Any],
+) -> bool:
+    expected = _clip_report(_clip_by_index(plan, episode_index))
+    try:
+        if (
+            _read_json(_completion_path(plan, episode_index)).get(
+                "source_episode"
+            )
+            == expected
+        ):
+            return True
+    except Exception:
+        pass
+    previous_sources = previous_report.get("selected_clips")
+    return isinstance(previous_sources, list) and expected in previous_sources
+
+
 def _new_report(plan: PipelinePlan) -> dict[str, Any]:
     config = plan.config
     return {
@@ -1657,16 +1709,10 @@ def _new_report(plan: PipelinePlan) -> dict[str, Any]:
             "report are retained; failed prepare/render inputs are retained "
             "for retry"
         ),
-        "selected_clips": [
-            {
-                "episode_index": clip.episode_index,
-                "session": clip.session,
-                "source_stem": clip.stem,
-                "source_video": str(clip.source.video_path),
-                "video": asdict(clip.video),
-            }
-            for clip in plan.clips
-        ],
+        "failed_episodes_file": str(
+            config.paths.root / "failed_episodes.json"
+        ),
+        "selected_clips": [_clip_report(clip) for clip in plan.clips],
         "started_at": _utc_now(),
         "updated_at": _utc_now(),
         "elapsed_seconds": 0.0,
@@ -1704,6 +1750,7 @@ def _initialize_output(plan: PipelinePlan) -> None:
         paths.final,
         paths.root / "logs",
         paths.report,
+        paths.root / "failed_episodes.json",
     ]
     if not config.alignment_is_external:
         owned_targets.extend(
@@ -1732,6 +1779,14 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
         except Exception:
             pass
     _initialize_output(plan)
+    try:
+        previous_failures = _read_json(
+            plan.config.paths.root / "failed_episodes.json"
+        ).get("failed_episodes", [])
+    except Exception:
+        previous_failures = []
+    if not isinstance(previous_failures, list):
+        previous_failures = []
     previous_stages = _load_previous_stages(
         plan.config.paths.report
     )
@@ -1839,16 +1894,36 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
                 except Exception:
                     continue
                 retained_render_indices.add(stage.episode_index)
+    if plan.config.resume:
+        for stage in plan.stages:
+            if (
+                stage.name != "render"
+                or stage.episode_index is None
+                or stage.episode_index in retained_render_indices
+                or not _completion_matches(
+                    plan,
+                    stage.episode_index,
+                    previous_report,
+                )
+            ):
+                continue
+            try:
+                _validate_render(stage, plan, allow_pruned_prepared=True)
+            except Exception:
+                continue
+            retained_render_indices.add(stage.episode_index)
+            _write_completion(plan, stage.episode_index)
+    all_episodes_retained = len(retained_render_indices) == len(plan.clips)
     retained_stage_ids = {
         stage.stage_id
         for stage in plan.stages
         if (
-            retained_lerobot_valid
-            and stage.name in {"alignment", "retarget"}
+            stage.name in {"alignment", "retarget", "repaint"}
+            and all_episodes_retained
         )
         or (
-            stage.name == "repaint"
-            and len(retained_render_indices) == len(plan.clips)
+            retained_lerobot_valid
+            and stage.name in {"alignment", "retarget"}
         )
         or (
             stage.name in {"prepare", "render"}
@@ -1999,9 +2074,42 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
                 }
             )
             report["updated_at"] = _utc_now()
-            _write_json_atomic(plan.config.paths.report, report)
+            persist_report()
 
-    _write_json_atomic(plan.config.paths.report, report)
+    def persist_report() -> None:
+        _write_json_atomic(plan.config.paths.report, report)
+        failures_by_episode: dict[int, dict[str, Any]] = {}
+        if report["status"] not in {"completed", "completed_with_skips"}:
+            for failure in previous_failures:
+                if not isinstance(failure, dict):
+                    continue
+                try:
+                    episode_index = int(failure["episode_index"])
+                    clip = _clip_by_index(plan, episode_index)
+                except (KeyError, TypeError, ValueError, IndexError):
+                    continue
+                if (
+                    failure.get("session") == clip.session
+                    and failure.get("source_stem") == clip.stem
+                ):
+                    failures_by_episode[episode_index] = failure
+        failures_by_episode.update(skipped_by_episode)
+        failures = [
+            failures_by_episode[index]
+            for index in sorted(failures_by_episode)
+        ]
+        _write_json_atomic(
+            plan.config.paths.root / "failed_episodes.json",
+            {
+                "schema_version": 1,
+                "source_root": str(plan.config.src_root),
+                "updated_at": report["updated_at"],
+                "failed_episode_count": len(failures),
+                "failed_episodes": failures,
+            },
+        )
+
+    persist_report()
 
     with tqdm(
         total=len(plan.stages),
@@ -2013,11 +2121,11 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
             for stage in plan.stages:
                 entry = report_by_id[stage.stage_id]
                 retained_stage = (
+                    stage.name in {"alignment", "retarget", "repaint"}
+                    and all_episodes_retained
+                ) or (
                     retained_lerobot_valid
                     and stage.name in {"alignment", "retarget"}
-                ) or (
-                    stage.name == "repaint"
-                    and len(retained_render_indices) == len(plan.clips)
                 ) or (
                     stage.name in {"prepare", "render"}
                     and stage.episode_index in retained_render_indices
@@ -2043,11 +2151,10 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
                     report["elapsed_seconds"] = (
                         time.perf_counter() - pipeline_started
                     )
-                    _write_json_atomic(
-                        plan.config.paths.report,
-                        report,
-                    )
+                    persist_report()
                     if stage.name == "render":
+                        assert stage.episode_index is not None
+                        _write_completion(plan, stage.episode_index)
                         cleanup_completed_episode(stage)
                     continue
                 if (
@@ -2093,7 +2200,7 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
                     report["elapsed_seconds"] = (
                         time.perf_counter() - pipeline_started
                     )
-                    _write_json_atomic(plan.config.paths.report, report)
+                    persist_report()
                     continue
 
                 dependencies_changed = any(
@@ -2146,10 +2253,7 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
                                 time.perf_counter() - pipeline_started
                             ),
                         )
-                        _write_json_atomic(
-                            plan.config.paths.report,
-                            report,
-                        )
+                        persist_report()
                         progress.update(1)
                         continue
                     entry["input_fingerprint"] = input_fingerprint
@@ -2229,8 +2333,10 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
                     report["elapsed_seconds"] = (
                         time.perf_counter() - pipeline_started
                     )
-                    _write_json_atomic(plan.config.paths.report, report)
+                    persist_report()
                     if stage.name == "render":
+                        assert stage.episode_index is not None
+                        _write_completion(plan, stage.episode_index)
                         cleanup_completed_episode(stage)
                     continue
                 if stage.command is None:
@@ -2256,15 +2362,12 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
                                 time.perf_counter() - pipeline_started
                             ),
                         )
-                        _write_json_atomic(
-                            plan.config.paths.report,
-                            report,
-                        )
+                        persist_report()
                         raise error
                     invalidate_stage_and_dependents(stage.stage_id)
                     changed.add(stage.stage_id)
                     report["updated_at"] = _utc_now()
-                    _write_json_atomic(plan.config.paths.report, report)
+                    persist_report()
                     now = _utc_now()
                     entry.update(
                         status="completed",
@@ -2289,7 +2392,7 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
                     report["elapsed_seconds"] = (
                         time.perf_counter() - pipeline_started
                     )
-                    _write_json_atomic(plan.config.paths.report, report)
+                    persist_report()
                     continue
 
                 invalidate_stage_and_dependents(stage.stage_id)
@@ -2304,7 +2407,7 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
                         else reason
                     ),
                 )
-                _write_json_atomic(plan.config.paths.report, report)
+                persist_report()
                 try:
                     _clear_stage(stage, plan)
                     _run_stage(
@@ -2364,10 +2467,7 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
                                 time.perf_counter() - pipeline_started
                             ),
                         )
-                        _write_json_atomic(
-                            plan.config.paths.report,
-                            report,
-                        )
+                        persist_report()
                         progress.update(1)
                         continue
                     report.update(
@@ -2377,7 +2477,7 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
                         updated_at=_utc_now(),
                         elapsed_seconds=time.perf_counter() - pipeline_started,
                     )
-                    _write_json_atomic(plan.config.paths.report, report)
+                    persist_report()
                     raise
                 for episode_index, failure in repaint_failures.items():
                     record_skipped_episode(
@@ -2407,9 +2507,11 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
                 report["elapsed_seconds"] = (
                     time.perf_counter() - pipeline_started
                 )
-                _write_json_atomic(plan.config.paths.report, report)
+                persist_report()
                 progress.update(1)
                 if stage.name == "render":
+                    assert stage.episode_index is not None
+                    _write_completion(plan, stage.episode_index)
                     cleanup_completed_episode(stage)
 
             report.update(
@@ -2456,7 +2558,7 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
                     report_by_id[stage.stage_id][
                         "retained_input_fingerprint"
                     ] = retained_fingerprint
-            _write_json_atomic(plan.config.paths.report, report)
+            persist_report()
             cleanup_targets = [plan.config.paths.root / "logs"]
             retryable_failure = any(
                 report_by_id[skipped["failed_stage"]]["name"]
@@ -2493,7 +2595,7 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
                     )
             if report.get("cleanup_errors"):
                 report["updated_at"] = _utc_now()
-                _write_json_atomic(plan.config.paths.report, report)
+                persist_report()
             return report
         except BaseException:
             if report.get("status") == "running":
@@ -2502,7 +2604,7 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
                     updated_at=_utc_now(),
                     elapsed_seconds=time.perf_counter() - pipeline_started,
                 )
-                _write_json_atomic(plan.config.paths.report, report)
+                persist_report()
             raise
 
 
