@@ -372,28 +372,15 @@ def _validate_retarget(plan: TaskPlan) -> None:
     collision_avoidance = gmr_robot_model.get(
         "cross_hand_collision_avoidance"
     )
-    if not isinstance(collision_avoidance, dict) or int(
-        collision_avoidance.get("geometry_pairs", -1)
-    ) != 144:
-        raise ValueError(
-            "LeRobot EgoDex manifest lacks GMR cross-hand collision avoidance"
-        )
     if (
-        collision_avoidance.get("solver")
-        != "Mink hard QP constraints; no post-GMR arm refinement"
-        or not math.isclose(
-            float(
-                collision_avoidance.get(
-                    "planning_clearance_m",
-                    float("nan"),
-                )
-            ),
-            0.015,
-            abs_tol=1e-12,
-        )
+        not isinstance(collision_avoidance, dict)
+        or collision_avoidance.get("enabled") is not False
+        or int(collision_avoidance.get("geometry_pairs", -1)) != 0
+        or collision_avoidance.get("solver") != "disabled"
     ):
         raise ValueError(
-            "LeRobot EgoDex manifest has an obsolete GMR collision solver"
+            "LeRobot EgoDex manifest still enables cross-hand collision "
+            "avoidance"
         )
     manifest_episodes = manifest.get("episodes")
     if not isinstance(manifest_episodes, list):

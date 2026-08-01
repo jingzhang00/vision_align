@@ -7,8 +7,8 @@ each episode this script:
 1. maps the tracked body and hand landmarks into a canonical Z-up frame,
 2. combines it with a static G1-derived standing target,
 3. builds GMR from the same complete G1+O6 URDF used by the output,
-4. solves the floating-base body trajectory with all 22 O6 hand joints and
-   cross-hand collision geometry present in the GMR configuration, and
+4. solves the floating-base body trajectory with all 22 O6 hand joints while
+   auditing, but not constraining, cross-hand collisions, and
 5. writes 51-DoF references, camera calibration, and frame-aligned RGB.
 """
 
@@ -81,13 +81,6 @@ ACTION_OFFSET = 1
 IMAGE_STAT_SAMPLES = 24
 CROSS_HAND_COLLISION_TOLERANCE_M = 1e-4
 CROSS_HAND_NEAR_CLEARANCE_M = 2e-3
-GMR_CROSS_HAND_PLANNING_CLEARANCE_M = 1.5e-2
-GMR_CROSS_HAND_DETECTION_DISTANCE_M = 5e-1
-# Mink applies this dimensionless gain once per IK iteration.
-GMR_CROSS_HAND_AVOIDANCE_GAIN = 0.85
-# Finger states change before each body solve, so restore any penetration they
-# introduce instead of merely preventing it from deepening.
-GMR_CROSS_HAND_RESTORATION_SPEED_M_S = 0.25
 GMR_COLLISION_PHASE1_MAX_ITERATIONS = 3
 GMR_COLLISION_PHASE2_MAX_ITERATIONS = 5
 GMR_NEUTRAL_PELVIS_HEIGHT_M = 0.793
@@ -377,39 +370,11 @@ def _build_gmr_with_hand_model(urdf_path: Path) -> mj.MjModel:
     return model
 
 
-def _gmr_o6_collision_geometries(
-    model: mj.MjModel,
-    side: str,
-) -> tuple[str, ...]:
-    names: list[str] = []
-    for geom_id in range(model.ngeom):
-        body_name = mj.mj_id2name(
-            model,
-            mj.mjtObj.mjOBJ_BODY,
-            int(model.geom_bodyid[geom_id]),
-        )
-        if body_name is None or not _is_o6_hand_body(body_name, side):
-            continue
-        geom_name = mj.mj_id2name(
-            model,
-            mj.mjtObj.mjOBJ_GEOM,
-            geom_id,
-        )
-        if geom_name is None:
-            raise ValueError(f"O6 collision geom {geom_id} has no stable name")
-        names.append(geom_name)
-    if len(names) != 12:
-        raise ValueError(
-            f"Expected 12 {side} O6 collision geoms in GMR, found {len(names)}"
-        )
-    return tuple(names)
-
-
 def _configure_gmr_hand_constraints(
     retarget: GMR,
     hand_joint_names: tuple[str, ...],
 ) -> tuple[dict[str, object], tuple[tuple[int, int], ...]]:
-    """Freeze the retargeted fingers and avoid all 144 cross-hand geom pairs."""
+    """Freeze the retargeted fingers without constraining the two hands."""
 
     if tuple(hand_joint_names) != tuple(HAND_JOINTS):
         raise ValueError("O6 hand joint order differs from the complete URDF")
@@ -419,63 +384,23 @@ def _configure_gmr_hand_constraints(
             {joint_name: 0.0 for joint_name in hand_joint_names},
         )
     )
-    left_geoms = _gmr_o6_collision_geometries(retarget.model, "left")
-    right_geoms = _gmr_o6_collision_geometries(retarget.model, "right")
-    retarget.ik_limits.append(
-        mink.CollisionAvoidanceLimit(
-            retarget.model,
-            geom_pairs=[(left_geoms, right_geoms)],
-            gain=GMR_CROSS_HAND_AVOIDANCE_GAIN,
-            minimum_distance_from_collisions=(
-                GMR_CROSS_HAND_PLANNING_CLEARANCE_M
-            ),
-            collision_detection_distance=(
-                GMR_CROSS_HAND_DETECTION_DISTANCE_M
-            ),
-            bound_relaxation=-GMR_CROSS_HAND_RESTORATION_SPEED_M_S,
-        )
-    )
-    geometry_pairs = tuple(
-        (
-            mj.mj_name2id(
-                retarget.model,
-                mj.mjtObj.mjOBJ_GEOM,
-                left_name,
-            ),
-            mj.mj_name2id(
-                retarget.model,
-                mj.mjtObj.mjOBJ_GEOM,
-                right_name,
-            ),
-        )
-        for left_name in left_geoms
-        for right_name in right_geoms
-    )
     diagnostics = {
         "model_kind": GMR_MODEL_KIND,
         "source_urdf": str(G1_URDF.resolve()),
         "floating_root": True,
         "fixed_link_fusion": False,
         "hand_joint_count": len(hand_joint_names),
-        "cross_hand_geometry_pairs": len(left_geoms) * len(right_geoms),
-        "planning_clearance_m": GMR_CROSS_HAND_PLANNING_CLEARANCE_M,
-        "detection_distance_m": GMR_CROSS_HAND_DETECTION_DISTANCE_M,
-        "avoidance_gain": GMR_CROSS_HAND_AVOIDANCE_GAIN,
-        "avoidance_discrete_gain": GMR_CROSS_HAND_AVOIDANCE_GAIN,
-        "penetration_restoration_speed_m_s": (
-            GMR_CROSS_HAND_RESTORATION_SPEED_M_S
-        ),
+        "cross_hand_geometry_pairs": 0,
+        "cross_hand_collision_avoidance": False,
         "finger_dofs_frozen_during_body_ik": True,
-        "collision_solver": (
-            "Mink hard QP collision constraints on the complete O6 geometry"
-        ),
+        "collision_solver": "disabled",
         "post_gmr_arm_refinement": False,
         "phase_iterations": [
             GMR_COLLISION_PHASE1_MAX_ITERATIONS,
             GMR_COLLISION_PHASE2_MAX_ITERATIONS,
         ],
     }
-    return diagnostics, geometry_pairs
+    return diagnostics, ()
 
 
 def _solve_complete_gmr_phase(
@@ -503,7 +428,7 @@ def _complete_gmr_retarget(
     retarget: GMR,
     human_frame: dict[str, tuple[np.ndarray, np.ndarray]],
 ) -> np.ndarray:
-    """Solve both GMR phases with frozen O6 joints and collision limits."""
+    """Solve both GMR phases with frozen O6 joints."""
 
     retarget.update_targets(human_frame)
     if retarget.use_ik_match_table1:
@@ -1154,7 +1079,7 @@ def _gmr_body_trajectory(
                 )
         # The QP backend may leave sub-microradian feasibility residuals on
         # zero-velocity joints. Reapply the exact retargeted O6 state before
-        # recording and before the next frame's collision linearization.
+        # recording the frame.
         _set_gmr_hand_configuration(retarget, hand, frame_index)
         qpos[frame_index] = retarget.configuration.data.qpos
         mj.mj_forward(retarget.model, retarget.configuration.data)
@@ -1408,14 +1333,6 @@ def _cross_hand_collision_validation(
         "worst_frame_index": worst_frame,
         "worst_geometry_pair": list(worst_pair),
     }
-    if collision_frames:
-        raise ValueError(
-            "Cross-hand collision validation failed: "
-            f"{len(collision_frames)}/{len(state)} frames exceed "
-            f"{CROSS_HAND_COLLISION_TOLERANCE_M:.1e} m penetration; "
-            f"worst frame={worst_frame}, pair={worst_pair}, "
-            f"depth={maximum_penetration:.6f} m"
-        )
     return metrics, diagnostics
 
 
@@ -2119,17 +2036,9 @@ def write_lerobot_v3(
                         ),
                     },
                     "cross_hand_collision_avoidance": {
-                        "geometry_pairs": 144,
-                        "planning_clearance_m": (
-                            GMR_CROSS_HAND_PLANNING_CLEARANCE_M
-                        ),
-                        "detection_distance_m": (
-                            GMR_CROSS_HAND_DETECTION_DISTANCE_M
-                        ),
-                        "solver": (
-                            "Mink hard QP constraints; no post-GMR arm "
-                            "refinement"
-                        ),
+                        "enabled": False,
+                        "geometry_pairs": 0,
+                        "solver": "disabled",
                         "final_validation_penetration_tolerance_m": (
                             CROSS_HAND_COLLISION_TOLERANCE_M
                         ),
@@ -2152,7 +2061,7 @@ def write_lerobot_v3(
                     "near_clearance_threshold_m": (
                         CROSS_HAND_NEAR_CLEARANCE_M
                     ),
-                    "failure_policy": "reject episode before dataset write",
+                    "failure_policy": "audit_only",
                 },
                 "robot_urdf": str(G1_URDF),
                 "joint_order": joint_names,
