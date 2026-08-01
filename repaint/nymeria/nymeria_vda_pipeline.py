@@ -46,6 +46,7 @@ from repaint.nymeria.nymeria_adapter import (  # noqa: E402
     load_motion_metadata,
     natural_key,
 )
+from repaint.lighting_profile import load_lighting_profile  # noqa: E402
 from repaint.nymeria.nymeria_to_lerobot import (  # noqa: E402
     VIDEO_KEY,
     load_source_episode,
@@ -1059,6 +1060,17 @@ def _validate_prepared(stage: Stage, plan: PipelinePlan) -> None:
     clip = _clip_by_index(plan, stage.episode_index)
     root = plan.config.paths.prepared / f"episode_{clip.episode_index:06d}"
     report = _read_json(root / "prepare_report.json")
+    lighting_path = root / "lighting_profile.json"
+    lighting_profile = load_lighting_profile(lighting_path)
+    if lighting_profile is None:
+        raise ValueError("Prepared lighting profile is missing")
+    lighting_report = report.get("lighting")
+    if (
+        not isinstance(lighting_report, dict)
+        or Path(str(lighting_report.get("profile", ""))).resolve()
+        != lighting_path.resolve()
+    ):
+        raise ValueError("Prepared lighting audit is invalid")
     if report.get("source_dataset_kind") != "nymeria":
         raise ValueError("Prepared episode does not identify Nymeria")
     if int(report.get("frame_count", -1)) != clip.video.frame_count:
@@ -1214,6 +1226,7 @@ def _validate_prepared(stage: Stage, plan: PipelinePlan) -> None:
             "scene_scale",
             "vda_metric_scale",
             "vda_scale_mode",
+            "lighting_profile",
         }
         missing = required - set(data.files)
         if missing:
@@ -1328,6 +1341,11 @@ def _validate_prepared(stage: Stage, plan: PipelinePlan) -> None:
         npz_scale_mode = str(np.asarray(data["vda_scale_mode"]).item())
         if npz_scale_mode != resolved_scale_mode:
             raise ValueError("Prepared NPZ/report VDA scale modes disagree")
+        npz_lighting_path = Path(
+            str(np.asarray(data["lighting_profile"]).item())
+        ).expanduser().resolve()
+        if npz_lighting_path != lighting_path.resolve():
+            raise ValueError("Prepared NPZ/report lighting profiles disagree")
 
 
 def _validate_render(
@@ -1354,6 +1372,15 @@ def _validate_render(
         raise ValueError("Final video is not a robot-camera capture")
     if int(report.get("frame_count", -1)) != clip.video.frame_count:
         raise ValueError("Final report frame count differs from source")
+    lighting = report.get("lighting")
+    if (
+        not isinstance(lighting, dict)
+        or lighting.get("applied") is not True
+        or int(lighting.get("profile_version", -1)) != 1
+        or not isinstance(lighting.get("dome"), dict)
+        or not isinstance(lighting.get("key"), dict)
+    ):
+        raise ValueError("Final Isaac lighting profile was not applied")
     capture_camera = report.get("capture_camera")
     if not isinstance(capture_camera, dict) or (
         capture_camera.get("profile") != BEINGBEYOND_HEAD_CAMERA_PROFILE

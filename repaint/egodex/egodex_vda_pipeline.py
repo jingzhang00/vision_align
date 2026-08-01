@@ -25,6 +25,7 @@ if str(WORKSPACE_ROOT) not in sys.path:
     sys.path.insert(0, str(WORKSPACE_ROOT))
 
 from repaint.robot_camera import BEINGBEYOND_HEAD_CAMERA_PROFILE  # noqa: E402
+from repaint.lighting_profile import load_lighting_profile  # noqa: E402
 from repaint.scene_hand_alignment import (  # noqa: E402
     HAND_TCP_ALIGNMENT_METHOD,
     HAND_TCP_ALIGNMENT_STAGE,
@@ -524,8 +525,19 @@ def _validate_prepared(stage: Stage, plan: TaskPlan) -> None:
     source = _episode_for_stage(stage, plan)
     root = plan.paths.prepared / f"episode_{source.episode_index:06d}"
     archive_path = root / "episode_data.npz"
-    if not (root / "prepare_report.json").is_file():
-        raise FileNotFoundError(root / "prepare_report.json")
+    prepare_report_path = root / "prepare_report.json"
+    prepare_report = _read_json_object(prepare_report_path)
+    lighting_path = root / "lighting_profile.json"
+    lighting_profile = load_lighting_profile(lighting_path)
+    if lighting_profile is None:
+        raise ValueError("Prepared lighting profile is missing")
+    lighting_report = prepare_report.get("lighting")
+    if (
+        not isinstance(lighting_report, dict)
+        or Path(str(lighting_report.get("profile", ""))).resolve()
+        != lighting_path.resolve()
+    ):
+        raise ValueError("Prepared lighting audit is invalid")
     with np.load(archive_path, allow_pickle=False) as archive:
         frame_indices = np.asarray(archive["frame_indices"], dtype=np.int64)
         source_size = tuple(
@@ -568,6 +580,15 @@ def _validate_render(stage: Stage, plan: TaskPlan) -> None:
         raise ValueError("Final Isaac report is not a robot-camera capture")
     if int(report.get("frame_count", -1)) != source.video.frame_count:
         raise ValueError("Final Isaac report frame_count differs from source")
+    lighting = report.get("lighting")
+    if (
+        not isinstance(lighting, dict)
+        or lighting.get("applied") is not True
+        or int(lighting.get("profile_version", -1)) != 1
+        or not isinstance(lighting.get("dome"), dict)
+        or not isinstance(lighting.get("key"), dict)
+    ):
+        raise ValueError("Final Isaac lighting profile was not applied")
     output_size = (
         source.video.width,
         source.video.height,

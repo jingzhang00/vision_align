@@ -23,6 +23,7 @@ from repaint.rgbd_episode import (  # noqa: E402
     load_rgbd_episode,
 )
 from repaint.rgbd_geometry import scale_intrinsic  # noqa: E402
+from repaint.lighting_profile import estimate_lighting_profile  # noqa: E402
 from repaint.vda_depth import (  # noqa: E402
     DEFAULT_CHECKPOINT,
     DEFAULT_VDA_METRIC_SCALE,
@@ -117,6 +118,8 @@ def _require_output_layout(output_root: Path) -> tuple[Path, Path]:
     for path in (
         output_root / "episode_data.npz",
         output_root / "prepare_report.json",
+        output_root / "lighting_profile.json",
+        output_root / "lighting_profile_samples.jpg",
     ):
         if path.exists():
             raise FileExistsError(f"Output already exists: {path}")
@@ -137,6 +140,8 @@ def _validate_output_available(output_root: Path) -> None:
     for path in (
         output_root / "episode_data.npz",
         output_root / "prepare_report.json",
+        output_root / "lighting_profile.json",
+        output_root / "lighting_profile_samples.jpg",
     ):
         if path.exists():
             raise FileExistsError(f"Output already exists: {path}")
@@ -341,6 +346,11 @@ def prepare(args: argparse.Namespace) -> dict[str, object]:
     del depths_raw_m, decoded
 
     frame_root, depth_root = _require_output_layout(output_root)
+    lighting_profile_path = output_root / "lighting_profile.json"
+    lighting_profile = estimate_lighting_profile(
+        inpaint_video=episode.removed_video,
+        output_path=lighting_profile_path,
+    )
 
     removed_capture = _open_at(
         episode.removed_video,
@@ -437,6 +447,7 @@ def prepare(args: argparse.Namespace) -> dict[str, object]:
         vda_scale_mode=np.asarray(
             str(scale_calibration["resolved_mode"])
         ),
+        lighting_profile=np.asarray(str(lighting_profile_path)),
     )
 
     samples = (
@@ -525,6 +536,13 @@ def prepare(args: argparse.Namespace) -> dict[str, object]:
                 if episode.source_dataset_kind == "nymeria"
                 else "one initial bilateral-hand midpoint translation"
             ),
+        },
+        "lighting": {
+            "profile": str(lighting_profile_path),
+            "analysis_video": lighting_profile["analysis_video"],
+            "isaac": lighting_profile["isaac"],
+            "confidence": lighting_profile["confidence"],
+            "warnings": lighting_profile["warnings"],
         },
         "episode_data": str(episode_data_path),
         "elapsed_seconds": time.perf_counter() - started,

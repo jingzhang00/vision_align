@@ -34,6 +34,11 @@ if str(WORKSPACE_ROOT) not in sys.path:
     sys.path.insert(0, str(WORKSPACE_ROOT))
 
 from repaint.isaac_g1 import import_g1, isaac_joint_order  # noqa: E402
+from repaint.lighting_profile import (  # noqa: E402
+    DEFAULT_COMPOSITE_PROFILE,
+    DEFAULT_ISAAC_PROFILE,
+    load_lighting_profile,
+)
 from repaint.rgbd_geometry import (  # noqa: E402
     backproject_z_depth,
     camera_points_to_world,
@@ -1017,6 +1022,77 @@ def _rgb8(rgba: np.ndarray, expected_shape: tuple[int, int, int]) -> np.ndarray:
     return np.clip(rgb, 0, 255).astype(np.uint8)
 
 
+def _resolve_isaac_lighting(
+    prepared_root: Path,
+    requested_profile: Path | None,
+) -> dict[str, object]:
+    automatic_path = prepared_root / "lighting_profile.json"
+    profile_path = (
+        requested_profile.expanduser().resolve()
+        if requested_profile is not None
+        else (automatic_path if automatic_path.is_file() else None)
+    )
+    profile = load_lighting_profile(profile_path)
+    values = dict(DEFAULT_ISAAC_PROFILE)
+    if profile is not None:
+        values.update(profile["isaac"])
+
+    def finite_scalar(key: str, minimum: float, maximum: float) -> float:
+        value = float(values[key])
+        if not np.isfinite(value) or not minimum <= value <= maximum:
+            raise ValueError(
+                f"Lighting {key} must be finite and in "
+                f"[{minimum}, {maximum}], got {value}"
+            )
+        return value
+
+    rotation = np.asarray(values["key_rotation"], dtype=np.float64)
+    if rotation.shape != (3,) or not np.isfinite(rotation).all():
+        raise ValueError("Lighting key_rotation must be three finite degrees")
+    source = (
+        "explicit profile"
+        if requested_profile is not None
+        else (
+            "prepared lighting_profile.json"
+            if profile_path is not None
+            else "stable defaults"
+        )
+    )
+    return {
+        "schema_version": 1,
+        "applied": True,
+        "source": source,
+        "profile_path": str(profile_path) if profile_path is not None else None,
+        "profile_version": (
+            int(profile["profile_version"]) if profile is not None else None
+        ),
+        "profile_scope": profile.get("scope") if profile is not None else None,
+        "dome": {
+            "intensity": finite_scalar("dome_intensity", 0.0, 1.0e7),
+            "color_temperature_kelvin": finite_scalar(
+                "dome_temperature", 1000.0, 20000.0
+            ),
+        },
+        "key": {
+            "type": "UsdLux.DistantLight",
+            "intensity": finite_scalar("key_intensity", 0.0, 1.0e7),
+            "color_temperature_kelvin": finite_scalar(
+                "key_temperature", 1000.0, 20000.0
+            ),
+            "angle_degrees": finite_scalar("key_angle", 0.0, 180.0),
+            "rotation_xyz_degrees": rotation.tolist(),
+        },
+        "confidence": profile.get("confidence") if profile is not None else None,
+        "warnings": list(profile.get("warnings", ())) if profile is not None else [],
+        "composite": (
+            dict(profile["composite"])
+            if profile is not None
+            else dict(DEFAULT_COMPOSITE_PROFILE)
+        ),
+        "composite_applied": False,
+    }
+
+
 def _resolve_run_options(
     args: argparse.Namespace,
     *,
@@ -1087,6 +1163,10 @@ def _next_playback_frame(
 def render(args: argparse.Namespace) -> dict[str, object]:
     scene = load_prepared_scene(args.prepared)
     run_options = _resolve_run_options(args, source_fps=scene.fps)
+    lighting_report = _resolve_isaac_lighting(
+        scene.root,
+        args.lighting_profile,
+    )
     if (
         not np.isfinite(args.depth_edge_absolute)
         or args.depth_edge_absolute < 0
@@ -1493,7 +1573,30 @@ def render(args: argparse.Namespace) -> dict[str, object]:
             stage,
             Sdf.Path("/World/G1DomeLight"),
         )
-        dome.CreateIntensityAttr(500.0)
+        dome_settings = lighting_report["dome"]
+        assert isinstance(dome_settings, dict)
+        dome.CreateIntensityAttr(float(dome_settings["intensity"]))
+        dome.CreateEnableColorTemperatureAttr(True)
+        dome.CreateColorTemperatureAttr(
+            float(dome_settings["color_temperature_kelvin"])
+        )
+        key_settings = lighting_report["key"]
+        assert isinstance(key_settings, dict)
+        key = UsdLux.DistantLight.Define(
+            stage,
+            Sdf.Path("/World/G1KeyLight"),
+        )
+        key.CreateIntensityAttr(float(key_settings["intensity"]))
+        key.CreateEnableColorTemperatureAttr(True)
+        key.CreateColorTemperatureAttr(
+            float(key_settings["color_temperature_kelvin"])
+        )
+        key.CreateAngleAttr(float(key_settings["angle_degrees"]))
+        key_rotation = key_settings["rotation_xyz_degrees"]
+        assert isinstance(key_rotation, list)
+        UsdGeom.Xformable(key.GetPrim()).AddRotateXYZOp().Set(
+            Gf.Vec3f(*(float(value) for value in key_rotation))
+        )
 
         mesh = UsdGeom.Mesh.Define(
             stage,
@@ -2245,6 +2348,7 @@ def render(args: argparse.Namespace) -> dict[str, object]:
             ),
             "background_material": "UsdPreviewSurface emissive RGB texture",
             "lighting_affects": "G1; VDA RGB-D mesh is emissive",
+            "lighting": lighting_report,
             "headless": bool(args.headless),
             "rt_subframes": args.rt_subframes,
             "elapsed_seconds": time.perf_counter() - started,
@@ -2377,6 +2481,14 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=2,
         help="RTX subframes per batch-captured frame (default: 2)",
+    )
+    parser.add_argument(
+        "--lighting-profile",
+        type=Path,
+        help=(
+            "Lighting profile JSON; default automatically uses "
+            "<prepared>/lighting_profile.json, then stable defaults"
+        ),
     )
     parser.add_argument(
         "--interactive",
