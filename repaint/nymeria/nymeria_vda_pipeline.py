@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict, dataclass
+from functools import lru_cache
 import hashlib
 import json
 import math
@@ -51,7 +52,7 @@ from repaint.nymeria.nymeria_to_lerobot import (  # noqa: E402
 )
 from repaint.robot_camera import (  # noqa: E402
     BEINGBEYOND_HEAD_CAMERA_PROFILE,
-    ROBOT_PALM_OFFSETS_LOCAL_M,
+    robot_palm_offsets_local_m,
 )
 from repaint.scene_hand_alignment import (  # noqa: E402
     PALM_ALIGNMENT_METHOD,
@@ -178,6 +179,21 @@ def _paths_overlap(left: Path, right: Path) -> bool:
     return left == right or left in right.parents or right in left.parents
 
 
+@lru_cache(maxsize=32)
+def _file_content_digest(
+    path: str,
+    size: int,
+    mtime_ns: int,
+    ctime_ns: int,
+) -> bytes:
+    del size, mtime_ns, ctime_ns
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.digest()
+
+
 def _update_path_fingerprint(
     digest: Any,
     path: Path,
@@ -207,9 +223,14 @@ def _update_path_fingerprint(
             ).encode()
         )
         if hash_contents and candidate.is_file():
-            with candidate.open("rb") as handle:
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                    digest.update(chunk)
+            digest.update(
+                _file_content_digest(
+                    str(candidate),
+                    stat.st_size,
+                    stat.st_mtime_ns,
+                    stat.st_ctime_ns,
+                )
+            )
 
 
 def _repaint_episode_video_paths(
@@ -218,15 +239,17 @@ def _repaint_episode_video_paths(
 ) -> tuple[Path, Path]:
     paths = plan.config.paths
     info = _read_json(paths.lerobot / "meta/info.json")
-    chunks_size = int(info.get("chunks_size", 1000))
-    if chunks_size <= 0:
-        raise ValueError("LeRobot chunks_size must be positive")
-    relative_video = Path(str(info["video_path"]).format(
-        video_key=VIDEO_KEY,
-        chunk_index=episode_index // chunks_size,
-        file_index=episode_index % chunks_size,
-    ))
-    return paths.lerobot / relative_video, paths.handless / relative_video
+    rows = _episode_rows(paths.lerobot)
+    try:
+        row = rows[episode_index]
+    except KeyError as exc:
+        raise ValueError(
+            f"LeRobot has no metadata row for episode {episode_index}"
+        ) from exc
+    return (
+        _video_path(paths.lerobot, info, row),
+        _video_path(paths.handless, info, row),
+    )
 
 
 def _update_repaint_episode_fingerprint(
@@ -266,7 +289,12 @@ def _update_repaint_episode_fingerprint(
     )
 
 
-def _stage_input_fingerprint(stage: Stage, plan: PipelinePlan) -> str:
+def _stage_input_fingerprint(
+    stage: Stage,
+    plan: PipelinePlan,
+    *,
+    include_pruned_outputs: bool = True,
+) -> str:
     """Fingerprint commands plus inputs/outputs that make reuse safe."""
 
     digest = hashlib.sha256()
@@ -300,21 +328,22 @@ def _stage_input_fingerprint(stage: Stage, plan: PipelinePlan) -> str:
             ),
         ):
             _update_path_fingerprint(digest, source)
-        for stem in stage.clip_stems:
+        if include_pruned_outputs:
+            for stem in stage.clip_stems:
+                _update_path_fingerprint(
+                    digest,
+                    plan.config.alignment_root
+                    / stage.session
+                    / f"{stem}.hdf5",
+                    hash_contents=True,
+                )
             _update_path_fingerprint(
                 digest,
-                plan.config.alignment_root
+                plan.config.alignment_report_root
                 / stage.session
-                / f"{stem}.hdf5",
+                / "visual_alignment_report.json",
                 hash_contents=True,
             )
-        _update_path_fingerprint(
-            digest,
-            plan.config.alignment_report_root
-            / stage.session
-            / "visual_alignment_report.json",
-            hash_contents=True,
-        )
     elif stage.name == "retarget":
         for clip in plan.clips:
             for source in (
@@ -326,25 +355,67 @@ def _stage_input_fingerprint(stage: Stage, plan: PipelinePlan) -> str:
                 _update_path_fingerprint(digest, source)
         _update_path_fingerprint(digest, paths.lerobot)
     elif stage.name == "repaint":
-        _update_path_fingerprint(digest, paths.lerobot)
-        _update_path_fingerprint(digest, paths.handless)
+        if include_pruned_outputs:
+            _update_path_fingerprint(digest, paths.lerobot)
+            _update_path_fingerprint(digest, paths.handless)
     elif stage.name in {"prepare", "render"}:
         assert stage.episode_index is not None
         label = f"episode_{stage.episode_index:06d}"
-        _update_path_fingerprint(digest, paths.prepared / label)
+        if include_pruned_outputs:
+            _update_path_fingerprint(digest, paths.prepared / label)
         if stage.name == "prepare":
-            _update_path_fingerprint(digest, paths.lerobot / "meta")
-            _update_repaint_episode_fingerprint(
-                digest,
-                plan,
-                stage.episode_index,
-            )
+            if include_pruned_outputs:
+                _update_path_fingerprint(digest, paths.lerobot / "meta")
+                _update_repaint_episode_fingerprint(
+                    digest,
+                    plan,
+                    stage.episode_index,
+                )
             _update_path_fingerprint(
                 digest,
                 plan.config.vda_checkpoint or DEFAULT_CHECKPOINT,
+                hash_contents=True,
             )
         else:
-            _update_path_fingerprint(digest, paths.final / label)
+            final_root = paths.final / label
+            _update_path_fingerprint(digest, final_root)
+            _update_path_fingerprint(
+                digest,
+                final_root / "g1_view.json",
+                hash_contents=True,
+            )
+    return digest.hexdigest()
+
+
+def _retained_render_fingerprint(
+    render_stage: Stage,
+    plan: PipelinePlan,
+) -> str:
+    """Receipt for pruned stages; retained LeRobot is checked separately."""
+
+    assert render_stage.name == "render"
+    assert render_stage.episode_index is not None
+    related = [
+        stage
+        for stage in plan.stages
+        if stage.name == "repaint"
+        or (
+            stage.name == "prepare"
+            and stage.episode_index == render_stage.episode_index
+        )
+    ]
+    if [stage.name for stage in related] != ["repaint", "prepare"]:
+        raise ValueError("Render retention dependencies are incomplete")
+    digest = hashlib.sha256()
+    for stage in (*related, render_stage):
+        digest.update(stage.stage_id.encode())
+        digest.update(
+            _stage_input_fingerprint(
+                stage,
+                plan,
+                include_pruned_outputs=False,
+            ).encode()
+        )
     return digest.hexdigest()
 
 
@@ -619,11 +690,15 @@ def _video_path(
     info: dict[str, Any],
     row: dict[str, Any],
 ) -> Path:
-    return root / str(info["video_path"]).format(
+    resolved_root = root.resolve()
+    path = (root / str(info["video_path"]).format(
         video_key=VIDEO_KEY,
         chunk_index=int(row[f"videos/{VIDEO_KEY}/chunk_index"]),
         file_index=int(row[f"videos/{VIDEO_KEY}/file_index"]),
-    )
+    )).resolve()
+    if not path.is_relative_to(resolved_root):
+        raise ValueError(f"Video path escapes its dataset root: {path}")
+    return path
 
 
 def _validate_alignment(stage: Stage, plan: PipelinePlan) -> None:
@@ -683,7 +758,11 @@ def _validate_alignment(stage: Stage, plan: PipelinePlan) -> None:
             )
 
 
-def _validate_retarget(plan: PipelinePlan) -> None:
+def _validate_retarget(
+    plan: PipelinePlan,
+    *,
+    allow_pruned_alignment: bool = False,
+) -> None:
     root = plan.config.paths.lerobot
     info = _read_json(root / "meta/info.json")
     manifest = _read_json(root / "meta/nymeria.json")
@@ -709,12 +788,15 @@ def _validate_retarget(plan: PipelinePlan) -> None:
         ).resolve()
         if report_path != expected_path or session in recorded_reports:
             raise ValueError("Hand-eye report provenance does not match config")
-        if not report_path.is_file():
+        if report_path.is_file():
+            if hashlib.sha256(report_path.read_bytes()).hexdigest() != item.get(
+                "sha256"
+            ):
+                raise ValueError(
+                    f"Hand-eye report changed after retarget: {session}"
+                )
+        elif not allow_pruned_alignment:
             raise FileNotFoundError(report_path)
-        if hashlib.sha256(report_path.read_bytes()).hexdigest() != item.get(
-            "sha256"
-        ):
-            raise ValueError(f"Hand-eye report changed after retarget: {session}")
         recorded_reports[session] = item
     if set(recorded_reports) != expected_sessions:
         raise ValueError("Hand-eye report provenance has incorrect sessions")
@@ -743,14 +825,17 @@ def _validate_retarget(plan: PipelinePlan) -> None:
             / clip.session
             / f"{clip.stem}.hdf5"
         ).resolve()
-        if adapter_path != expected_adapter or not adapter_path.is_file():
+        if adapter_path != expected_adapter or (
+            not allow_pruned_alignment and not adapter_path.is_file()
+        ):
             raise ValueError(f"{clip.stem} camera adapter path changed")
-        digest = hashlib.sha256()
-        with adapter_path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-        if digest.hexdigest() != alignment.get("adapter_hdf5_sha256"):
-            raise ValueError(f"{clip.stem} camera adapter content changed")
+        if adapter_path.is_file():
+            digest = hashlib.sha256()
+            with adapter_path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            if digest.hexdigest() != alignment.get("adapter_hdf5_sha256"):
+                raise ValueError(f"{clip.stem} camera adapter content changed")
         if alignment.get("hand_eye_quality_report") != recorded_reports[
             clip.session
         ]:
@@ -1244,7 +1329,12 @@ def _validate_prepared(stage: Stage, plan: PipelinePlan) -> None:
             raise ValueError("Prepared NPZ/report VDA scale modes disagree")
 
 
-def _validate_render(stage: Stage, plan: PipelinePlan) -> None:
+def _validate_render(
+    stage: Stage,
+    plan: PipelinePlan,
+    *,
+    allow_pruned_prepared: bool = False,
+) -> None:
     assert stage.episode_index is not None
     clip = _clip_by_index(plan, stage.episode_index)
     output = (
@@ -1287,20 +1377,36 @@ def _validate_render(stage: Stage, plan: PipelinePlan) -> None:
         if isinstance(robot, dict)
         else None
     )
-    prepared_report = _read_json(
+    prepared_report_path = (
         plan.config.paths.prepared
         / f"episode_{clip.episode_index:06d}"
         / "prepare_report.json"
     )
-    replacement = prepared_report.get("arm_replacement", {})
-    if (
-        not isinstance(visual_visibility, dict)
-        or int(visual_visibility.get("visible_frames", -1))
-        != int(replacement.get("robot_arm_render_frames", -2))
-        or int(visual_visibility.get("hidden_frames", -1))
-        != int(replacement.get("view_only_frames", -2))
-    ):
+    if not isinstance(visual_visibility, dict):
         raise ValueError("Final robot visual-visibility audit is inconsistent")
+    visible_frames = int(visual_visibility.get("visible_frames", -1))
+    hidden_frames = int(visual_visibility.get("hidden_frames", -1))
+    if prepared_report_path.is_file():
+        replacement = _read_json(prepared_report_path).get(
+            "arm_replacement",
+            {},
+        )
+        if (
+            visible_frames
+            != int(replacement.get("robot_arm_render_frames", -2))
+            or hidden_frames != int(replacement.get("view_only_frames", -2))
+        ):
+            raise ValueError(
+                "Final robot visual-visibility audit is inconsistent"
+            )
+    elif not allow_pruned_prepared:
+        raise FileNotFoundError(prepared_report_path)
+    elif (
+        visible_frames < 0
+        or hidden_frames < 0
+        or visible_frames + hidden_frames != clip.video.frame_count
+    ):
+        raise ValueError("Final robot visual-visibility totals are invalid")
     alignment = report.get("scene_alignment")
     if (
         not isinstance(alignment, dict)
@@ -1333,22 +1439,42 @@ def _validate_render(stage: Stage, plan: PipelinePlan) -> None:
     ):
         raise ValueError("Nymeria palm scene-alignment translation is invalid")
     semantics = alignment.get("anchor_semantics")
-    palm_offsets = np.asarray(
+    robot_palm_offsets = np.asarray(
         semantics.get("robot_palm_local_offsets_m")
         if isinstance(semantics, dict)
         else None,
         dtype=np.float64,
     )
+    source_palm_offsets = np.asarray(
+        semantics.get("source_wrist_to_palm_offsets_local_m")
+        if isinstance(semantics, dict)
+        else None,
+        dtype=np.float64,
+    )
+    expected_robot_palm_offsets = robot_palm_offsets_local_m(
+        Path(str(robot.get("urdf")))
+    )
+    scene_scale = float(alignment.get("scene_scale", math.nan))
     if (
         not isinstance(semantics, dict)
         or semantics.get("source_transform_origins")
         != ["transforms/leftHand", "transforms/rightHand"]
         or semantics.get("robot_parent_frame_origins")
         != ["left_wrist_yaw_link", "right_wrist_yaw_link"]
-        or palm_offsets.shape != ROBOT_PALM_OFFSETS_LOCAL_M.shape
+        or semantics.get("source_transform_semantics")
+        != "wrist joint origins"
+        or semantics.get("uses_source_wrist_origins") is not True
+        or robot_palm_offsets.shape != (2, 3)
+        or source_palm_offsets.shape != (2, 3)
         or not np.array_equal(
-            palm_offsets,
-            ROBOT_PALM_OFFSETS_LOCAL_M,
+            robot_palm_offsets,
+            expected_robot_palm_offsets,
+        )
+        or not np.allclose(
+            scene_scale * source_palm_offsets,
+            robot_palm_offsets,
+            rtol=0.0,
+            atol=1e-12,
         )
         or semantics.get("matches_retarget_rigid_palm_action_frames")
         is not True
@@ -1396,38 +1522,62 @@ def _clear_stage(stage: Stage, plan: PipelinePlan) -> None:
                 "External camera alignment failed validation and is read-only"
             )
         assert stage.session is not None
-        _remove_exact(plan.config.alignment_root / stage.session)
-        _remove_exact(paths.alignment_reports / stage.session)
+        _remove_exact(
+            plan.config.alignment_root / stage.session,
+            owner_root=paths.root,
+        )
+        _remove_exact(
+            paths.alignment_reports / stage.session,
+            owner_root=paths.root,
+        )
     elif stage.name == "retarget":
-        _remove_exact(paths.lerobot)
+        _remove_exact(paths.lerobot, owner_root=paths.root)
     elif stage.name == "repaint":
-        _remove_exact(paths.handless)
+        _remove_exact(paths.handless, owner_root=paths.root)
     elif stage.name == "prepare":
         assert stage.episode_index is not None
         _remove_exact(
-            paths.prepared / f"episode_{stage.episode_index:06d}"
+            paths.prepared / f"episode_{stage.episode_index:06d}",
+            owner_root=paths.root,
         )
     elif stage.name == "render":
         assert stage.episode_index is not None
-        _remove_exact(paths.final / f"episode_{stage.episode_index:06d}")
+        _remove_exact(
+            paths.final / f"episode_{stage.episode_index:06d}",
+            owner_root=paths.root,
+        )
 
 
 def _clear_episode_intermediates(
     plan: PipelinePlan,
     episode_index: int,
 ) -> None:
-    _remove_exact(
-        plan.config.paths.prepared / f"episode_{episode_index:06d}"
-    )
-    _, handless_video = _repaint_episode_video_paths(plan, episode_index)
-    _remove_exact(handless_video)
+    targets = [
+        plan.config.paths.prepared / f"episode_{episode_index:06d}",
+    ]
+    errors: list[str] = []
+    try:
+        _, handless_video = _repaint_episode_video_paths(
+            plan,
+            episode_index,
+        )
+        targets.append(handless_video)
+    except Exception as exc:
+        errors.append(f"handless path: {type(exc).__name__}: {exc}")
     if not plan.config.alignment_is_external:
         clip = _clip_by_index(plan, episode_index)
-        _remove_exact(
+        targets.append(
             plan.config.alignment_root
             / clip.session
             / f"{clip.stem}.hdf5"
         )
+    for target in targets:
+        try:
+            _remove_exact(target, owner_root=plan.config.paths.root)
+        except Exception as exc:
+            errors.append(f"{target}: {type(exc).__name__}: {exc}")
+    if errors:
+        raise RuntimeError("; ".join(errors))
 
 
 def _run_stage(
@@ -1504,7 +1654,7 @@ def _new_report(plan: PipelinePlan) -> dict[str, Any]:
         "intermediate_retention": (
             "handless, prepared, and pipeline-owned alignment artifacts are "
             "removed after render; only LeRobot, final outputs, and this "
-            "report are retained"
+            "report are retained; validated final outputs remain resumable"
         ),
         "selected_clips": [
             {
@@ -1532,6 +1682,7 @@ def _new_report(plan: PipelinePlan) -> dict[str, Any]:
                 ),
                 "dependencies": list(stage.dependencies),
                 "input_fingerprint": None,
+                "retained_input_fingerprint": None,
                 "validation": None,
                 "started_at": None,
                 "finished_at": None,
@@ -1559,7 +1710,7 @@ def _initialize_output(plan: PipelinePlan) -> None:
         )
     if config.overwrite:
         for target in owned_targets:
-            _remove_exact(target)
+            _remove_exact(target, owner_root=paths.root)
     elif not config.resume:
         existing = [target for target in owned_targets if target.exists()]
         if existing:
@@ -1568,10 +1719,17 @@ def _initialize_output(plan: PipelinePlan) -> None:
                 + ", ".join(str(path) for path in existing)
             )
     paths.root.mkdir(parents=True, exist_ok=True)
-    _remove_exact(paths.root / "logs")
+    _remove_exact(paths.root / "logs", owner_root=paths.root)
 
 
 def execute(plan: PipelinePlan) -> dict[str, Any]:
+    _file_content_digest.cache_clear()
+    previous_report: dict[str, Any] = {}
+    if plan.config.resume and not plan.config.overwrite:
+        try:
+            previous_report = _read_json(plan.config.paths.report)
+        except Exception:
+            pass
     _initialize_output(plan)
     previous_stages = _load_previous_stages(
         plan.config.paths.report
@@ -1588,20 +1746,138 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
     }
     for stage_id, entry in report_by_id.items():
         previous = previous_stages.get(stage_id, {})
-        if previous.get("status") not in reusable_statuses:
+        if (
+            previous.get("status") not in reusable_statuses
+            or previous.get("command") != entry["command"]
+        ):
             continue
         for key in (
             "status",
             "input_fingerprint",
+            "retained_input_fingerprint",
             "validation",
             "started_at",
             "finished_at",
             "elapsed_seconds",
         ):
             entry[key] = previous.get(key)
+    commands_unchanged = bool(previous_stages) and all(
+        previous_stages.get(stage.stage_id, {}).get("command")
+        == (None if stage.command is None else list(stage.command))
+        for stage in plan.stages
+    )
+    retained_lerobot_valid = False
+    retained_render_indices: set[int] = set()
+    if plan.config.resume and commands_unchanged:
+        retarget_stage = next(
+            (stage for stage in plan.stages if stage.name == "retarget"),
+            None,
+        )
+        try:
+            alignment_inputs_unchanged = all(
+                previous_stages.get(stage.stage_id, {}).get(
+                    "retained_input_fingerprint"
+                )
+                == _stage_input_fingerprint(
+                    stage,
+                    plan,
+                    include_pruned_outputs=False,
+                )
+                for stage in plan.stages
+                if stage.name == "alignment"
+            )
+            retarget_inputs_unchanged = bool(
+                retarget_stage is not None
+                and previous_stages.get(retarget_stage.stage_id, {}).get(
+                    "input_fingerprint"
+                )
+                == _stage_input_fingerprint(retarget_stage, plan)
+            )
+        except Exception:
+            alignment_inputs_unchanged = False
+            retarget_inputs_unchanged = False
+        if (
+            retarget_stage is not None
+            and alignment_inputs_unchanged
+            and retarget_inputs_unchanged
+            and previous_stages.get(
+                retarget_stage.stage_id,
+                {},
+            ).get("status")
+            in reusable_statuses
+        ):
+            try:
+                _validate_retarget(
+                    plan,
+                    allow_pruned_alignment=(
+                        not plan.config.alignment_is_external
+                    ),
+                )
+                retained_lerobot_valid = True
+            except Exception:
+                pass
+        if retained_lerobot_valid:
+            for stage in plan.stages:
+                if (
+                    stage.name != "render"
+                    or stage.episode_index is None
+                    or previous_stages.get(stage.stage_id, {}).get("status")
+                    not in reusable_statuses
+                ):
+                    continue
+                try:
+                    if previous_stages.get(stage.stage_id, {}).get(
+                        "retained_input_fingerprint"
+                    ) != _retained_render_fingerprint(stage, plan):
+                        continue
+                    _validate_render(
+                        stage,
+                        plan,
+                        allow_pruned_prepared=True,
+                    )
+                except Exception:
+                    continue
+                retained_render_indices.add(stage.episode_index)
+    retained_stage_ids = {
+        stage.stage_id
+        for stage in plan.stages
+        if (
+            retained_lerobot_valid
+            and stage.name in {"alignment", "retarget"}
+        )
+        or (
+            stage.name == "repaint"
+            and len(retained_render_indices) == len(plan.clips)
+        )
+        or (
+            stage.name in {"prepare", "render"}
+            and stage.episode_index in retained_render_indices
+        )
+    }
     pipeline_started = time.perf_counter()
     changed: set[str] = set()
     skipped_by_episode: dict[int, dict[str, Any]] = {}
+    if commands_unchanged:
+        previous_skips = previous_report.get("skipped_episodes")
+        if not isinstance(previous_skips, list):
+            previous_skips = []
+        for skipped in previous_skips:
+            if (
+                not isinstance(skipped, dict)
+                or skipped.get("failed_stage") != "repaint"
+            ):
+                continue
+            try:
+                episode_index = int(skipped["episode_index"])
+                clip = _clip_by_index(plan, episode_index)
+            except (KeyError, TypeError, ValueError, IndexError):
+                continue
+            if (
+                skipped.get("session") == clip.session
+                and skipped.get("source_stem") == clip.stem
+            ):
+                skipped_by_episode[episode_index] = dict(skipped)
+    report["skipped_episodes"] = list(skipped_by_episode.values())
     dependents: dict[str, list[str]] = {}
     for planned_stage in plan.stages:
         for dependency in planned_stage.dependencies:
@@ -1619,8 +1895,11 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
             invalidated.add(current)
             pending.extend(dependents.get(current, ()))
         for invalidated_id in invalidated:
+            if invalidated_id in retained_stage_ids:
+                continue
             entry = report_by_id[invalidated_id]
             entry["input_fingerprint"] = None
+            entry["retained_input_fingerprint"] = None
             if invalidated_id != stage_id:
                 entry.update(
                     status="invalidated",
@@ -1731,6 +2010,44 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
         try:
             for stage in plan.stages:
                 entry = report_by_id[stage.stage_id]
+                retained_stage = (
+                    retained_lerobot_valid
+                    and stage.name in {"alignment", "retarget"}
+                ) or (
+                    stage.name == "repaint"
+                    and len(retained_render_indices) == len(plan.clips)
+                ) or (
+                    stage.name in {"prepare", "render"}
+                    and stage.episode_index in retained_render_indices
+                )
+                if retained_stage:
+                    now = _utc_now()
+                    previous = previous_stages.get(stage.stage_id, {})
+                    entry.update(
+                        status="reused",
+                        started_at=now,
+                        finished_at=now,
+                        elapsed_seconds=0.0,
+                        input_fingerprint=previous.get(
+                            "input_fingerprint"
+                        ),
+                        validation=(
+                            "retained output validated; intermediate artifact "
+                            "was intentionally pruned"
+                        ),
+                    )
+                    progress.update(1)
+                    report["updated_at"] = now
+                    report["elapsed_seconds"] = (
+                        time.perf_counter() - pipeline_started
+                    )
+                    _write_json_atomic(
+                        plan.config.paths.report,
+                        report,
+                    )
+                    if stage.name == "render":
+                        cleanup_completed_episode(stage)
+                    continue
                 if (
                     stage.episode_index is not None
                     and stage.episode_index in skipped_by_episode
@@ -1759,6 +2076,7 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
                         finished_at=now,
                         elapsed_seconds=0.0,
                         input_fingerprint=None,
+                        retained_input_fingerprint=None,
                         validation=(
                             f"episode skipped after {failed_stage} failed"
                             + (
@@ -1812,6 +2130,7 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
                             finished_at=now,
                             elapsed_seconds=0.0,
                             input_fingerprint=None,
+                            retained_input_fingerprint=None,
                             validation=error,
                         )
                         record_skipped_episode(
@@ -1860,6 +2179,11 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
                         if stage.name == "repaint"
                         else {}
                     )
+                    repaint_failures = {
+                        episode_index: failure
+                        for episode_index, failure in repaint_failures.items()
+                        if episode_index not in retained_render_indices
+                    }
                     for episode_index, failure in repaint_failures.items():
                         record_skipped_episode(
                             episode_index,
@@ -1868,6 +2192,19 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
                             failure_status=failure["status"],
                         )
                     now = _utc_now()
+                    retained_fingerprint = entry.get(
+                        "retained_input_fingerprint"
+                    )
+                    if stage.name == "alignment":
+                        retained_fingerprint = _stage_input_fingerprint(
+                            stage,
+                            plan,
+                            include_pruned_outputs=False,
+                        )
+                    elif stage.name == "render":
+                        retained_fingerprint = (
+                            _retained_render_fingerprint(stage, plan)
+                        )
                     entry.update(
                         status=(
                             "reused_with_skips"
@@ -1877,6 +2214,7 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
                         started_at=now,
                         finished_at=now,
                         elapsed_seconds=0.0,
+                        retained_input_fingerprint=retained_fingerprint,
                         validation=(
                             f"validated with {len(repaint_failures)} "
                             "skipped episode(s)"
@@ -1935,6 +2273,13 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
                             stage,
                             plan,
                         ),
+                        retained_input_fingerprint=(
+                            _stage_input_fingerprint(
+                                stage,
+                                plan,
+                                include_pruned_outputs=False,
+                            )
+                        ),
                         validation=reason,
                     )
                     progress.update(1)
@@ -1976,11 +2321,27 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
                         stage,
                         plan,
                     )
+                    retained_fingerprint = None
+                    if stage.name == "alignment":
+                        retained_fingerprint = _stage_input_fingerprint(
+                            stage,
+                            plan,
+                            include_pruned_outputs=False,
+                        )
+                    elif stage.name == "render":
+                        retained_fingerprint = (
+                            _retained_render_fingerprint(stage, plan)
+                        )
                     repaint_failures = (
                         _repaint_manifest(plan)[0]
                         if stage.name == "repaint"
                         else {}
                     )
+                    repaint_failures = {
+                        episode_index: failure
+                        for episode_index, failure in repaint_failures.items()
+                        if episode_index not in retained_render_indices
+                    }
                 except Exception as exc:
                     error = f"{type(exc).__name__}: {exc}"
                     entry.update(
@@ -2032,6 +2393,7 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
                     finished_at=_utc_now(),
                     elapsed_seconds=time.perf_counter() - stage_started,
                     input_fingerprint=completed_fingerprint,
+                    retained_input_fingerprint=retained_fingerprint,
                     validation=(
                         f"validated with {len(repaint_failures)} "
                         "skipped episode(s)"
@@ -2079,6 +2441,19 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
                     report["final_videos"]
                 )
             report["skipped_episode_count"] = len(skipped_by_episode)
+            for stage in plan.stages:
+                if stage.name == "alignment":
+                    try:
+                        retained_fingerprint = _stage_input_fingerprint(
+                            stage,
+                            plan,
+                            include_pruned_outputs=False,
+                        )
+                    except Exception:
+                        retained_fingerprint = None
+                    report_by_id[stage.stage_id][
+                        "retained_input_fingerprint"
+                    ] = retained_fingerprint
             _write_json_atomic(plan.config.paths.report, report)
             cleanup_targets = [plan.config.paths.root / "logs"]
             if plan.config.stop_after == "render":
@@ -2097,7 +2472,10 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
                     )
             for target in cleanup_targets:
                 try:
-                    _remove_exact(target)
+                    _remove_exact(
+                        target,
+                        owner_root=plan.config.paths.root,
+                    )
                 except Exception as exc:
                     report.setdefault("cleanup_errors", []).append(
                         {

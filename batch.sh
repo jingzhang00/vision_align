@@ -15,7 +15,7 @@ for source in "$EGODEX_SOURCE"/*; do
         exit 1
     }
     mkdir -p "$EGODEX_FIRST/$task"
-    ln -sfn "$source/0.hdf5" "$source/0.mp4" "$EGODEX_FIRST/$task/"
+    ln -f "$source/0.hdf5" "$source/0.mp4" "$EGODEX_FIRST/$task/"
     tasks+=("$task")
 done
 

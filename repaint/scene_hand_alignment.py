@@ -14,12 +14,12 @@ from human_to_robot.trajectory import (
     RIGID_PALM_TARGET,
 )
 from repaint.robot_camera import (
-    ROBOT_PALM_OFFSETS_LOCAL_M,
     ROBOT_WRIST_FRAMES,
     load_source_hand_tcp_points_camera_cv,
     load_source_palm_points_camera_cv,
     robot_frame_points_in_camera_cv,
     robot_hand_tcp_points_in_camera_cv,
+    robot_palm_offsets_local_m,
 )
 
 
@@ -430,6 +430,8 @@ def estimate_initial_palm_midpoint_translation(
     *,
     source_palm_camera_cv: np.ndarray,
     robot_palm_camera_cv: np.ndarray,
+    source_wrist_to_palm_offsets_local_m: np.ndarray,
+    robot_wrist_to_palm_offsets_local_m: np.ndarray,
     scene_camera_pose_cv_xyzw: np.ndarray,
     scene_scale: float,
     max_translation_m: float = 0.3,
@@ -440,6 +442,21 @@ def estimate_initial_palm_midpoint_translation(
     """Fit one XYZ translation between matching rigid-palm action frames."""
 
     source = np.asarray(source_palm_camera_cv, dtype=np.float64)
+    source_offsets = np.asarray(
+        source_wrist_to_palm_offsets_local_m,
+        dtype=np.float64,
+    )
+    robot_offsets = np.asarray(
+        robot_wrist_to_palm_offsets_local_m,
+        dtype=np.float64,
+    )
+    if (
+        source_offsets.shape != (2, 3)
+        or robot_offsets.shape != (2, 3)
+        or not np.isfinite(source_offsets).all()
+        or not np.isfinite(robot_offsets).all()
+    ):
+        raise ValueError("Palm offsets must be finite [2,3] arrays")
     translation_world, report, _ = (
         _estimate_initial_bilateral_midpoint_translation(
             source_anchor_camera_cv=source,
@@ -472,15 +489,24 @@ def estimate_initial_palm_midpoint_translation(
                     "transforms/rightHand",
                 ],
                 "source_action_mode": RIGID_PALM_TARGET,
+                "source_transform_semantics": "wrist joint origins",
+                "source_wrist_to_palm_offsets_local_m": (
+                    source_offsets.tolist()
+                ),
+                "source_palm_offset_policy": (
+                    "canonical G1 wrist-to-palm offsets divided by "
+                    "scene_scale before source scene scaling"
+                ),
                 "robot_parent_frame_origins": list(ROBOT_WRIST_FRAMES),
                 "robot_palm_local_offsets_m": (
-                    ROBOT_PALM_OFFSETS_LOCAL_M.tolist()
+                    robot_offsets.tolist()
                 ),
                 "robot_action_frames": ["left_palm", "right_palm"],
                 "bilateral_aggregation": (
                     "equal-weight midpoint of left and right palms"
                 ),
                 "matches_retarget_rigid_palm_action_frames": True,
+                "uses_source_wrist_origins": True,
                 "uses_fingertips": False,
                 "uses_hand_base_origins": False,
             },
@@ -651,12 +677,17 @@ def align_scene_camera_poses_to_initial_palms(
             f"{HAND_TARGET_MODE_ATTRIBUTE}={RIGID_PALM_TARGET!r}, "
             f"got {target_mode!r}"
         )
+    if not np.isfinite(scene_scale) or scene_scale <= 0.0:
+        raise ValueError("scene_scale must be positive and finite")
 
     initial_indices = frame_indices[:selected_count]
     initial_camera_pose = camera_pose[:selected_count]
+    robot_palm_offsets = robot_palm_offsets_local_m(urdf_path)
+    source_palm_offsets = robot_palm_offsets / scene_scale
     source_palm = load_source_palm_points_camera_cv(
         source_hdf5,
         initial_indices,
+        wrist_to_palm_offsets_local_m=source_palm_offsets,
     )
     robot_palm = robot_frame_points_in_camera_cv(
         urdf_path=urdf_path,
@@ -665,11 +696,13 @@ def align_scene_camera_poses_to_initial_palms(
         root_pose_xyzw=np.asarray(root_pose_xyzw)[:selected_count],
         camera_pose_cv_xyzw=initial_camera_pose,
         frame_names=ROBOT_WRIST_FRAMES,
-        frame_local_offsets_m=ROBOT_PALM_OFFSETS_LOCAL_M,
+        frame_local_offsets_m=robot_palm_offsets,
     )
     translation_world, report = estimate_initial_palm_midpoint_translation(
         source_palm_camera_cv=source_palm,
         robot_palm_camera_cv=robot_palm,
+        source_wrist_to_palm_offsets_local_m=source_palm_offsets,
+        robot_wrist_to_palm_offsets_local_m=robot_palm_offsets,
         scene_camera_pose_cv_xyzw=initial_camera_pose,
         scene_scale=scene_scale,
         max_translation_m=max_translation_m,
@@ -687,7 +720,8 @@ def align_scene_camera_poses_to_initial_palms(
             "window_source_frame_indices": initial_indices.tolist(),
             "hand_frame_mapping": {
                 "source": (
-                    "leftHand/rightHand rigid-palm action-frame origins"
+                    "leftHand/rightHand wrist origins plus scale-matched "
+                    "local palm offsets"
                 ),
                 "robot": (
                     "left/right wrist_yaw_link plus the canonical retarget "

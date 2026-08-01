@@ -198,7 +198,18 @@ def load_previous_stages(path: Path) -> dict[str, dict[str, Any]]:
     }
 
 
-def remove_exact(path: Path) -> None:
+def remove_exact(path: Path, *, owner_root: Path | None = None) -> None:
+    if owner_root is not None:
+        if owner_root.is_symlink():
+            raise ValueError(
+                f"Refusing to remove through symlinked owner: {owner_root}"
+            )
+        owner = owner_root.resolve()
+        parent = path.parent.resolve()
+        if parent != owner and not parent.is_relative_to(owner):
+            raise ValueError(
+                f"Refusing to remove path outside {owner}: {path}"
+            )
     if path.is_symlink() or path.is_file():
         path.unlink()
     elif path.is_dir():
@@ -237,6 +248,31 @@ def run_stage_process(
         env=environment,
         start_new_session=True,
     )
+
+    def terminate_process_group() -> None:
+        def signal_group(group_signal: signal.Signals) -> None:
+            while True:
+                try:
+                    os.killpg(process.pid, group_signal)
+                    return
+                except ProcessLookupError:
+                    return
+                except KeyboardInterrupt:
+                    continue
+
+        signal_group(signal.SIGTERM)
+        try:
+            process.wait(timeout=5)
+        except (subprocess.TimeoutExpired, KeyboardInterrupt):
+            pass
+        signal_group(signal.SIGKILL)
+        while True:
+            try:
+                process.wait()
+                return
+            except KeyboardInterrupt:
+                continue
+
     try:
         while True:
             try:
@@ -256,19 +292,8 @@ def run_stage_process(
             if return_code is not None:
                 break
     except BaseException:
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            pass
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        process.wait()
+        terminate_process_group()
         raise
     if return_code != 0:
+        terminate_process_group()
         raise RuntimeError(f"{stage_id} failed with exit code {return_code}")

@@ -144,7 +144,7 @@ def discover_source_episodes(source_root: Path) -> tuple[SourceEpisode, ...]:
     if not root.is_dir():
         raise FileNotFoundError(f"EgoDex task directory does not exist: {root}")
     hdf5_paths = sorted(
-        {path.resolve() for path in root.rglob("*.hdf5")},
+        set(root.rglob("*.hdf5")),
         key=lambda path: _natural_key(str(path.relative_to(root))),
     )
     if not hdf5_paths:
@@ -1043,23 +1043,38 @@ def _clear_stage_output(stage: Stage, plan: TaskPlan) -> None:
     else:
         raise ValueError(f"Unknown stage {stage.name!r}")
     for target in targets:
-        _remove_exact_path(target)
+        _remove_exact_path(target, owner_root=plan.paths.root)
 
 
 def _clear_episode_intermediates(
     plan: TaskPlan,
     episode_index: int,
 ) -> None:
-    _remove_exact_path(
-        plan.paths.prepared / f"episode_{episode_index:06d}"
-    )
-    _remove_exact_path(
-        plan.paths.handless
-        / "videos"
-        / VIDEO_KEY
-        / f"chunk-{episode_index // LEROBOT_CHUNKS_SIZE:03d}"
-        / f"file-{episode_index % LEROBOT_CHUNKS_SIZE:03d}.mp4"
-    )
+    targets = [
+        plan.paths.prepared / f"episode_{episode_index:06d}",
+    ]
+    errors: list[str] = []
+    try:
+        info = _read_json_object(plan.paths.lerobot / "meta/info.json")
+        chunks_size = int(info.get("chunks_size", LEROBOT_CHUNKS_SIZE))
+        if chunks_size <= 0:
+            raise ValueError("LeRobot chunks_size must be positive")
+        targets.append(
+            plan.paths.handless
+            / "videos"
+            / VIDEO_KEY
+            / f"chunk-{episode_index // chunks_size:03d}"
+            / f"file-{episode_index % chunks_size:03d}.mp4"
+        )
+    except Exception as exc:
+        errors.append(f"handless path: {type(exc).__name__}: {exc}")
+    for target in targets:
+        try:
+            _remove_exact_path(target, owner_root=plan.paths.root)
+        except Exception as exc:
+            errors.append(f"{target}: {type(exc).__name__}: {exc}")
+    if errors:
+        raise RuntimeError("; ".join(errors))
 
 
 def _command_text(command: Sequence[str]) -> str:
@@ -1097,7 +1112,8 @@ def _new_report(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
         },
         "intermediate_retention": (
             "handless and prepared episode artifacts are removed after render; "
-            "only LeRobot, final outputs, and this report are retained"
+            "only LeRobot, final outputs, and this report are retained; "
+            "validated final outputs remain resumable"
         ),
         "video_metadata_policy": {
             "source": "ffprobe each source MP4",
@@ -1183,6 +1199,12 @@ def _run_stage_process(
 def execute_task(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
     """Execute or resume one task with exactly one visible progress bar."""
 
+    previous_report: dict[str, Any] = {}
+    if config.resume and not config.overwrite:
+        try:
+            previous_report = _read_json_object(plan.paths.report)
+        except Exception:
+            pass
     if config.overwrite:
         _remove_exact_path(plan.paths.root)
     elif plan.paths.root.exists() and not config.resume:
@@ -1190,7 +1212,10 @@ def execute_task(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
             f"Task output already exists and resume is disabled: "
             f"{plan.paths.root}"
         )
-    _remove_exact_path(plan.paths.root / "logs")
+    _remove_exact_path(
+        plan.paths.root / "logs",
+        owner_root=plan.paths.root,
+    )
 
     previous_stages = _load_previous_stages(plan.paths.report)
     report = _new_report(plan, config)
@@ -1204,6 +1229,18 @@ def execute_task(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
     }
     for stage_id, entry in report_by_id.items():
         previous = previous_stages.get(stage_id, {})
+        if (
+            previous.get("status") in reusable_statuses
+            and previous.get("command") == entry["command"]
+        ):
+            for key in (
+                "status",
+                "validation",
+                "started_at",
+                "finished_at",
+                "elapsed_seconds",
+            ):
+                entry[key] = previous.get(key)
         last_command = previous.get("last_successful_command")
         if (
             last_command is None
@@ -1211,9 +1248,76 @@ def execute_task(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
         ):
             last_command = previous.get("command")
         entry["last_successful_command"] = last_command
+    commands_unchanged = bool(previous_stages) and all(
+        (
+            previous_stages.get(stage.stage_id, {}).get(
+                "last_successful_command"
+            )
+            or previous_stages.get(stage.stage_id, {}).get("command")
+        )
+        == list(stage.command)
+        for stage in plan.stages
+    )
+    retained_render_indices: set[int] = set()
+    if config.resume and commands_unchanged:
+        retarget_stage = next(
+            (stage for stage in plan.stages if stage.name == "retarget"),
+            None,
+        )
+        retarget_valid = bool(
+            retarget_stage is not None
+            and previous_stages.get(
+                retarget_stage.stage_id,
+                {},
+            ).get("status")
+            in reusable_statuses
+            and validate_stage_artifacts(retarget_stage, plan)[0]
+        )
+        if retarget_valid:
+            for stage in plan.stages:
+                if (
+                    stage.name == "render"
+                    and stage.episode_index is not None
+                    and previous_stages.get(stage.stage_id, {}).get("status")
+                    in reusable_statuses
+                    and validate_stage_artifacts(stage, plan)[0]
+                ):
+                    retained_render_indices.add(stage.episode_index)
+    retained_stage_ids = {
+        stage.stage_id
+        for stage in plan.stages
+        if (
+            stage.name == "repaint"
+            and len(retained_render_indices) == len(plan.episodes)
+        )
+        or (
+            stage.name in {"prepare", "render"}
+            and stage.episode_index in retained_render_indices
+        )
+    }
     task_started = time.perf_counter()
     changed: set[str] = set()
     skipped_by_episode: dict[int, dict[str, Any]] = {}
+    if commands_unchanged:
+        previous_skips = previous_report.get("skipped_episodes")
+        if not isinstance(previous_skips, list):
+            previous_skips = []
+        for skipped in previous_skips:
+            if (
+                not isinstance(skipped, dict)
+                or skipped.get("failed_stage") != "repaint"
+            ):
+                continue
+            try:
+                episode_index = int(skipped["episode_index"])
+                if not 0 <= episode_index < len(plan.episodes):
+                    continue
+                episode = plan.episodes[episode_index]
+            except (KeyError, TypeError, ValueError, IndexError):
+                continue
+            if skipped.get("source_stem") == episode.stem:
+                skipped_by_episode[episode_index] = dict(skipped)
+    report["skipped_episodes"] = list(skipped_by_episode.values())
     dependents: dict[str, list[str]] = {}
     for planned_stage in plan.stages:
         for dependency in planned_stage.dependencies:
@@ -1231,6 +1335,8 @@ def execute_task(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
             invalidated.add(current)
             pending.extend(dependents.get(current, ()))
         for invalidated_id in invalidated:
+            if invalidated_id in retained_stage_ids:
+                continue
             entry = report_by_id[invalidated_id]
             entry["last_successful_command"] = None
             if invalidated_id != stage_id:
@@ -1314,6 +1420,35 @@ def execute_task(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
         try:
             for stage in plan.stages:
                 stage_entry = report_by_id[stage.stage_id]
+                retained_stage = (
+                    stage.name == "repaint"
+                    and len(retained_render_indices) == len(plan.episodes)
+                ) or (
+                    stage.name in {"prepare", "render"}
+                    and stage.episode_index in retained_render_indices
+                )
+                if retained_stage:
+                    now = _utc_now()
+                    stage_entry.update(
+                        status="reused",
+                        started_at=now,
+                        finished_at=now,
+                        elapsed_seconds=0.0,
+                        last_successful_command=list(stage.command),
+                        validation=(
+                            "retained final validated; intermediate artifact "
+                            "was intentionally pruned"
+                        ),
+                    )
+                    progress.update(1)
+                    report["updated_at"] = now
+                    report["elapsed_seconds"] = (
+                        time.perf_counter() - task_started
+                    )
+                    _write_json_atomic(plan.paths.report, report)
+                    if stage.name == "render":
+                        cleanup_completed_episode(stage)
+                    continue
                 if (
                     stage.episode_index is not None
                     and stage.episode_index in skipped_by_episode
@@ -1387,6 +1522,11 @@ def execute_task(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
                         if stage.name == "repaint"
                         else {}
                     )
+                    repaint_failures = {
+                        episode_index: failure
+                        for episode_index, failure in repaint_failures.items()
+                        if episode_index not in retained_render_indices
+                    }
                     for episode_index, failure in repaint_failures.items():
                         record_skipped_episode(
                             episode_index,
@@ -1511,6 +1651,11 @@ def execute_task(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
                     if stage.name == "repaint"
                     else {}
                 )
+                repaint_failures = {
+                    episode_index: failure
+                    for episode_index, failure in repaint_failures.items()
+                    if episode_index not in retained_render_indices
+                }
                 for episode_index, failure in repaint_failures.items():
                     record_skipped_episode(
                         episode_index,
@@ -1581,7 +1726,10 @@ def execute_task(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
                 plan.paths.root / "logs",
             ):
                 try:
-                    _remove_exact_path(target)
+                    _remove_exact_path(
+                        target,
+                        owner_root=plan.paths.root,
+                    )
                 except Exception as exc:
                     report.setdefault("cleanup_errors", []).append(
                         {

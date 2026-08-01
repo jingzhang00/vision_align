@@ -22,6 +22,14 @@ from scipy.spatial.transform import Rotation
 
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
+ISAAC_NO_LOG_ARGS = (
+    "--/log/enabled=false",
+    "--/log/file=/dev/null",
+    "--/structuredLog/enable=false",
+    "--/telemetry/enableAnonymousData=false",
+    "--/telemetry/log/file=/dev/null",
+    "--/app/enableStdoutOutput=0",
+)
 if str(WORKSPACE_ROOT) not in sys.path:
     sys.path.insert(0, str(WORKSPACE_ROOT))
 
@@ -1431,11 +1439,7 @@ def render(args: argparse.Namespace) -> dict[str, object]:
             "width": render_width,
             "height": render_height,
             "enable_crashreporter": False,
-            "extra_args": [
-                "--/log/enabled=false",
-                "--/log/file=/dev/null",
-                "--/app/enableStdoutOutput=0",
-            ],
+            "extra_args": list(ISAAC_NO_LOG_ARGS),
         }
     )
     writer: cv2.VideoWriter | None = None

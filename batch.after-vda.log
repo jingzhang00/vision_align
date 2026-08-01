@@ -1,0 +1,22 @@
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/home/ai01/Downloads/vision_align/repaint/egodex/egodex_vda_pipeline.py", line 1835, in <module>
+    main()
+  File "/home/ai01/Downloads/vision_align/repaint/egodex/egodex_vda_pipeline.py", line 1831, in main
+    run_pipeline(args.tasks, config)
+  File "/home/ai01/Downloads/vision_align/repaint/egodex/egodex_vda_pipeline.py", line 1770, in run_pipeline
+    plan = build_task_plan(task, config)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ai01/Downloads/vision_align/repaint/egodex/egodex_vda_pipeline.py", line 191, in build_task_plan
+    episodes = discover_source_episodes(source_root)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ai01/Downloads/vision_align/repaint/egodex/egodex_vda_pipeline.py", line 146, in discover_source_episodes
+    hdf5_paths = sorted(
+                 ^^^^^^^
+  File "/home/ai01/Downloads/vision_align/repaint/egodex/egodex_vda_pipeline.py", line 148, in <lambda>
+    key=lambda path: _natural_key(str(path.relative_to(root))),
+                                      ^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ai01/.local/share/uv/python/cpython-3.11.15-linux-x86_64-gnu/lib/python3.11/pathlib.py", line 730, in relative_to
+    raise ValueError("{!r} is not in the subpath of {!r}"
+ValueError: '/home/ai01/Downloads/vision_align/dataset/egodex_test/add_remove_lid/0.hdf5' is not in the subpath of '/home/ai01/Downloads/vision_align/dataset/.egodex_test_first/add_remove_lid' OR one path is relative and the other is absolute.

@@ -83,10 +83,11 @@ CROSS_HAND_COLLISION_TOLERANCE_M = 1e-4
 CROSS_HAND_NEAR_CLEARANCE_M = 2e-3
 GMR_CROSS_HAND_PLANNING_CLEARANCE_M = 1.5e-2
 GMR_CROSS_HAND_DETECTION_DISTANCE_M = 5e-1
-# Mink applies ``gain * (distance - minimum) / dt``. With the imported
-# URDF's 2 ms timestep, 2e-4 gives a 0.1 discrete contraction factor instead
-# of allowing a single linearized IK step to jump through the collision set.
-GMR_CROSS_HAND_AVOIDANCE_GAIN = 2e-4
+# Mink applies this dimensionless gain once per IK iteration.
+GMR_CROSS_HAND_AVOIDANCE_GAIN = 0.85
+# Finger states change before each body solve, so restore any penetration they
+# introduce instead of merely preventing it from deepening.
+GMR_CROSS_HAND_RESTORATION_SPEED_M_S = 0.25
 GMR_COLLISION_PHASE1_MAX_ITERATIONS = 3
 GMR_COLLISION_PHASE2_MAX_ITERATIONS = 5
 GMR_NEUTRAL_PELVIS_HEIGHT_M = 0.793
@@ -431,6 +432,7 @@ def _configure_gmr_hand_constraints(
             collision_detection_distance=(
                 GMR_CROSS_HAND_DETECTION_DISTANCE_M
             ),
+            bound_relaxation=-GMR_CROSS_HAND_RESTORATION_SPEED_M_S,
         )
     )
     geometry_pairs = tuple(
@@ -459,8 +461,9 @@ def _configure_gmr_hand_constraints(
         "planning_clearance_m": GMR_CROSS_HAND_PLANNING_CLEARANCE_M,
         "detection_distance_m": GMR_CROSS_HAND_DETECTION_DISTANCE_M,
         "avoidance_gain": GMR_CROSS_HAND_AVOIDANCE_GAIN,
-        "avoidance_discrete_gain": (
-            GMR_CROSS_HAND_AVOIDANCE_GAIN / retarget.model.opt.timestep
+        "avoidance_discrete_gain": GMR_CROSS_HAND_AVOIDANCE_GAIN,
+        "penetration_restoration_speed_m_s": (
+            GMR_CROSS_HAND_RESTORATION_SPEED_M_S
         ),
         "finger_dofs_frozen_during_body_ik": True,
         "collision_solver": (

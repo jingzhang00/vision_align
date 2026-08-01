@@ -11,7 +11,7 @@ from scipy.spatial.transform import Rotation
 
 from human_to_robot.retarget_g1_pinocchio import (
     HAND_TIP_LOCAL_OFFSETS,
-    PALM_OFFSET_FROM_WRIST,
+    build_pinocchio_g1,
 )
 
 
@@ -83,11 +83,25 @@ ROBOT_HAND_TCP_OFFSETS_LOCAL_M = np.asarray(
 )
 SOURCE_PALM_TRANSFORMS = ("leftHand", "rightHand")
 ROBOT_WRIST_FRAMES = ("left_wrist_yaw_link", "right_wrist_yaw_link")
-ROBOT_PALM_OFFSETS_LOCAL_M = np.repeat(
-    PALM_OFFSET_FROM_WRIST[None],
-    len(ROBOT_WRIST_FRAMES),
-    axis=0,
-)
+ROBOT_PALM_FRAMES = ("left_palm", "right_palm")
+
+
+def robot_palm_offsets_local_m(urdf_path: Path) -> np.ndarray:
+    """Read the canonical wrist-to-palm offsets from the G1 model."""
+
+    model = build_pinocchio_g1(urdf_path)
+    offsets = np.empty((2, 3), dtype=np.float64)
+    for index, (wrist_name, palm_name) in enumerate(
+        zip(ROBOT_WRIST_FRAMES, ROBOT_PALM_FRAMES, strict=True)
+    ):
+        wrist = model.frames[model.getFrameId(wrist_name)]
+        palm = model.frames[model.getFrameId(palm_name)]
+        if wrist.parent != palm.parent:
+            raise ValueError(f"{palm_name} is not fixed to {wrist_name}")
+        offsets[index] = (
+            wrist.placement.inverse() * palm.placement
+        ).translation
+    return offsets
 
 
 def _continuous_xyzw(quaternions: np.ndarray) -> np.ndarray:
@@ -308,8 +322,10 @@ def load_source_hand_tcp_points_camera_cv(
 def load_source_palm_points_camera_cv(
     source_hdf5: Path,
     frame_indices: np.ndarray,
+    *,
+    wrist_to_palm_offsets_local_m: np.ndarray,
 ) -> np.ndarray:
-    """Return ``leftHand/rightHand`` under the rigid-palm action contract."""
+    """Convert Nymeria ``leftHand/rightHand`` wrists to palm points."""
 
     source_hdf5 = source_hdf5.resolve()
     if not source_hdf5.is_file():
@@ -319,6 +335,12 @@ def load_source_palm_points_camera_cv(
         raise ValueError("frame_indices must be a non-empty vector")
     if np.any(frame_indices < 0):
         raise ValueError("frame_indices must be non-negative")
+    palm_offsets = np.asarray(
+        wrist_to_palm_offsets_local_m,
+        dtype=np.float64,
+    )
+    if palm_offsets.shape != (2, 3) or not np.isfinite(palm_offsets).all():
+        raise ValueError("wrist-to-palm offsets must be finite [2,3]")
 
     with h5py.File(source_hdf5, "r") as handle:
         camera = np.asarray(handle["transforms/camera"], dtype=np.float64)
@@ -327,7 +349,7 @@ def load_source_palm_points_camera_cv(
                 "transforms/camera must have shape [frames,4,4]"
             )
         palm_values: list[np.ndarray] = []
-        for name in SOURCE_PALM_TRANSFORMS:
+        for side_index, name in enumerate(SOURCE_PALM_TRANSFORMS):
             key = f"transforms/{name}"
             transforms = np.asarray(handle[key], dtype=np.float64)
             if transforms.shape != camera.shape:
@@ -335,7 +357,14 @@ def load_source_palm_points_camera_cv(
                     f"{key} must have shape {camera.shape}, "
                     f"got {transforms.shape}"
                 )
-            palm_values.append(transforms[:, :3, 3])
+            palm_values.append(
+                transforms[:, :3, 3]
+                + np.einsum(
+                    "nij,j->ni",
+                    transforms[:, :3, :3],
+                    palm_offsets[side_index],
+                )
+            )
 
     if int(frame_indices.max()) >= len(camera):
         raise IndexError("source palm frame index is out of range")
