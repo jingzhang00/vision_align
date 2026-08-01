@@ -143,6 +143,7 @@ class PipelineConfig:
     vda_checkpoint: Path | None
     stop_after: str
     poll_seconds: float
+    retain_intermediates: bool = False
 
 
 @dataclass(frozen=True)
@@ -1699,15 +1700,21 @@ def _new_report(plan: PipelinePlan) -> dict[str, Any]:
         "stop_after": config.stop_after,
         "resume": config.resume,
         "overwrite": config.overwrite,
+        "retain_intermediates": config.retain_intermediates,
         "episode_failure_policy": (
             "repaint manifest failures are terminal skips on resume; "
             "prepare/render exceptions are retried on the next run"
         ),
         "intermediate_retention": (
-            "handless, prepared, and pipeline-owned alignment artifacts are "
-            "removed after render; only LeRobot, final outputs, and this "
-            "report are retained; failed prepare/render inputs are retained "
-            "for retry"
+            "alignment, LeRobot, handless, prepared, and final artifacts are "
+            "retained"
+            if config.retain_intermediates
+            else (
+                "handless, prepared, and pipeline-owned alignment artifacts "
+                "are removed after render; only LeRobot, final outputs, and "
+                "this report are retained; failed prepare/render inputs are "
+                "retained for retry"
+            )
         ),
         "failed_episodes_file": str(
             config.paths.root / "failed_episodes.json"
@@ -2047,22 +2054,25 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
                 "recorded_at": _utc_now(),
             },
         )
-        try:
-            if stage.name in {"prepare", "render"}:
-                _clear_stage(stage, plan)
-            else:
-                _clear_episode_intermediates(plan, episode_index)
-        except Exception as exc:
-            skipped.setdefault("cleanup_errors", []).append(
-                {
-                    "stage": stage.stage_id,
-                    "error": f"{type(exc).__name__}: {exc}",
-                }
-            )
+        if not plan.config.retain_intermediates:
+            try:
+                if stage.name in {"prepare", "render"}:
+                    _clear_stage(stage, plan)
+                else:
+                    _clear_episode_intermediates(plan, episode_index)
+            except Exception as exc:
+                skipped.setdefault("cleanup_errors", []).append(
+                    {
+                        "stage": stage.stage_id,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
         report["skipped_episodes"] = list(skipped_by_episode.values())
 
     def cleanup_completed_episode(stage: Stage) -> None:
         assert stage.episode_index is not None
+        if plan.config.retain_intermediates:
+            return
         try:
             _clear_episode_intermediates(plan, stage.episode_index)
         except Exception as exc:
@@ -2559,13 +2569,21 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
                         "retained_input_fingerprint"
                     ] = retained_fingerprint
             persist_report()
-            cleanup_targets = [plan.config.paths.root / "logs"]
+            cleanup_targets = (
+                []
+                if plan.config.retain_intermediates
+                else [plan.config.paths.root / "logs"]
+            )
             retryable_failure = any(
                 report_by_id[skipped["failed_stage"]]["name"]
                 in {"prepare", "render"}
                 for skipped in skipped_by_episode.values()
             )
-            if plan.config.stop_after == "render" and not retryable_failure:
+            if (
+                not plan.config.retain_intermediates
+                and plan.config.stop_after == "render"
+                and not retryable_failure
+            ):
                 cleanup_targets.extend(
                     [
                         plan.config.paths.handless,
