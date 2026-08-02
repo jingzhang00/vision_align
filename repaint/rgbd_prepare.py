@@ -40,6 +40,7 @@ from repaint.vda_depth import (  # noqa: E402
     validate_metric_checkpoint,
 )
 from repaint.vda_scale_validation import (  # noqa: E402
+    estimate_semidense_handless_metric_scale,
     infer_and_estimate_handless_metric_scale,
 )
 
@@ -167,20 +168,36 @@ def _resolve_episode_metric_scale(
             "scale_excludes_scene_scale": True,
         }
 
-    calibration = infer_and_estimate_handless_metric_scale(
-        original_video=episode.source_video,
-        handless_video=episode.removed_video,
-        source_hdf5=episode.source_hdf5,
-        frame_indices=episode.frame_indices,
-        handless_decoded=handless_decoded,
-        handless_depth_raw_m=handless_depth_raw_m,
-        checkpoint=checkpoint,
-        encoder=args.vda_encoder,
-        input_size=args.vda_input_size,
-        max_resolution=args.vda_max_resolution,
-        fp32=args.vda_fp32,
-        mask_dir=args.vda_scale_mask_dir,
-    )
+    if episode.source_dataset_kind == "nymeria":
+        calibration = estimate_semidense_handless_metric_scale(
+            original_video=episode.source_video,
+            handless_video=episode.removed_video,
+            source_hdf5=episode.source_hdf5,
+            semidense_points=(
+                episode.source_video.parents[1]
+                / "recording_head/mps/slam/semidense_points.csv.gz"
+            ),
+            frame_indices=episode.frame_indices,
+            handless_depth_raw_m=handless_depth_raw_m,
+            source_size=handless_decoded.source_size,
+            inference_size=handless_decoded.inference_size,
+            mask_dir=args.vda_scale_mask_dir,
+        )
+    else:
+        calibration = infer_and_estimate_handless_metric_scale(
+            original_video=episode.source_video,
+            handless_video=episode.removed_video,
+            source_hdf5=episode.source_hdf5,
+            frame_indices=episode.frame_indices,
+            handless_decoded=handless_decoded,
+            handless_depth_raw_m=handless_depth_raw_m,
+            checkpoint=checkpoint,
+            encoder=args.vda_encoder,
+            input_size=args.vda_input_size,
+            max_resolution=args.vda_max_resolution,
+            fp32=args.vda_fp32,
+            mask_dir=args.vda_scale_mask_dir,
+        )
     status = str(calibration["decision"]["status"])
     if status == "validated":
         calibration["requested_mode"] = "auto"
@@ -280,8 +297,7 @@ def prepare(args: argparse.Namespace) -> dict[str, object]:
         input_size=args.vda_input_size,
         fp32=args.vda_fp32,
     )
-    # The matching original-video pass only needs handless metadata. Avoid
-    # retaining two complete RGB sequences at once.
+    # Scale calibration only needs handless metadata after inference.
     decoded = decoded.without_rgb_frames()
     resolved_vda_metric_scale, scale_calibration = (
         _resolve_episode_metric_scale(
@@ -324,10 +340,15 @@ def prepare(args: argparse.Namespace) -> dict[str, object]:
         "raw_depth": "metric camera-Z meters",
         "vda_metric_scale": resolved_vda_metric_scale,
         "vda_metric_scale_source": (
-            "automatic per-episode HDF5 hand anchor plus unchanged "
-            "background transfer"
-            if scale_calibration["resolved_mode"] == "auto"
-            else "explicit fixed value or explicitly allowed fallback"
+            "explicit fixed value or explicitly allowed fallback"
+            if scale_calibration["resolved_mode"] != "auto"
+            else (
+                "automatic per-episode Aria MPS semidense background anchor"
+                if scale_calibration.get("method")
+                == "aria-mps-semidense-background-depth"
+                else "automatic per-episode HDF5 hand anchor plus unchanged "
+                "background transfer"
+            )
         ),
         "vda_scale_calibration": scale_calibration,
         "vda_metric_scale_application_count": 1,
@@ -634,8 +655,8 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("auto", "fixed"),
         default="auto",
         help=(
-            "Estimate one per-episode VDA-to-source metric scale from the "
-            "original video and HDF5 hand anchors, or use a fixed value "
+            "Estimate one per-episode VDA-to-source metric scale from an "
+            "available metric anchor, or use a fixed value "
             "(default: auto)"
         ),
     )
@@ -661,7 +682,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--vda-scale-mask-dir",
         type=Path,
         help=(
-            "Optional hand-mask PNG directory indexed by source frame; "
+            "Optional changed-region PNG directory indexed by source frame; "
             "default derives the changed region from original/handless RGB"
         ),
     )

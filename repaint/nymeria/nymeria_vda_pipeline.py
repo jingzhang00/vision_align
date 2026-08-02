@@ -365,6 +365,13 @@ def _stage_input_fingerprint(
                     plan,
                     stage.episode_index,
                 )
+            if plan.clips:
+                clip = _clip_by_index(plan, stage.episode_index)
+                _update_path_fingerprint(
+                    digest,
+                    clip.source.video_path.parents[1]
+                    / "recording_head/mps/slam/semidense_points.csv.gz",
+                )
             _update_path_fingerprint(
                 digest,
                 plan.config.vda_checkpoint or DEFAULT_CHECKPOINT,
@@ -1124,6 +1131,11 @@ def _validate_prepared(stage: Stage, plan: PipelinePlan) -> None:
         raise ValueError("Prepared report has no VDA scale calibration")
     if scale_calibration.get("requested_mode") != "auto":
         raise ValueError("Nymeria VDA scale was not requested automatically")
+    if (
+        scale_calibration.get("method")
+        != "aria-mps-semidense-background-depth"
+    ):
+        raise ValueError("Nymeria VDA scale did not use Aria semidense points")
     resolved_scale_mode = str(scale_calibration.get("resolved_mode", ""))
     if resolved_scale_mode not in {"auto", "fixed_fallback"}:
         raise ValueError("Prepared VDA scale mode is invalid")

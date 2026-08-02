@@ -6,8 +6,8 @@ pipeline.  It keeps the two scale conversions separate:
 * raw VDA depth -> source-camera meters, estimated from the original video;
 * source-camera meters -> robot/world scale, owned by the caller.
 
-The original-video estimate is transferred to the handless prediction using
-unchanged background pixels.
+Hand anchors are transferred through unchanged pixels. Datasets with a metric
+background map instead calibrate the handless prediction directly.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from typing import Any
 import cv2
 import h5py
 import numpy as np
+import pandas as pd
 
 from human_to_robot.trajectory import HAND_LANDMARK_NAMES
 from repaint.vda_depth import (
@@ -34,6 +35,10 @@ from repaint.vda_depth import (
 
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
+SEMIDENSE_DISTANCE_STD_MAX_M = 0.05
+SEMIDENSE_INVERSE_DISTANCE_STD_MAX = 0.01
+SEMIDENSE_SAMPLE_STRIDE = 32
+SEMIDENSE_MAX_POINTS = 50_000
 
 
 def _video_metadata(path: Path) -> tuple[int, int, int, float]:
@@ -367,19 +372,29 @@ def _scaled_intrinsic(
     return result
 
 
-def _load_hdf5_geometry(
+def _maximum_camera_baseline(camera_to_world: np.ndarray) -> float:
+    translations = camera_to_world[:, :3, 3]
+    squared_norm = np.einsum("ni,ni->n", translations, translations)
+    maximum_squared = 0.0
+    for start in range(0, len(translations), 256):
+        stop = min(start + 256, len(translations))
+        squared_distance = (
+            squared_norm[start:stop, None]
+            + squared_norm[None, :]
+            - 2.0 * translations[start:stop] @ translations.T
+        )
+        maximum_squared = max(
+            maximum_squared,
+            float(np.max(squared_distance)),
+        )
+    return float(math.sqrt(max(0.0, maximum_squared)))
+
+
+def _load_hdf5_camera_geometry(
     path: Path,
     *,
     frame_indices: np.ndarray | None = None,
-) -> tuple[
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    tuple[str, ...],
-    float,
-    int,
-]:
+) -> tuple[np.ndarray, np.ndarray, float, int]:
     selected = (
         None
         if frame_indices is None
@@ -407,6 +422,39 @@ def _load_hdf5_geometry(
         camera_to_world = np.asarray(
             camera_dataset[selection],
             dtype=np.float64,
+        )
+    return (
+        intrinsic,
+        camera_to_world,
+        _maximum_camera_baseline(camera_to_world),
+        frame_count,
+    )
+
+
+def _load_hdf5_geometry(
+    path: Path,
+    *,
+    frame_indices: np.ndarray | None = None,
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    tuple[str, ...],
+    float,
+    int,
+]:
+    selected = None if frame_indices is None else validate_frame_indices(
+        frame_indices
+    )
+    intrinsic, camera_to_world, max_baseline, frame_count = (
+        _load_hdf5_camera_geometry(path, frame_indices=selected)
+    )
+    with h5py.File(path, "r") as handle:
+        selection = (
+            slice(None)
+            if selected is None
+            else slice(int(selected[0]), int(selected[-1]) + 1)
         )
         transform_values: list[np.ndarray] = []
         confidence_values: list[np.ndarray] = []
@@ -464,23 +512,6 @@ def _load_hdf5_geometry(
         world_to_camera,
         homogeneous,
     )[..., :3]
-    translations = camera_to_world[:, :3, 3]
-    # Exact maximum pairwise baseline with bounded memory. The Gram-matrix
-    # form avoids materializing an N x N x 3 tensor.
-    squared_norm = np.einsum("ni,ni->n", translations, translations)
-    maximum_squared = 0.0
-    for start in range(0, len(translations), 256):
-        stop = min(start + 256, len(translations))
-        squared_distance = (
-            squared_norm[start:stop, None]
-            + squared_norm[None, :]
-            - 2.0 * translations[start:stop] @ translations.T
-        )
-        maximum_squared = max(
-            maximum_squared,
-            float(np.max(squared_distance)),
-        )
-    max_baseline = float(math.sqrt(max(0.0, maximum_squared)))
     return (
         intrinsic,
         camera_to_world,
@@ -1148,6 +1179,401 @@ def _analyze(
         },
     }
     return result
+
+
+def _load_semidense_points(path: Path) -> tuple[np.ndarray, dict[str, Any]]:
+    columns = (
+        "px_world",
+        "py_world",
+        "pz_world",
+        "inv_dist_std",
+        "dist_std",
+    )
+    sampled: list[np.ndarray] = []
+    row_count = 0
+    quality_count = 0
+    for chunk in pd.read_csv(
+        path,
+        usecols=list(columns),
+        chunksize=250_000,
+    ):
+        row_count += len(chunk)
+        values = chunk.to_numpy(dtype=np.float64)
+        quality = (
+            np.isfinite(values).all(axis=1)
+            & (values[:, 3] <= SEMIDENSE_INVERSE_DISTANCE_STD_MAX)
+            & (values[:, 4] <= SEMIDENSE_DISTANCE_STD_MAX_M)
+        )
+        quality_count += int(np.count_nonzero(quality))
+        keep = quality & (
+            chunk.index.to_numpy(dtype=np.int64) % SEMIDENSE_SAMPLE_STRIDE == 0
+        )
+        if np.any(keep):
+            sampled.append(values[keep, :3])
+    if not sampled:
+        raise ValueError(f"No reliable semidense points in {path}")
+    points = np.concatenate(sampled)
+    if len(points) > SEMIDENSE_MAX_POINTS:
+        points = points[
+            np.linspace(
+                0,
+                len(points) - 1,
+                SEMIDENSE_MAX_POINTS,
+                dtype=np.int64,
+            )
+        ]
+    return points, {
+        "source_row_count": row_count,
+        "quality_row_count": quality_count,
+        "sampled_point_count": len(points),
+        "sampling_stride": SEMIDENSE_SAMPLE_STRIDE,
+        "maximum_sampled_points": SEMIDENSE_MAX_POINTS,
+        "maximum_distance_std_m": SEMIDENSE_DISTANCE_STD_MAX_M,
+        "maximum_inverse_distance_std": (
+            SEMIDENSE_INVERSE_DISTANCE_STD_MAX
+        ),
+    }
+
+
+def _semidense_frame_ratios(
+    *,
+    points_world: np.ndarray,
+    world_to_camera: np.ndarray,
+    intrinsic: np.ndarray,
+    depth: np.ndarray,
+    background: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    points_camera = (
+        points_world @ world_to_camera[:3, :3].T
+        + world_to_camera[:3, 3]
+    )
+    z = points_camera[:, 2]
+    height, width = depth.shape
+    projectable = (
+        np.isfinite(points_camera).all(axis=1)
+        & (z > 0.1)
+        & (z < 20.0)
+    )
+    points_camera = points_camera[projectable]
+    z = z[projectable]
+    if not len(z):
+        return np.empty(0), np.empty(0), 0
+    u = intrinsic[0, 0] * points_camera[:, 0] / z + intrinsic[0, 2]
+    v = intrinsic[1, 1] * points_camera[:, 1] / z + intrinsic[1, 2]
+    x = np.rint(u).astype(np.int64)
+    y = np.rint(v).astype(np.int64)
+    visible = (
+        (x >= 0)
+        & (x < width)
+        & (y >= 0)
+        & (y < height)
+    )
+    x = x[visible]
+    y = y[visible]
+    z = z[visible]
+    if not len(z):
+        return np.empty(0), np.empty(0), 0
+
+    # Keep the closest map point at each pixel so hidden surfaces cannot vote.
+    pixel = y * width + x
+    order = np.lexsort((z, pixel))
+    pixel = pixel[order]
+    first = np.r_[True, pixel[1:] != pixel[:-1]]
+    x = x[order][first]
+    y = y[order][first]
+    z = z[order][first]
+    projected_count = len(z)
+    predicted = np.asarray(depth[y, x], dtype=np.float64)
+    usable = (
+        background[y, x]
+        & np.isfinite(predicted)
+        & (predicted > 0.0)
+    )
+    ratios = z[usable] / predicted[usable]
+    valid = np.isfinite(ratios) & (ratios > 0.0)
+    return ratios[valid], z[usable][valid], projected_count
+
+
+def _analyze_semidense(
+    *,
+    original_video: Path,
+    handless_video: Path,
+    mask_dir: Path | None,
+    handless_depth: np.ndarray,
+    source_size: tuple[int, int],
+    inference_size: tuple[int, int],
+    intrinsic: np.ndarray,
+    camera_to_world: np.ndarray,
+    points_world: np.ndarray,
+    frame_indices: np.ndarray,
+) -> dict[str, Any]:
+    selected = validate_frame_indices(frame_indices)
+    frame_count = len(selected)
+    if handless_depth.shape[0] != frame_count:
+        raise ValueError("frame_indices and VDA frame counts disagree")
+    if camera_to_world.shape != (frame_count, 4, 4):
+        raise ValueError("Camera and VDA frame counts disagree")
+    scaled_k = _scaled_intrinsic(
+        intrinsic,
+        source_size=source_size,
+        target_size=inference_size,
+    )
+    explicit_masks = _mask_paths(mask_dir, selected)
+    original_capture = _open_video(original_video)
+    handless_capture = _open_video(handless_video)
+    _seek_capture(
+        original_capture,
+        start_frame=int(selected[0]),
+        path=original_video,
+    )
+    _seek_capture(
+        handless_capture,
+        start_frame=int(selected[0]),
+        path=handless_video,
+    )
+    world_to_camera = np.linalg.inv(camera_to_world)
+    scale_frame_medians = np.full(frame_count, np.nan, dtype=np.float64)
+    scale_frame_log_mads = np.full(frame_count, np.nan, dtype=np.float64)
+    depth_frame_medians = np.full(frame_count, np.nan, dtype=np.float64)
+    background_depth_frame_medians = np.full(
+        frame_count,
+        np.nan,
+        dtype=np.float64,
+    )
+    raw_sample_count = 0
+    background_raw_sample_count = 0
+    projected_counts = np.zeros(frame_count, dtype=np.int64)
+    usable_counts = np.zeros(frame_count, dtype=np.int64)
+    unchanged_coverages = np.zeros(frame_count, dtype=np.float64)
+    try:
+        for frame_id in range(frame_count):
+            original_rgb = _read_resized_rgb(
+                original_capture,
+                size=inference_size,
+                frame_id=int(selected[frame_id]),
+            )
+            handless_rgb = _read_resized_rgb(
+                handless_capture,
+                size=inference_size,
+                frame_id=int(selected[frame_id]),
+            )
+            foreground, rgb_difference = _foreground_mask(
+                original_rgb=original_rgb,
+                handless_rgb=handless_rgb,
+                explicit_path=(
+                    explicit_masks[frame_id] if explicit_masks else None
+                ),
+            )
+            dilation_radius = max(
+                3,
+                int(round(30.0 * inference_size[0] / source_size[0])),
+            )
+            depth = np.asarray(handless_depth[frame_id], dtype=np.float64)
+            background = (
+                ~_dilate(foreground, dilation_radius)
+                & (rgb_difference <= 12.0)
+                & np.isfinite(depth)
+                & (depth > 0.0)
+            )
+            unchanged_coverages[frame_id] = float(np.mean(background))
+            sampled_background = depth[::4, ::4][background[::4, ::4]]
+            background_raw_sample_count += len(sampled_background)
+            if len(sampled_background):
+                background_depth_frame_medians[frame_id] = np.median(
+                    sampled_background
+                )
+            ratios, metric_depths, projected_count = (
+                _semidense_frame_ratios(
+                    points_world=points_world,
+                    world_to_camera=world_to_camera[frame_id],
+                    intrinsic=scaled_k,
+                    depth=depth,
+                    background=background,
+                )
+            )
+            projected_counts[frame_id] = projected_count
+            usable_counts[frame_id] = len(ratios)
+            raw_sample_count += len(ratios)
+            if len(ratios):
+                scale_frame_medians[frame_id] = np.median(ratios)
+                logs = np.log(ratios)
+                scale_frame_log_mads[frame_id] = np.median(
+                    np.abs(logs - np.median(logs))
+                )
+                depth_frame_medians[frame_id] = np.median(metric_depths)
+    finally:
+        original_capture.release()
+        handless_capture.release()
+
+    anchor, scale_frame_medians = _frame_equal_summary_from_medians(
+        scale_frame_medians,
+        raw_sample_count=raw_sample_count,
+    )
+    map_depth, _ = _frame_equal_summary_from_medians(
+        depth_frame_medians,
+        raw_sample_count=raw_sample_count,
+    )
+    raw_background, _ = _frame_equal_summary_from_medians(
+        background_depth_frame_medians,
+        raw_sample_count=background_raw_sample_count,
+    )
+    scale = anchor["p50"]
+    raw_background_median = raw_background["p50"]
+    return {
+        "selected_frame_indices": selected,
+        "source_intrinsic": intrinsic,
+        "inference_intrinsic": scaled_k,
+        "mask_source": "explicit PNG masks" if explicit_masks else "RGB difference",
+        "unchanged_background_coverage": _distribution(
+            unchanged_coverages,
+            positive_only=False,
+        ),
+        "projected_semidense_points_per_frame": _distribution(
+            projected_counts,
+            positive_only=False,
+        ),
+        "usable_semidense_points_per_frame": _distribution(
+            usable_counts,
+            positive_only=False,
+        ),
+        "semidense_anchor": anchor,
+        "semidense_anchor_frame_log_mad": _distribution(
+            scale_frame_log_mads,
+            positive_only=False,
+        ),
+        "sampled_semidense_camera_z_m": map_depth,
+        "handless_background_raw_vda_depth_m": raw_background,
+        "estimated_metric_background_depth_m": (
+            None
+            if scale is None or raw_background_median is None
+            else float(scale) * float(raw_background_median)
+        ),
+        "recommended_handless_metric_scale": scale,
+        "recommended_scale_formula": (
+            "median_frame(z_aria_semidense / d_vda_handless_background)"
+        ),
+        "temporal_diagnostics": {
+            "semidense_anchor_frame_medians": _distribution(
+                scale_frame_medians
+            ),
+        },
+    }
+
+
+def _semidense_quality_decision(analysis: dict[str, Any]) -> dict[str, Any]:
+    anchor = analysis["semidense_anchor"]
+    scale = analysis["recommended_handless_metric_scale"]
+    selected_frame_count = len(analysis["selected_frame_indices"])
+    minimum_frames = _minimum_anchor_frame_count(selected_frame_count)
+    minimum_samples = max(300, minimum_frames * 10)
+    reasons: list[str] = []
+    if scale is None:
+        reasons.append("no valid Aria semidense scale")
+    elif not 0.1 <= float(scale) <= 2.0:
+        reasons.append("estimated VDA metric scale lies outside [0.1, 2.0]")
+    if int(anchor["supporting_frames"]) < minimum_frames:
+        reasons.append(
+            "too few semidense-anchor frames: "
+            f"{anchor['supporting_frames']} < {minimum_frames}"
+        )
+    if int(anchor["raw_sample_count"]) < minimum_samples:
+        reasons.append(
+            "too few semidense-anchor samples: "
+            f"{anchor['raw_sample_count']} < {minimum_samples}"
+        )
+    if anchor["log_mad"] is None or float(anchor["log_mad"]) > 0.15:
+        reasons.append("semidense-anchor temporal log-MAD exceeds 0.15")
+    unchanged = analysis["unchanged_background_coverage"]["p50"]
+    if unchanged is None or float(unchanged) < 0.05:
+        reasons.append("median unchanged-background coverage is below 5%")
+    return {
+        "status": "validated" if not reasons else "needs_fallback_or_review",
+        "reasons": reasons,
+        "support_requirements": {
+            "selected_frame_count": selected_frame_count,
+            "minimum_semidense_anchor_frames": minimum_frames,
+            "minimum_semidense_anchor_samples": minimum_samples,
+        },
+        "metric_reference": (
+            "Project Aria MPS semidense world points projected by the raw "
+            "closed-loop camera trajectory"
+        ),
+    }
+
+
+def estimate_semidense_handless_metric_scale(
+    *,
+    original_video: Path,
+    handless_video: Path,
+    source_hdf5: Path,
+    semidense_points: Path,
+    frame_indices: np.ndarray,
+    handless_depth_raw_m: np.ndarray,
+    source_size: tuple[int, int],
+    inference_size: tuple[int, int],
+    mask_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Calibrate handless VDA directly from static Aria background points."""
+
+    selected = validate_frame_indices(frame_indices)
+    paths = [original_video, handless_video, source_hdf5, semidense_points]
+    paths = [path.expanduser().resolve() for path in paths]
+    original_video, handless_video, source_hdf5, semidense_points = paths
+    for path in paths:
+        if not path.is_file():
+            raise FileNotFoundError(path)
+    if mask_dir is not None:
+        mask_dir = mask_dir.expanduser().resolve()
+    intrinsic, camera_to_world, _baseline, hdf5_frame_count = (
+        _load_hdf5_camera_geometry(
+            source_hdf5,
+            frame_indices=selected,
+        )
+    )
+    _validate_source_frame_provenance(
+        original_video=original_video,
+        handless_video_frame_count=_video_metadata(handless_video)[2],
+        source_hdf5=source_hdf5,
+        hdf5_frame_count=hdf5_frame_count,
+        selected_frame_indices=selected,
+    )
+    points_world, point_filter = _load_semidense_points(semidense_points)
+    analysis = _analyze_semidense(
+        original_video=original_video,
+        handless_video=handless_video,
+        mask_dir=mask_dir,
+        handless_depth=np.asarray(handless_depth_raw_m),
+        source_size=source_size,
+        inference_size=inference_size,
+        intrinsic=intrinsic,
+        camera_to_world=camera_to_world,
+        points_world=points_world,
+        frame_indices=selected,
+    )
+    analysis["semidense_point_filter"] = point_filter
+    decision = _semidense_quality_decision(analysis)
+    scale = analysis["recommended_handless_metric_scale"]
+    resolved_scale = (
+        None
+        if scale is None or not np.isfinite(scale) or float(scale) <= 0.0
+        else float(scale)
+    )
+    return _json_ready({
+        "schema_version": 1,
+        "method": "aria-mps-semidense-background-depth",
+        "resolved_vda_metric_scale": resolved_scale,
+        "scale_excludes_scene_scale": True,
+        "source_video": str(original_video),
+        "source_video_sha256": file_sha256(original_video),
+        "handless_video": str(handless_video),
+        "handless_video_sha256": file_sha256(handless_video),
+        "source_hdf5": str(source_hdf5),
+        "source_hdf5_sha256": file_sha256(source_hdf5),
+        "semidense_points": str(semidense_points),
+        "semidense_points_sha256": file_sha256(semidense_points),
+        "analysis": analysis,
+        "decision": decision,
+    })
 
 
 def estimate_handless_metric_scale(
