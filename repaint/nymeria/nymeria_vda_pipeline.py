@@ -65,7 +65,6 @@ from repaint.vda_depth import (  # noqa: E402
     DEFAULT_VDA_METRIC_SCALE,
 )
 from repaint.vda_pipeline_common import (  # noqa: E402
-    TOTAL_PROGRESS_BAR_FORMAT,
     VideoMetadata,
     build_command as _command,
     load_previous_stages as _load_previous_stages,
@@ -73,6 +72,7 @@ from repaint.vda_pipeline_common import (  # noqa: E402
     read_json as _read_json,
     remove_exact as _remove_exact,
     run_stage_process as _run_process,
+    total_progress_bar_format,
     utc_now as _utc_now,
     write_json_atomic as _write_json_atomic,
 )
@@ -2124,7 +2124,7 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
         desc="Nymeria VDA",
         unit="stage",
         dynamic_ncols=True,
-        bar_format=TOTAL_PROGRESS_BAR_FORMAT,
+        bar_format=total_progress_bar_format(),
     ) as progress:
         try:
             for stage in plan.stages:
@@ -2614,6 +2614,8 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
             if report.get("cleanup_errors"):
                 report["updated_at"] = _utc_now()
                 persist_report()
+            progress.bar_format = total_progress_bar_format(0.0)
+            progress.refresh()
             return report
         except BaseException:
             if report.get("status") == "running":

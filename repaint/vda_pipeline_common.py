@@ -224,9 +224,9 @@ def format_elapsed(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
-TOTAL_PROGRESS_BAR_FORMAT = (
-    "{desc}: {percentage:3.0f}%|{bar}| ETA {remaining}"
-)
+def total_progress_bar_format(remaining: float | None = None) -> str:
+    eta = "?" if remaining is None else format_elapsed(remaining)
+    return f"{{desc}}: {{percentage:3.0f}}%|{{bar}}| ETA {eta}"
 
 
 def run_stage_process(
@@ -239,6 +239,22 @@ def run_stage_process(
 ) -> None:
     """Run one pipeline stage and keep its aggregate progress bar current."""
 
+    stage_started = time.perf_counter()
+    rate = progress.format_dict.get("rate")
+    if (rate is None or rate <= 0.0) and progress.n > 0:
+        elapsed = max(time.time() - progress.start_t, 1e-6)
+        rate = progress.n / elapsed
+    initial_remaining = (
+        (progress.total - progress.n) / rate
+        if rate is not None and rate > 0.0
+        else None
+    )
+    remaining = initial_remaining
+    remaining_updated_at = stage_started
+    episode_batch_started: float | None = None
+    last_episode_progress: tuple[int, int] | None = None
+    output_offset = 0
+    output_tail = ""
     environment = os.environ.copy()
     environment["PYTHONUNBUFFERED"] = "1"
     output = tempfile.TemporaryFile()
@@ -286,6 +302,56 @@ def run_stage_process(
                     return_code = process.wait(timeout=poll_seconds)
                 except subprocess.TimeoutExpired:
                     return_code = None
+                now = time.perf_counter()
+                output_size = os.fstat(output.fileno()).st_size
+                if output_size > output_offset:
+                    chunk = os.pread(
+                        output.fileno(),
+                        output_size - output_offset,
+                        output_offset,
+                    )
+                    output_offset = output_size
+                    buffered_output = output_tail + chunk.decode(
+                        errors="replace"
+                    )
+                    matches = re.findall(
+                        r"(?:^|\n)\[(\d+)/(\d+)\] ",
+                        buffered_output,
+                    )
+                    output_tail = buffered_output[-4096:]
+                    if matches:
+                        current, total = map(int, matches[-1])
+                        episode_progress = (current - 1, total)
+                        if episode_progress != last_episode_progress:
+                            last_episode_progress = episode_progress
+                            if current == 1:
+                                episode_batch_started = now
+                            elif total > 0 and 1 < current <= total:
+                                started = episode_batch_started or stage_started
+                                completed = current - 1
+                                average = (now - started) / completed
+                                future_stages = max(
+                                    progress.total - progress.n - 1,
+                                    0,
+                                )
+                                future_seconds = (
+                                    future_stages / rate
+                                    if rate is not None and rate > 0.0
+                                    else 0.0
+                                )
+                                remaining = (
+                                    average * (total - completed)
+                                    + future_seconds
+                                )
+                                remaining_updated_at = now
+                displayed_remaining = (
+                    None
+                    if remaining is None
+                    else max(0.0, remaining - (now - remaining_updated_at))
+                )
+                progress.bar_format = total_progress_bar_format(
+                    displayed_remaining
+                )
                 progress.refresh()
                 if return_code is not None:
                     break

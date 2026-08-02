@@ -38,7 +38,6 @@ from repaint.scene_leveling import (  # noqa: E402
     SUPPORT_PLANE_LEVELING_STAGE,
 )
 from repaint.vda_pipeline_common import (  # noqa: E402
-    TOTAL_PROGRESS_BAR_FORMAT,
     VideoMetadata,
     build_command as _stage_command,
     load_previous_stages as _load_previous_stages,
@@ -47,6 +46,7 @@ from repaint.vda_pipeline_common import (  # noqa: E402
     read_json as _read_json_object,
     remove_exact as _remove_exact_path,
     run_stage_process as _run_process,
+    total_progress_bar_format,
     utc_now as _utc_now,
     write_json_atomic as _write_json_atomic,
 )
@@ -1564,7 +1564,7 @@ def execute_task(
             unit="stage",
             dynamic_ncols=True,
             leave=True,
-            bar_format=TOTAL_PROGRESS_BAR_FORMAT,
+            bar_format=total_progress_bar_format(),
         )
     )
     with progress_context as progress:
@@ -1910,10 +1910,12 @@ def run_pipeline(tasks: Iterable[str], config: PipelineConfig) -> list[dict[str,
         unit="stage",
         dynamic_ncols=True,
         leave=True,
-        bar_format=TOTAL_PROGRESS_BAR_FORMAT,
+        bar_format=total_progress_bar_format(),
     ) as progress:
         for plan in plans:
             reports.append(execute_task(plan, config, progress=progress))
+        progress.bar_format = total_progress_bar_format(0.0)
+        progress.refresh()
     return reports
 
 
