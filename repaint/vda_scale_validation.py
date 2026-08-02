@@ -1508,6 +1508,7 @@ def estimate_semidense_handless_metric_scale(
     source_hdf5: Path,
     semidense_points: Path,
     frame_indices: np.ndarray,
+    handless_video_frame_count: int,
     handless_depth_raw_m: np.ndarray,
     source_size: tuple[int, int],
     inference_size: tuple[int, int],
@@ -1532,7 +1533,7 @@ def estimate_semidense_handless_metric_scale(
     )
     _validate_source_frame_provenance(
         original_video=original_video,
-        handless_video_frame_count=_video_metadata(handless_video)[2],
+        handless_video_frame_count=handless_video_frame_count,
         source_hdf5=source_hdf5,
         hdf5_frame_count=hdf5_frame_count,
         selected_frame_indices=selected,

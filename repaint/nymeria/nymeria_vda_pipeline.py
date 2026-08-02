@@ -10,10 +10,10 @@ native inputs:
       -> metric Video Depth Anything RGB-D preparation
       -> source-sized Isaac robot-camera replay
 
-The first five frames fit one fixed Aria-world-to-G1-world camera transform.
-The original camera rotation trajectory is preserved without a rejection
-threshold, and Isaac scene alignment is disabled because retargeting already
-anchors the camera.
+The original Aria camera trajectory is retained as source provenance without a
+rotation rejection threshold.  Isaac places every RGB-D frame at that frame's
+exact G1 FK capture-camera pose, so rendering does not depend on a fixed
+first-five-frame Aria-to-G1 alignment.
 """
 
 from __future__ import annotations
@@ -1392,6 +1392,10 @@ def _validate_render(
             f"{asdict(rendered)} != {asdict(clip.video)}"
         )
     report = _read_json(output.with_suffix(".json"))
+    if int(report.get("schema_version", -1)) < 3:
+        raise ValueError(
+            "Final Isaac report predates mesh/capture camera synchronization"
+        )
     if report.get("capture_view") != "robot-camera":
         raise ValueError("Final video is not a robot-camera capture")
     if int(report.get("frame_count", -1)) != clip.video.frame_count:

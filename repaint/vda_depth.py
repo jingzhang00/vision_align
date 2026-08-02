@@ -344,6 +344,7 @@ def scale_and_resize_metric_depths(
     scene_scale: float,
     vda_metric_scale: float = 1.0,
     mesh_size: tuple[int, int],
+    maximum_depth_m: float | None = None,
 ) -> np.ndarray:
     """Calibrate VDA depth, apply scene scale, and nearest-resize it."""
 
@@ -354,6 +355,10 @@ def scale_and_resize_metric_depths(
         raise ValueError("scene_scale must be positive and finite")
     if not np.isfinite(vda_metric_scale) or vda_metric_scale <= 0.0:
         raise ValueError("vda_metric_scale must be positive and finite")
+    if maximum_depth_m is not None and (
+        not np.isfinite(maximum_depth_m) or maximum_depth_m <= 0.0
+    ):
+        raise ValueError("maximum_depth_m must be positive and finite")
     mesh_width, mesh_height = (int(value) for value in mesh_size)
     if min(mesh_width, mesh_height) <= 1:
         raise ValueError("mesh_size must contain valid WIDTH,HEIGHT")
@@ -382,6 +387,15 @@ def scale_and_resize_metric_depths(
                 f"VDA depth is not dense at frame {frame_id}: "
                 f"positive_rate={positive_rate:.6f}"
             )
+        if maximum_depth_m is not None:
+            too_far = valid & (resized > maximum_depth_m)
+            too_far_rate = float(np.mean(too_far))
+            if too_far_rate > 0.01:
+                raise RuntimeError(
+                    f"VDA depth beyond {maximum_depth_m:.3f} m is not sparse "
+                    f"at frame {frame_id}: rate={too_far_rate:.6f}"
+                )
+            resized[too_far] = 0.0
         resized[~valid] = 0.0
         output[frame_id] = resized
 

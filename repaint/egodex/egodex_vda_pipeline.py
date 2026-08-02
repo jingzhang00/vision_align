@@ -573,6 +573,10 @@ def _validate_render(stage: Stage, plan: TaskPlan) -> None:
             f"{asdict(rendered)} != {asdict(source.video)}"
         )
     report = _read_json_object(output_report)
+    if int(report.get("schema_version", -1)) < 3:
+        raise ValueError(
+            "Final Isaac report predates mesh/capture camera synchronization"
+        )
     if str(report.get("capture_view")) != "robot-camera":
         raise ValueError("Final Isaac report is not a robot-camera capture")
     if int(report.get("frame_count", -1)) != source.video.frame_count:

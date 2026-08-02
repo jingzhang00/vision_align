@@ -178,6 +178,7 @@ def _resolve_episode_metric_scale(
                 / "recording_head/mps/slam/semidense_points.csv.gz"
             ),
             frame_indices=episode.frame_indices,
+            handless_video_frame_count=episode.full_frame_count,
             handless_depth_raw_m=handless_depth_raw_m,
             source_size=handless_decoded.source_size,
             inference_size=handless_decoded.inference_size,
@@ -313,6 +314,11 @@ def prepare(args: argparse.Namespace) -> dict[str, object]:
         scene_scale=episode.scene_scale,
         vda_metric_scale=resolved_vda_metric_scale,
         mesh_size=mesh_size,
+        maximum_depth_m=(
+            np.iinfo(np.uint16).max / 1000.0
+            if episode.source_dataset_kind == "nymeria"
+            else None
+        ),
     )
     depth_backend_report: dict[str, object] = {
         "backend": "video-depth-anything",
@@ -361,6 +367,9 @@ def prepare(args: argparse.Namespace) -> dict[str, object]:
         "scene_scale_application_count": 1,
         "effective_raw_depth_to_robot_scale": (
             resolved_vda_metric_scale * episode.scene_scale
+        ),
+        "far_depth_clipped_pixel_count": int(
+            np.count_nonzero(depths_mesh_m == 0.0)
         ),
         "depth_resize_interpolation": "nearest",
     }

@@ -2,9 +2,9 @@
 """Replay a prepared Video Depth Anything scene and G1 trajectory in Isaac.
 
 Each prepared RGB-D frame is reconstructed as a textured USD mesh in the
-recorded camera pose while the frame-aligned G1 root and joint trajectory are
-applied to an Isaac articulation.  The combined replay can either be captured
-to one fixed-camera MP4 or viewed in an interactive Isaac viewport.
+active capture-camera pose while the frame-aligned G1 root and joint trajectory
+are applied to an Isaac articulation.  The combined replay can either be
+captured to one fixed-camera MP4 or viewed in an interactive Isaac viewport.
 """
 
 from __future__ import annotations
@@ -385,6 +385,7 @@ def _load_depth_m(path: Path, mesh_size: tuple[int, int]) -> np.ndarray:
 def scan_scene(
     scene: PreparedScene,
     *,
+    camera_poses_cv_xyzw: np.ndarray,
     absolute_threshold_m: float,
     relative_threshold: float,
     scene_leveling_linear_world: np.ndarray,
@@ -409,7 +410,7 @@ def scan_scene(
         points_camera = backproject_z_depth(depth_m, scene.mesh_intrinsic)
         points_world = camera_points_to_world(
             points_camera,
-            scene.camera_poses_cv_xyzw[frame_id],
+            camera_poses_cv_xyzw[frame_id],
         )
         valid = np.isfinite(points_world).all(axis=-1)
         points_world[valid] = apply_world_affine_to_points(
@@ -442,6 +443,33 @@ def scan_scene(
         valid_vertex_counts=valid_vertex_counts,
         triangle_counts=triangle_counts,
         median_depths_m=median_depths_m,
+    )
+
+
+def _resolve_mesh_camera_poses(
+    *,
+    capture_view: str,
+    prepared_camera_poses_cv_xyzw: np.ndarray,
+    robot_camera_poses_cv_xyzw: np.ndarray | None,
+) -> tuple[np.ndarray, str]:
+    """Use the capture trajectory to place first-person RGB-D meshes."""
+
+    if capture_view == "robot-camera":
+        if (
+            robot_camera_poses_cv_xyzw is None
+            or robot_camera_poses_cv_xyzw.shape
+            != prepared_camera_poses_cv_xyzw.shape
+        ):
+            raise ValueError("Robot mesh/capture camera poses are unavailable")
+        return (
+            robot_camera_poses_cv_xyzw,
+            "per-frame G1 FK robot-camera pose backprojection",
+        )
+    if capture_view != "scene":
+        raise ValueError(f"Unsupported capture view: {capture_view!r}")
+    return (
+        prepared_camera_poses_cv_xyzw,
+        "prepared camera_pose_cv_xyzw backprojection",
     )
 
 
@@ -1179,6 +1207,28 @@ def render(args: argparse.Namespace) -> dict[str, object]:
         raise ValueError("--depth-edge-relative must be finite and non-negative")
     if args.rt_subframes <= 0:
         raise ValueError("--rt-subframes must be positive")
+    robot_camera_poses_world_xyzw: np.ndarray | None = None
+    robot_camera_poses_cv_xyzw: np.ndarray | None = None
+    if args.capture_view == "robot-camera":
+        robot_camera_poses_world_xyzw = beingbeyond_head_camera_poses_world(
+            urdf_path=scene.g1_urdf,
+            joint_names=scene.joint_names,
+            joint_positions=scene.joint_positions,
+            root_pose_xyzw=scene.root_poses_xyzw,
+        )
+        robot_camera_poses_cv_xyzw = beingbeyond_head_camera_poses_cv(
+            urdf_path=scene.g1_urdf,
+            joint_names=scene.joint_names,
+            joint_positions=scene.joint_positions,
+            root_pose_xyzw=scene.root_poses_xyzw,
+        )
+    mesh_camera_poses_cv_xyzw, mesh_pose_source = (
+        _resolve_mesh_camera_poses(
+            capture_view=args.capture_view,
+            prepared_camera_poses_cv_xyzw=scene.camera_poses_cv_xyzw,
+            robot_camera_poses_cv_xyzw=robot_camera_poses_cv_xyzw,
+        )
+    )
     if (
         args.scene_alignment != "none"
         and (scene.source_hdf5 is None or scene.scene_scale is None)
@@ -1210,7 +1260,7 @@ def render(args: argparse.Namespace) -> dict[str, object]:
             depth_paths=scene.depth_paths,
             mesh_size=scene.mesh_size,
             mesh_intrinsic=scene.mesh_intrinsic,
-            camera_pose_cv_xyzw=scene.camera_poses_cv_xyzw,
+            camera_pose_cv_xyzw=mesh_camera_poses_cv_xyzw,
             window_frames=leveling_window.resolved_frames,
         )
         scene_leveling_linear_world = leveling.linear_world
@@ -1274,7 +1324,7 @@ def render(args: argparse.Namespace) -> dict[str, object]:
             "source_hdf5": scene.source_hdf5,
             "frame_indices": scene.frame_indices,
             "scene_scale": scene.scene_scale,
-            "scene_camera_pose_cv_xyzw": scene.camera_poses_cv_xyzw,
+            "scene_camera_pose_cv_xyzw": mesh_camera_poses_cv_xyzw,
             "urdf_path": scene.g1_urdf,
             "joint_names": scene.joint_names,
             "joint_positions": scene.joint_positions,
@@ -1414,24 +1464,8 @@ def render(args: argparse.Namespace) -> dict[str, object]:
     output_intrinsic = render_intrinsic.copy()
     output_intrinsic[0, 2] += letterbox_left
     output_intrinsic[1, 2] += letterbox_top
-    robot_camera_poses_world_xyzw: np.ndarray | None = None
-    robot_camera_poses_cv_xyzw: np.ndarray | None = None
     hand_projection_report: dict[str, object] | None = None
-    if args.capture_view == "robot-camera":
-        robot_camera_poses_world_xyzw = (
-            beingbeyond_head_camera_poses_world(
-                urdf_path=scene.g1_urdf,
-                joint_names=scene.joint_names,
-                joint_positions=scene.joint_positions,
-                root_pose_xyzw=scene.root_poses_xyzw,
-            )
-        )
-        robot_camera_poses_cv_xyzw = beingbeyond_head_camera_poses_cv(
-            urdf_path=scene.g1_urdf,
-            joint_names=scene.joint_names,
-            joint_positions=scene.joint_positions,
-            root_pose_xyzw=scene.root_poses_xyzw,
-        )
+    if robot_camera_poses_cv_xyzw is not None:
         hand_points_camera = robot_frame_points_in_camera_cv(
             urdf_path=scene.g1_urdf,
             joint_names=scene.joint_names,
@@ -1449,6 +1483,7 @@ def render(args: argparse.Namespace) -> dict[str, object]:
             print(f"WARNING: {warning}", flush=True)
     scan = scan_scene(
         scene,
+        camera_poses_cv_xyzw=mesh_camera_poses_cv_xyzw,
         absolute_threshold_m=args.depth_edge_absolute,
         relative_threshold=args.depth_edge_relative,
         scene_leveling_linear_world=scene_leveling_linear_world,
@@ -1828,7 +1863,7 @@ def render(args: argparse.Namespace) -> dict[str, object]:
             )
             points_world = camera_points_to_world(
                 points_camera,
-                scene.camera_poses_cv_xyzw[frame_id],
+                mesh_camera_poses_cv_xyzw[frame_id],
             )
             valid = np.isfinite(points_world).all(axis=-1)
             points_world[valid] = apply_world_affine_to_points(
@@ -2246,7 +2281,7 @@ def render(args: argparse.Namespace) -> dict[str, object]:
             / float(scene.mesh_size[0] * scene.mesh_size[1])
         )
         report: dict[str, object] = {
-            "schema_version": 2,
+            "schema_version": 3,
             "method": (
                 "video-depth-anything-dynamic-rgbd-mesh"
                 "-plus-g1-articulation"
@@ -2291,7 +2326,7 @@ def render(args: argparse.Namespace) -> dict[str, object]:
             "render_intrinsic_source": render_intrinsic_source,
             "capture_distortion": D435_DISTORTION.tolist(),
             "mesh_pose_source": (
-                "prepared camera_pose_cv_xyzw backprojection"
+                mesh_pose_source
                 + (
                     " followed by one constant world-Z-only affine "
                     "support-plane correction applied to world points"
@@ -2305,7 +2340,7 @@ def render(args: argparse.Namespace) -> dict[str, object]:
                     else ""
                 )
             ),
-            "camera_axes": "prepared poses are OpenCV world-from-camera",
+            "camera_axes": "mesh poses are OpenCV world-from-camera",
             "scene_leveling": scene_leveling_report,
             "scene_alignment": scene_alignment_report,
             "scene_placement": scene_placement_report,
