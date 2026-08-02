@@ -60,6 +60,9 @@ from repaint.nymeria.nymeria_adapter import (  # noqa: E402
     probe_display_video,
     resample_motion_to_video,
 )
+from repaint.robot_camera import (  # noqa: E402
+    beingbeyond_head_camera_poses_cv,
+)
 
 
 VIDEO_KEY = "observation.images.ego"
@@ -106,19 +109,14 @@ SMPL_JOINT_NAMES = (
 )
 Y_UP_TO_Z_UP = Rotation.from_quat([0.5, 0.5, 0.5, 0.5])
 MAXIMUM_MOTION_BOUNDARY_CLAMP_SECONDS = 0.25
-MAXIMUM_ALIGNMENT_P95_ROTATION_ERROR_DEGREES = 10.0
-MAXIMUM_ALIGNMENT_ROTATION_ERROR_DEGREES = 30.0
-MAXIMUM_HAND_EYE_P95_ROTATION_ERROR_DEGREES = 10.0
-MAXIMUM_HAND_EYE_P95_TRANSLATION_ERROR_M = 0.10
-MAXIMUM_HAND_EYE_TIME_ERROR_US = 5_000.0
 MAXIMUM_CAMERA_TIMELINE_DRIFT_SECONDS = 0.02
+INITIAL_CAMERA_ALIGNMENT_FRAME_COUNT = 5
 
 
 @dataclass(frozen=True)
 class NymeriaCameraAlignment:
     hdf5_path: Path
     camera_to_world: np.ndarray
-    hip_to_world: np.ndarray
     body_times_seconds: np.ndarray
     source_frame_indices: np.ndarray
     motion_timestamps_seconds: np.ndarray
@@ -151,8 +149,9 @@ class NymeriaRetargetedEpisode:
     camera_pose: np.ndarray | None
     camera_intrinsics: np.ndarray
     source_to_robot_rotation: np.ndarray | None
+    source_to_robot_translation: np.ndarray | None
     source_to_robot_scale: float | None
-    camera_alignment_metrics: dict[str, float] | None
+    camera_alignment_metrics: dict[str, Any] | None
     metrics: dict[str, float]
     elapsed_seconds: float
 
@@ -264,11 +263,6 @@ def load_camera_alignment(
             frame_count=frame_count,
             label=f"{path}:transforms/camera",
         )
-        hip_to_world = _validate_transform_sequence(
-            handle["transforms/hip"],
-            frame_count=frame_count,
-            label=f"{path}:transforms/hip",
-        )
         body_times = np.asarray(
             handle["nymeria/body_time_seconds"],
             dtype=np.float64,
@@ -334,7 +328,6 @@ def load_camera_alignment(
     return NymeriaCameraAlignment(
         hdf5_path=path,
         camera_to_world=camera_to_world,
-        hip_to_world=hip_to_world,
         body_times_seconds=body_times,
         source_frame_indices=source_frame_indices,
         motion_timestamps_seconds=motion_timestamps,
@@ -398,7 +391,7 @@ def load_camera_alignment_reports(
     *,
     report_root: Path,
 ) -> dict[str, dict[str, Any]]:
-    """Validate session hand-eye reports and return compact provenance."""
+    """Validate raw Aria camera reports and return compact provenance."""
 
     clips_by_session: dict[str, set[str]] = {}
     for clip in clips:
@@ -415,7 +408,7 @@ def load_camera_alignment_reports(
         )
         if not path.is_file():
             raise FileNotFoundError(
-                f"Nymeria hand-eye quality report is missing: {path}"
+                f"Nymeria camera trajectory report is missing: {path}"
             )
         raw = path.read_bytes()
         report = json.loads(raw)
@@ -431,32 +424,14 @@ def load_camera_alignment_reports(
                 f"{path} declares episode {report_episode!r}, "
                 f"expected {session!r}"
             )
-        hand_eye = report.get("hand_eye")
-        if not isinstance(hand_eye, dict):
-            raise ValueError(f"{path} has no hand-eye quality audit")
-        metrics = {
-            "p95_rotation_error_degrees": float(
-                hand_eye.get("p95_rotation_error_degrees", np.inf)
-            ),
-            "p95_translation_error_m": float(
-                hand_eye.get("p95_translation_error_m", np.inf)
-            ),
-            "maximum_time_error_us": float(
-                hand_eye.get("maximum_time_error_us", np.inf)
-            ),
-        }
+        camera_trajectory = report.get("camera_trajectory")
         if (
-            not all(np.isfinite(list(metrics.values())))
-            or metrics["p95_rotation_error_degrees"]
-            > MAXIMUM_HAND_EYE_P95_ROTATION_ERROR_DEGREES
-            or metrics["p95_translation_error_m"]
-            > MAXIMUM_HAND_EYE_P95_TRANSLATION_ERROR_M
-            or metrics["maximum_time_error_us"]
-            > MAXIMUM_HAND_EYE_TIME_ERROR_US
+            not isinstance(camera_trajectory, dict)
+            or camera_trajectory.get("uses_208d_pose") is not False
+            or camera_trajectory.get("rotation_rejection_threshold_degrees")
+            is not None
         ):
-            raise ValueError(
-                f"{path} hand-eye quality gate failed: {metrics}"
-            )
+            raise ValueError(f"{path} is not a raw Aria camera trajectory")
         prepared = report.get("prepared")
         if not isinstance(prepared, list):
             raise ValueError(f"{path} has no prepared clip list")
@@ -474,16 +449,7 @@ def load_camera_alignment_reports(
             "path": str(path),
             "sha256": hashlib.sha256(raw).hexdigest(),
             "status": str(report["status"]),
-            "metrics": metrics,
-            "thresholds": {
-                "maximum_p95_rotation_error_degrees": (
-                    MAXIMUM_HAND_EYE_P95_ROTATION_ERROR_DEGREES
-                ),
-                "maximum_p95_translation_error_m": (
-                    MAXIMUM_HAND_EYE_P95_TRANSLATION_ERROR_M
-                ),
-                "maximum_time_error_us": MAXIMUM_HAND_EYE_TIME_ERROR_US,
-            },
+            "camera_trajectory": camera_trajectory,
         }
     return reports
 
@@ -537,100 +503,58 @@ def _mean_proper_rotation(matrices: np.ndarray) -> np.ndarray:
     return result
 
 
-def estimate_source_to_robot_rotation(
-    source: NymeriaSourceEpisode,
-) -> tuple[np.ndarray, dict[str, float]]:
-    alignment = source.camera_alignment
-    if alignment is None:
-        raise ValueError("Camera alignment is required to estimate the basis")
-    pelvis_rotation_208 = (
-        Y_UP_TO_Z_UP
-        * source.resampled.root_rotation
-        * source.resampled.relative_joint_rotations[0]
-    ).as_matrix()
-    hip_rotation_source = alignment.hip_to_world[:, :3, :3]
-    candidates = np.einsum(
-        "nij,nkj->nik",
-        pelvis_rotation_208,
-        hip_rotation_source,
-    )
-    source_to_robot = _mean_proper_rotation(candidates)
-    residual = Rotation.from_matrix(
-        np.einsum(
-            "ji,njk->nik",
-            source_to_robot,
-            candidates,
-        )
-    ).magnitude()
-    residual_degrees = np.rad2deg(residual)
-    metrics = {
-        "basis_rotation_error_median_degrees": float(
-            np.median(residual_degrees)
-        ),
-        "basis_rotation_error_p95_degrees": float(
-            np.quantile(residual_degrees, 0.95)
-        ),
-        "basis_rotation_error_max_degrees": float(
-            np.max(residual_degrees)
-        ),
-        "motion_leading_clamp_seconds": (
-            alignment.leading_clamp_seconds
-        ),
-        "motion_trailing_clamp_seconds": (
-            alignment.trailing_clamp_seconds
-        ),
-        "motion_clamped_frame_count": float(
-            np.count_nonzero(
-                (alignment.motion_timestamps_seconds < 0.0)
-                | (
-                    alignment.motion_timestamps_seconds
-                    > (
-                        source.motion.sample_count - 1
-                    )
-                    / source.motion.fps
-                )
-            )
-        ),
-    }
-    if (
-        metrics["basis_rotation_error_p95_degrees"]
-        > MAXIMUM_ALIGNMENT_P95_ROTATION_ERROR_DEGREES
-        or metrics["basis_rotation_error_max_degrees"]
-        > MAXIMUM_ALIGNMENT_ROTATION_ERROR_DEGREES
-    ):
-        raise ValueError(
-            "Nymeria 208-D pelvis and calibrated XSens hip do not admit a "
-            "stable source-to-robot basis: "
-            f"p95={metrics['basis_rotation_error_p95_degrees']:.3f} deg, "
-            f"max={metrics['basis_rotation_error_max_degrees']:.3f} deg"
-        )
-    return source_to_robot, metrics
-
-
 def _mapped_camera_poses(
     *,
-    root_positions: np.ndarray,
     camera_to_world: np.ndarray,
-    hip_to_world: np.ndarray,
-    source_to_robot_rotation: np.ndarray,
+    robot_camera_pose_cv_xyzw: np.ndarray,
     source_to_robot_scale: float,
-) -> tuple[np.ndarray, dict[str, float]]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
+    """Map raw Aria poses with one first-five-frame similarity transform."""
+
     if not np.isfinite(source_to_robot_scale) or source_to_robot_scale <= 0.0:
         raise ValueError("source_to_robot_scale must be positive and finite")
-    relative_source = (
-        camera_to_world[:, :3, 3] - hip_to_world[:, :3, 3]
+    source = np.asarray(camera_to_world, dtype=np.float64)
+    robot = np.asarray(robot_camera_pose_cv_xyzw, dtype=np.float64)
+    if (
+        source.ndim != 3
+        or source.shape[1:] != (4, 4)
+        or robot.shape != (len(source), 7)
+        or not np.isfinite(source).all()
+        or not np.isfinite(robot).all()
+    ):
+        raise ValueError("Aria and robot camera poses must be finite and aligned")
+    window_frames = min(INITIAL_CAMERA_ALIGNMENT_FRAME_COUNT, len(source))
+    if window_frames == 0:
+        raise ValueError("Camera alignment requires at least one frame")
+    source_rotation = source[:, :3, :3]
+    robot_rotation = Rotation.from_quat(robot[:, 3:7]).as_matrix()
+    source_to_robot_rotation = _mean_proper_rotation(
+        np.einsum(
+            "nij,nkj->nik",
+            robot_rotation[:window_frames],
+            source_rotation[:window_frames],
+        )
     )
-    mapped_relative = (
+    translation_candidates = robot[:window_frames, :3] - (
         source_to_robot_scale
-        * (source_to_robot_rotation @ relative_source.T).T
+        * (
+            source_to_robot_rotation
+            @ source[:window_frames, :3, 3].T
+        ).T
     )
-    mapped_position = np.asarray(root_positions, dtype=np.float64) + (
-        mapped_relative
+    source_to_robot_translation = np.median(
+        translation_candidates,
+        axis=0,
+    )
+    mapped_position = (
+        source_to_robot_scale
+        * (source_to_robot_rotation @ source[:, :3, 3].T).T
+        + source_to_robot_translation
     )
     mapped_rotation = np.einsum(
         "ij,njk->nik",
         source_to_robot_rotation,
-        camera_to_world[:, :3, :3],
+        source_rotation,
     )
     mapped_quaternion = Rotation.from_matrix(mapped_rotation).as_quat()
     for frame_index in range(1, len(mapped_quaternion)):
@@ -642,29 +566,39 @@ def _mapped_camera_poses(
             < 0.0
         ):
             mapped_quaternion[frame_index] *= -1.0
-    source_distance = np.linalg.norm(relative_source, axis=1)
-    mapped_distance = np.linalg.norm(mapped_relative, axis=1)
     if (
         not np.isfinite(mapped_position).all()
         or not np.isfinite(mapped_quaternion).all()
     ):
         raise ValueError("Mapped Nymeria camera pose contains non-finite values")
-    median_source_distance = float(np.median(source_distance))
-    if not 0.03 <= median_source_distance <= 1.0:
-        raise ValueError(
-            "Calibrated Nymeria camera-to-hip distance is implausible: "
-            f"median={median_source_distance:.4f} m"
-        )
+    fit_rotation_error = np.degrees(
+        Rotation.from_matrix(
+            np.einsum(
+                "nji,njk->nik",
+                mapped_rotation[:window_frames],
+                robot_rotation[:window_frames],
+            )
+        ).magnitude()
+    )
+    fit_translation_error = np.linalg.norm(
+        mapped_position[:window_frames] - robot[:window_frames, :3],
+        axis=1,
+    )
     metrics = {
-        "source_camera_to_hip_distance_median_m": median_source_distance,
-        "source_camera_to_hip_distance_p05_m": float(
-            np.quantile(source_distance, 0.05)
+        "mapping": "raw Aria camera to G1 camera, fixed first-five-frame similarity",
+        "fit_window_frames": window_frames,
+        "source_camera_rotation_rejection_threshold_degrees": None,
+        "fit_rotation_error_median_degrees": float(
+            np.median(fit_rotation_error)
         ),
-        "source_camera_to_hip_distance_p95_m": float(
-            np.quantile(source_distance, 0.95)
+        "fit_rotation_error_p95_degrees": float(
+            np.quantile(fit_rotation_error, 0.95)
         ),
-        "robot_camera_to_root_distance_median_m": float(
-            np.median(mapped_distance)
+        "fit_translation_error_median_m": float(
+            np.median(fit_translation_error)
+        ),
+        "fit_translation_error_p95_m": float(
+            np.quantile(fit_translation_error, 0.95)
         ),
         "source_to_robot_camera_translation_scale": float(
             source_to_robot_scale
@@ -672,7 +606,12 @@ def _mapped_camera_poses(
         "scene_scale_application_count": 1.0,
     }
     pose = np.concatenate([mapped_position, mapped_quaternion], axis=1)
-    return pose.astype(np.float32), metrics
+    return (
+        pose.astype(np.float32),
+        source_to_robot_rotation,
+        source_to_robot_translation,
+        metrics,
+    )
 
 
 def merge_body_with_open_hands(
@@ -766,12 +705,10 @@ def retarget_source_episode(
     ).astype(np.float32)
     camera_pose: np.ndarray | None = None
     source_to_robot_rotation: np.ndarray | None = None
+    source_to_robot_translation: np.ndarray | None = None
     source_to_robot_scale: float | None = None
-    camera_alignment_metrics: dict[str, float] | None = None
+    camera_alignment_metrics: dict[str, Any] | None = None
     if source.camera_alignment is not None:
-        source_to_robot_rotation, basis_metrics = (
-            estimate_source_to_robot_rotation(source)
-        )
         source_to_robot_scale = float(
             np.mean(
                 [
@@ -780,17 +717,22 @@ def retarget_source_episode(
                 ]
             )
         )
-        camera_pose, camera_metrics = _mapped_camera_poses(
-            root_positions=body_qpos[:, :3],
+        robot_camera_pose = beingbeyond_head_camera_poses_cv(
+            urdf_path=G1_URDF,
+            joint_names=tuple(joint_names),
+            joint_positions=state,
+            root_pose_xyzw=root_pose,
+        )
+        (
+            camera_pose,
+            source_to_robot_rotation,
+            source_to_robot_translation,
+            camera_alignment_metrics,
+        ) = _mapped_camera_poses(
             camera_to_world=source.camera_alignment.camera_to_world,
-            hip_to_world=source.camera_alignment.hip_to_world,
-            source_to_robot_rotation=source_to_robot_rotation,
+            robot_camera_pose_cv_xyzw=robot_camera_pose,
             source_to_robot_scale=source_to_robot_scale,
         )
-        camera_alignment_metrics = {
-            **basis_metrics,
-            **camera_metrics,
-        }
     intrinsics = np.repeat(
         source.intrinsic.reshape(1, 9),
         source.frame_count,
@@ -822,6 +764,7 @@ def retarget_source_episode(
             camera_pose=camera_pose,
             camera_intrinsics=intrinsics,
             source_to_robot_rotation=source_to_robot_rotation,
+            source_to_robot_translation=source_to_robot_translation,
             source_to_robot_scale=source_to_robot_scale,
             camera_alignment_metrics=camera_alignment_metrics,
             metrics=metrics,
@@ -1210,12 +1153,12 @@ def write_lerobot_v3(
         }
         if alignment_reports is None or set(alignment_reports) != expected_sessions:
             raise ValueError(
-                "Validated hand-eye reports are required for every "
+                "Validated camera trajectory reports are required for every "
                 "camera-aligned Nymeria session"
             )
     elif alignment_reports is not None:
         raise ValueError(
-            "Hand-eye reports were supplied without camera alignment"
+            "Camera trajectory reports were supplied without camera alignment"
         )
     features = _feature_schema(
         joint_names=joint_names,
@@ -1341,19 +1284,22 @@ def write_lerobot_v3(
                             "source_to_robot_rotation": (
                                 episode.source_to_robot_rotation.tolist()
                             ),
+                            "source_to_robot_translation": (
+                                episode.source_to_robot_translation.tolist()
+                            ),
                             "source_to_robot_camera_translation_scale": (
                                 episode.source_to_robot_scale
                             ),
                             "mapping": (
-                                "EgoDex camera-relative-to-hip mapping onto "
-                                "the current GMR root pose"
+                                "raw Aria camera mapped to the exact G1 head "
+                                "camera by one fixed first-five-frame similarity"
                             ),
                             "camera_pose_convention": (
                                 "T_RobotWorld_CameraOpenCV as "
                                 "[x,y,z,qx,qy,qz,qw]"
                             ),
                             "metrics": episode.camera_alignment_metrics,
-                            "hand_eye_quality_report": (
+                            "camera_trajectory_report": (
                                 alignment_reports[source.clip.session]
                             ),
                             "source_body_time_seconds": {
@@ -1429,7 +1375,7 @@ def write_lerobot_v3(
         _write_json(
             temporary / "meta/nymeria.json",
             {
-                "schema_version": 5,
+                "schema_version": 6,
                 "source_format": (
                     "Nymeria displayed MP4 + same-stem 208-D motion/text/SMPL"
                 ),
@@ -1464,12 +1410,13 @@ def write_lerobot_v3(
                     {
                         "status": "passed",
                         "method": (
-                            "Aria MPS + XSens hand-eye adapter, then EgoDex "
-                            "camera-relative-to-hip mapping onto GMR root"
+                            "raw Aria MPS camera trajectory mapped to the "
+                            "exact G1 head camera from the first five frames"
                         ),
                         "observation_camera_pose": True,
                         "source_to_robot_scale_application_count": 1,
-                        "hand_eye_quality_reports": [
+                        "source_camera_rotation_rejection_threshold_degrees": None,
+                        "camera_trajectory_reports": [
                             alignment_reports[session]
                             for session in sorted(
                                 alignment_reports,
@@ -1478,7 +1425,7 @@ def write_lerobot_v3(
                         ],
                         "fingertip_policy": (
                             "no synthetic fingertips; Isaac scene alignment "
-                            "must use none or a future rigid-palm mode"
+                            "is disabled because retarget anchors the camera"
                         ),
                     }
                     if include_camera_pose
@@ -1689,9 +1636,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--camera-alignment-root",
         type=Path,
         help=(
-            "Root containing <session>/<clip>.hdf5 Aria/XSens calibration "
-            "adapters. When supplied, observation.camera_pose is generated "
-            "with the EgoDex camera-relative-to-hip mapping."
+            "Root containing <session>/<clip>.hdf5 raw Aria camera "
+            "trajectories. When supplied, observation.camera_pose is "
+            "anchored to the G1 head camera from the first five frames."
         ),
     )
     parser.add_argument(
@@ -1699,7 +1646,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help=(
             "Root containing <session>/visual_alignment_report.json. "
-            "Required for the hand-eye quality gate and defaults to "
+            "Required for raw-camera provenance and defaults to "
             "--camera-alignment-root."
         ),
     )

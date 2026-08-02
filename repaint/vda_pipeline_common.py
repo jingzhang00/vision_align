@@ -12,6 +12,7 @@ import re
 import shutil
 import signal
 import subprocess
+import tempfile
 import time
 from typing import Any, Sequence
 
@@ -223,31 +224,36 @@ def format_elapsed(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
+TOTAL_PROGRESS_BAR_FORMAT = (
+    "{desc}: {percentage:3.0f}%|{bar}| ETA {remaining}"
+)
+
+
 def run_stage_process(
     *,
     command: Sequence[str],
     stage_id: str,
-    stage_name: str,
-    item_key: str,
-    item_label: str,
     progress: Any,
-    pipeline_started: float,
     poll_seconds: float,
     cwd: Path,
 ) -> None:
     """Run one pipeline stage and keep its aggregate progress bar current."""
 
-    stage_started = time.perf_counter()
     environment = os.environ.copy()
     environment["PYTHONUNBUFFERED"] = "1"
-    process = subprocess.Popen(
-        list(command),
-        cwd=cwd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        env=environment,
-        start_new_session=True,
-    )
+    output = tempfile.TemporaryFile()
+    try:
+        process = subprocess.Popen(
+            list(command),
+            cwd=cwd,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+            env=environment,
+            start_new_session=True,
+        )
+    except BaseException:
+        output.close()
+        raise
 
     def terminate_process_group() -> None:
         def signal_group(group_signal: signal.Signals) -> None:
@@ -274,26 +280,24 @@ def run_stage_process(
                 continue
 
     try:
-        while True:
-            try:
-                return_code = process.wait(timeout=poll_seconds)
-            except subprocess.TimeoutExpired:
-                return_code = None
-            now = time.perf_counter()
-            progress.set_postfix(
-                stage=stage_name,
-                **{
-                    item_key: item_label,
-                    "stage_elapsed": format_elapsed(now - stage_started),
-                    "total_elapsed": format_elapsed(now - pipeline_started),
-                    "refresh": True,
-                },
-            )
-            if return_code is not None:
-                break
-    except BaseException:
-        terminate_process_group()
-        raise
-    if return_code != 0:
-        terminate_process_group()
-        raise RuntimeError(f"{stage_id} failed with exit code {return_code}")
+        try:
+            while True:
+                try:
+                    return_code = process.wait(timeout=poll_seconds)
+                except subprocess.TimeoutExpired:
+                    return_code = None
+                progress.refresh()
+                if return_code is not None:
+                    break
+        except BaseException:
+            terminate_process_group()
+            raise
+        if return_code != 0:
+            terminate_process_group()
+            output.seek(0)
+            lines = output.read().decode(errors="replace").splitlines()
+            detail = "\n".join(lines[-20:])
+            message = f"{stage_id} failed with exit code {return_code}"
+            raise RuntimeError(f"{message}\n{detail}" if detail else message)
+    finally:
+        output.close()

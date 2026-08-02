@@ -4,24 +4,27 @@
 The route mirrors the current EgoDex repaint pipeline after adapting Nymeria's
 native inputs:
 
-    Aria MPS + XSens camera calibration
+    raw Aria MPS camera trajectory
       -> Nymeria full-body GMR LeRobot (fixed-open hands)
       -> human-arm repaint
       -> metric Video Depth Anything RGB-D preparation
       -> source-sized Isaac robot-camera replay
 
-Camera translation follows the EgoDex camera-relative-to-hip mapping.  Nymeria
-does not contain articulated fingertips, so scene placement aligns its
-declared rigid-palm action frames to the matching replayed G1 palms.
+The first five frames fit one fixed Aria-world-to-G1-world camera transform.
+The original camera rotation trajectory is preserved without a rejection
+threshold, and Isaac scene alignment is disabled because retargeting already
+anchors the camera.
 """
 
 from __future__ import annotations
 
 import argparse
+from contextlib import redirect_stdout
 from dataclasses import asdict, dataclass
 from functools import lru_cache
 import hashlib
 import json
+from io import StringIO
 import math
 from pathlib import Path
 import sys
@@ -31,6 +34,8 @@ from typing import Any, Sequence
 import numpy as np
 import pyarrow.parquet as pq
 from tqdm import tqdm
+
+_write_notice = tqdm.write
 
 
 SCRIPT_PATH = Path(__file__).resolve()
@@ -47,26 +52,22 @@ from repaint.nymeria.nymeria_adapter import (  # noqa: E402
     natural_key,
 )
 from repaint.lighting_profile import load_lighting_profile  # noqa: E402
-from repaint.nymeria.nymeria_to_lerobot import (  # noqa: E402
-    VIDEO_KEY,
-    load_source_episode,
-)
+with redirect_stdout(StringIO()):
+    from repaint.nymeria.nymeria_to_lerobot import (  # noqa: E402
+        VIDEO_KEY,
+        load_source_episode,
+    )
 from repaint.robot_camera import (  # noqa: E402
     BEINGBEYOND_HEAD_CAMERA_PROFILE,
-    robot_palm_offsets_local_m,
-)
-from repaint.scene_hand_alignment import (  # noqa: E402
-    PALM_ALIGNMENT_METHOD,
-    PALM_ALIGNMENT_STAGE,
 )
 from repaint.vda_depth import (  # noqa: E402
     DEFAULT_CHECKPOINT,
     DEFAULT_VDA_METRIC_SCALE,
 )
 from repaint.vda_pipeline_common import (  # noqa: E402
+    TOTAL_PROGRESS_BAR_FORMAT,
     VideoMetadata,
     build_command as _command,
-    format_elapsed as _format_elapsed,
     load_previous_stages as _load_previous_stages,
     probe_video,
     read_json as _read_json,
@@ -139,7 +140,6 @@ class PipelineConfig:
     headless: bool
     require_visible_hands: bool
     hardware_encoding: bool
-    hand_eye_sample_fps: float
     scene_scale: float | None
     vda_checkpoint: Path | None
     stop_after: str
@@ -156,14 +156,6 @@ class Stage:
     session: str | None = None
     episode_index: int | None = None
     clip_stems: tuple[str, ...] = ()
-
-    @property
-    def label(self) -> str:
-        if self.session is not None:
-            return self.session
-        if self.episode_index is not None:
-            return f"{self.episode_index:06d}"
-        return "all"
 
 
 @dataclass(frozen=True)
@@ -522,8 +514,6 @@ def build_plan(
                 config.paths.alignment_reports,
                 "--adapter-output",
                 config.alignment_root,
-                "--hand-eye-sample-fps",
-                repr(config.hand_eye_sample_fps),
             ]
             for clip in session_clips:
                 arguments.extend(["--clip", clip.stem])
@@ -652,7 +642,7 @@ def build_plan(
                         "--capture-view",
                         "robot-camera",
                         "--scene-alignment",
-                        "initial-palms",
+                        "none",
                         "--scene-leveling",
                         "none",
                         (
@@ -725,15 +715,15 @@ def _validate_alignment(stage: Stage, plan: PipelinePlan) -> None:
             f"Nymeria alignment report is not complete: "
             f"{report.get('status')!r}"
         )
-    hand_eye = report.get("hand_eye")
-    if not isinstance(hand_eye, dict):
-        raise ValueError("Nymeria alignment report has no hand-eye audit")
-    if float(hand_eye.get("p95_rotation_error_degrees", math.inf)) > 10.0:
-        raise ValueError("Nymeria hand-eye p95 rotation residual exceeds 10 deg")
-    if float(hand_eye.get("p95_translation_error_m", math.inf)) > 0.10:
-        raise ValueError("Nymeria hand-eye p95 translation residual exceeds 10 cm")
-    if float(hand_eye.get("maximum_time_error_us", math.inf)) > 5000.0:
-        raise ValueError("Nymeria hand-eye timestamp residual exceeds 5 ms")
+    trajectory = report.get("camera_trajectory")
+    if (
+        not isinstance(trajectory, dict)
+        or trajectory.get("uses_208d_pose") is not False
+        or trajectory.get("rotation_rejection_threshold_degrees") is not None
+    ):
+        raise ValueError(
+            "Nymeria alignment is not a threshold-free raw camera trajectory"
+        )
 
     prepared = report.get("prepared")
     if not isinstance(prepared, list):
@@ -771,17 +761,17 @@ def _validate_retarget(
     quality_gate = manifest.get("camera_alignment_quality_gate", {})
     if not isinstance(quality_gate, dict) or quality_gate.get("status") != "passed":
         raise ValueError("Nymeria LeRobot camera alignment gate did not pass")
-    report_entries = quality_gate.get("hand_eye_quality_reports")
+    report_entries = quality_gate.get("camera_trajectory_reports")
     if not isinstance(report_entries, list):
-        raise ValueError("Nymeria LeRobot has no hand-eye report provenance")
+        raise ValueError("Nymeria LeRobot has no camera trajectory provenance")
     expected_sessions = {clip.session for clip in plan.clips}
     recorded_reports: dict[str, dict[str, Any]] = {}
     for item in report_entries:
         if not isinstance(item, dict):
-            raise ValueError("Invalid hand-eye report provenance entry")
+            raise ValueError("Invalid camera trajectory provenance entry")
         report_path = Path(str(item.get("path", ""))).resolve()
         if report_path.name != "visual_alignment_report.json":
-            raise ValueError("Invalid hand-eye report provenance path")
+            raise ValueError("Invalid camera trajectory provenance path")
         session = report_path.parent.name
         expected_path = (
             plan.config.alignment_report_root
@@ -789,19 +779,19 @@ def _validate_retarget(
             / "visual_alignment_report.json"
         ).resolve()
         if report_path != expected_path or session in recorded_reports:
-            raise ValueError("Hand-eye report provenance does not match config")
+            raise ValueError("Camera trajectory provenance does not match config")
         if report_path.is_file():
             if hashlib.sha256(report_path.read_bytes()).hexdigest() != item.get(
                 "sha256"
             ):
                 raise ValueError(
-                    f"Hand-eye report changed after retarget: {session}"
+                    f"Camera trajectory report changed after retarget: {session}"
                 )
         elif not allow_pruned_alignment:
             raise FileNotFoundError(report_path)
         recorded_reports[session] = item
     if set(recorded_reports) != expected_sessions:
-        raise ValueError("Hand-eye report provenance has incorrect sessions")
+        raise ValueError("Camera trajectory provenance has incorrect sessions")
     if "observation.camera_pose" not in info.get("features", {}):
         raise ValueError("Nymeria LeRobot has no observation.camera_pose")
     episodes = manifest.get("episodes")
@@ -838,13 +828,18 @@ def _validate_retarget(
                     digest.update(chunk)
             if digest.hexdigest() != alignment.get("adapter_hdf5_sha256"):
                 raise ValueError(f"{clip.stem} camera adapter content changed")
-        if alignment.get("hand_eye_quality_report") != recorded_reports[
+        if alignment.get("camera_trajectory_report") != recorded_reports[
             clip.session
         ]:
-            raise ValueError(f"{clip.stem} hand-eye provenance changed")
+            raise ValueError(f"{clip.stem} camera trajectory provenance changed")
         metrics = alignment.get("metrics", {})
-        if float(metrics.get("basis_rotation_error_p95_degrees", math.inf)) > 10.0:
-            raise ValueError(f"{clip.stem} camera/body basis residual is too high")
+        if (
+            metrics.get("mapping")
+            != "raw Aria camera to G1 camera, fixed first-five-frame similarity"
+            or metrics.get("source_camera_rotation_rejection_threshold_degrees")
+            is not None
+        ):
+            raise ValueError(f"{clip.stem} camera mapping policy changed")
         if int(metrics.get("scene_scale_application_count", -1)) != 1:
             raise ValueError(f"{clip.stem} scene scale was not applied exactly once")
         scale = float(
@@ -852,11 +847,28 @@ def _validate_retarget(
         )
         if not math.isfinite(scale) or scale <= 0.0:
             raise ValueError(f"{clip.stem} has an invalid camera scale")
+        rotation = np.asarray(
+            alignment.get("source_to_robot_rotation"),
+            dtype=np.float64,
+        )
+        translation = np.asarray(
+            alignment.get("source_to_robot_translation"),
+            dtype=np.float64,
+        )
+        if (
+            rotation.shape != (3, 3)
+            or translation.shape != (3,)
+            or not np.isfinite(rotation).all()
+            or not np.isfinite(translation).all()
+        ):
+            raise ValueError(f"{clip.stem} has an invalid fixed camera transform")
 
         row = rows[clip.episode_index]
         length = int(row["length"])
         if length != clip.video.frame_count:
             raise ValueError(f"{clip.stem} LeRobot length differs from source")
+        if int(metrics.get("fit_window_frames", -1)) != min(5, length):
+            raise ValueError(f"{clip.stem} did not use the first five camera frames")
         data_path = root / str(info["data_path"]).format(
             chunk_index=int(row["data/chunk_index"]),
             file_index=int(row["data/file_index"]),
@@ -1438,80 +1450,13 @@ def _validate_render(
     alignment = report.get("scene_alignment")
     if (
         not isinstance(alignment, dict)
-        or int(alignment.get("schema_version", -1)) < 2
-        or alignment.get("method") != PALM_ALIGNMENT_METHOD
-        or alignment.get("requested_mode") != "initial-palms"
-        or int(alignment.get("pipeline_order", -1)) != 2
-        or int(alignment.get("application_count", -1)) != 1
-        or alignment.get("source_hand_target_mode") != "rigid_palm"
-        or alignment.get("source_visibility_confidence_used") is not False
-        or any(
-            bool(alignment.get(key, True))
-            for key in (
-                "fits_rotation",
-                "fits_scale",
-                "fits_linear_leveling",
-            )
-        )
+        or alignment.get("method") != "disabled"
+        or alignment.get("requested_mode") != "none"
+        or int(alignment.get("application_count", -1)) != 0
     ):
-        raise ValueError(
-            "Nymeria final render must apply rigid-palm scene alignment"
-        )
-    translation = np.asarray(
-        alignment.get("world_translation_xyz_m"),
-        dtype=np.float64,
-    )
-    if (
-        translation.shape != (3,)
-        or not np.isfinite(translation).all()
-    ):
-        raise ValueError("Nymeria palm scene-alignment translation is invalid")
-    semantics = alignment.get("anchor_semantics")
-    robot_palm_offsets = np.asarray(
-        semantics.get("robot_palm_local_offsets_m")
-        if isinstance(semantics, dict)
-        else None,
-        dtype=np.float64,
-    )
-    source_palm_offsets = np.asarray(
-        semantics.get("source_wrist_to_palm_offsets_local_m")
-        if isinstance(semantics, dict)
-        else None,
-        dtype=np.float64,
-    )
-    expected_robot_palm_offsets = robot_palm_offsets_local_m(
-        Path(str(robot.get("urdf")))
-    )
-    scene_scale = float(alignment.get("scene_scale", math.nan))
-    if (
-        not isinstance(semantics, dict)
-        or semantics.get("source_transform_origins")
-        != ["transforms/leftHand", "transforms/rightHand"]
-        or semantics.get("robot_parent_frame_origins")
-        != ["left_wrist_yaw_link", "right_wrist_yaw_link"]
-        or semantics.get("source_transform_semantics")
-        != "wrist joint origins"
-        or semantics.get("uses_source_wrist_origins") is not True
-        or robot_palm_offsets.shape != (2, 3)
-        or source_palm_offsets.shape != (2, 3)
-        or not np.array_equal(
-            robot_palm_offsets,
-            expected_robot_palm_offsets,
-        )
-        or not np.allclose(
-            scene_scale * source_palm_offsets,
-            robot_palm_offsets,
-            rtol=0.0,
-            atol=1e-12,
-        )
-        or semantics.get("matches_retarget_rigid_palm_action_frames")
-        is not True
-        or semantics.get("uses_fingertips") is not False
-        or semantics.get("uses_hand_base_origins") is not False
-    ):
-        raise ValueError("Nymeria rigid-palm scene-alignment audit is invalid")
+        raise ValueError("Nymeria final render must disable scene alignment")
     operation_order = report.get("operation_order")
-    if operation_order != [PALM_ALIGNMENT_STAGE]:
+    if operation_order != []:
         raise ValueError("Nymeria scene-placement order is invalid")
     leveling = report.get("scene_leveling")
     if (
@@ -1612,18 +1557,13 @@ def _run_stage(
     stage: Stage,
     progress: tqdm[Any],
     *,
-    pipeline_started: float,
     poll_seconds: float,
 ) -> None:
     assert stage.command is not None
     _run_process(
         command=stage.command,
         stage_id=stage.stage_id,
-        stage_name=stage.name,
-        item_key="item",
-        item_label=stage.label,
         progress=progress,
-        pipeline_started=pipeline_started,
         poll_seconds=poll_seconds,
         cwd=WORKSPACE_ROOT,
     )
@@ -1702,8 +1642,8 @@ def _new_report(plan: PipelinePlan) -> dict[str, Any]:
             else "generated_by_this_pipeline"
         ),
         "camera_mapping": (
-            "EgoDex camera-relative-to-hip mapping onto current GMR root; "
-            "GMR wrist scale applied once"
+            "raw Aria camera mapped to the exact G1 head camera by one "
+            "fixed first-five-frame similarity; GMR wrist scale applied once"
         ),
         "hand_policy": (
             "51-DoF G1 with 29 retargeted body joints and 22 fixed-open hand "
@@ -1716,9 +1656,8 @@ def _new_report(plan: PipelinePlan) -> dict[str, Any]:
             "visuals are hidden"
         ),
         "scene_alignment_policy": (
-            "support-plane leveling disabled; one constant XYZ translation "
-            "aligns Nymeria leftHand/rightHand rigid-palm action frames to "
-            "the matching replayed G1 canonical palm frames"
+            "support-plane leveling and Isaac scene alignment disabled; "
+            "retargeting already anchors the raw Aria camera to G1 world"
         ),
         "video_metadata_policy": (
             "ffprobe decoded/displayed frame count, source FPS and source "
@@ -1988,6 +1927,17 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
             ):
                 skipped_by_episode[episode_index] = dict(skipped)
     report["skipped_episodes"] = list(skipped_by_episode.values())
+    for episode_index in sorted(retained_render_indices):
+        _write_notice(
+            f"[SKIPPED] episode={_clip_by_index(plan, episode_index).stem} "
+            "reason=already_completed"
+        )
+    for episode_index in sorted(skipped_by_episode):
+        skipped = skipped_by_episode[episode_index]
+        _write_notice(
+            f"[SKIPPED] episode={_clip_by_index(plan, episode_index).stem} "
+            f"reason=previous_failure stage={skipped['failed_stage']}"
+        )
     dependents: dict[str, list[str]] = {}
     for planned_stage in plan.stages:
         for dependency in planned_stage.dependencies:
@@ -2029,6 +1979,7 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
         clip = _clip_by_index(plan, episode_index)
         source = clip.source
         session_root = plan.config.src_root / clip.session
+        is_new = episode_index not in skipped_by_episode
         skipped = skipped_by_episode.setdefault(
             episode_index,
             {
@@ -2081,6 +2032,11 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
                 "recorded_at": _utc_now(),
             },
         )
+        if is_new:
+            _write_notice(
+                f"[FAILED] episode={clip.stem} stage={stage.name}; "
+                "remaining_stages=skipped"
+            )
         if not plan.config.retain_intermediates:
             try:
                 if stage.name in {"prepare", "render"}:
@@ -2095,6 +2051,21 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
                     }
                 )
         report["skipped_episodes"] = list(skipped_by_episode.values())
+
+    def write_global_failure(stage: Stage) -> None:
+        affected = len(stage.clip_stems) or sum(
+            clip.episode_index not in retained_render_indices
+            for clip in plan.clips
+        )
+        scope = (
+            f"session={stage.session}"
+            if stage.session is not None
+            else "scope=all"
+        )
+        _write_notice(
+            f"[FAILED] {scope} stage={stage.name} "
+            f"affected_episodes={affected}"
+        )
 
     def cleanup_completed_episode(stage: Stage) -> None:
         assert stage.episode_index is not None
@@ -2153,6 +2124,7 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
         desc="Nymeria VDA",
         unit="stage",
         dynamic_ncols=True,
+        bar_format=TOTAL_PROGRESS_BAR_FORMAT,
     ) as progress:
         try:
             for stage in plan.stages:
@@ -2400,6 +2372,7 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
                             ),
                         )
                         persist_report()
+                        write_global_failure(stage)
                         raise error
                     invalidate_stage_and_dependents(stage.stage_id)
                     changed.add(stage.stage_id)
@@ -2450,7 +2423,6 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
                     _run_stage(
                         stage,
                         progress,
-                        pipeline_started=pipeline_started,
                         poll_seconds=plan.config.poll_seconds,
                     )
                     valid, reason = validate_stage(stage, plan)
@@ -2515,6 +2487,7 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
                         elapsed_seconds=time.perf_counter() - pipeline_started,
                     )
                     persist_report()
+                    write_global_failure(stage)
                     raise
                 for episode_index, failure in repaint_failures.items():
                     record_skipped_episode(
@@ -2729,7 +2702,6 @@ def _config_from_args(args: argparse.Namespace) -> PipelineConfig:
         headless=bool(args.headless),
         require_visible_hands=False,
         hardware_encoding=bool(args.hardware_encoding),
-        hand_eye_sample_fps=15.0,
         scene_scale=None,
         vda_checkpoint=None,
         stop_after="render",
@@ -2739,13 +2711,21 @@ def _config_from_args(args: argparse.Namespace) -> PipelineConfig:
 
 def main() -> None:
     args = build_parser().parse_args()
-    config = _config_from_args(args)
-    plan = build_plan(
-        config,
-        sessions=set(args.session) if args.session else None,
-        requested_clips=set(args.clip) if args.clip else None,
-    )
-    execute(plan)
+    try:
+        config = _config_from_args(args)
+        plan = build_plan(
+            config,
+            sessions=set(args.session) if args.session else None,
+            requested_clips=set(args.clip) if args.clip else None,
+        )
+        execute(plan)
+    except Exception as exc:
+        lines = str(exc).splitlines()
+        _write_notice(
+            f"[FAILED] pipeline reason="
+            f"{lines[-1] if lines else type(exc).__name__}"
+        )
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":

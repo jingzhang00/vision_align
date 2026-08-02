@@ -193,6 +193,32 @@ def _mapped_camera_poses(
     return np.concatenate([mapped_position, quaternions], axis=1)
 
 
+def _mapped_nymeria_camera_poses(
+    *,
+    source_camera_to_world: np.ndarray,
+    source_to_robot_rotation: np.ndarray,
+    source_to_robot_translation: np.ndarray,
+    scene_scale: float,
+) -> np.ndarray:
+    mapped_position = (
+        scene_scale
+        * (
+            source_to_robot_rotation
+            @ source_camera_to_world[:, :3, 3].T
+        ).T
+        + source_to_robot_translation
+    )
+    mapped_rotation = np.einsum(
+        "ij,njk->nik",
+        source_to_robot_rotation,
+        source_camera_to_world[:, :3, :3],
+    )
+    return np.concatenate(
+        [mapped_position, Rotation.from_matrix(mapped_rotation).as_quat()],
+        axis=1,
+    )
+
+
 def _resolve_scene_scale(
     *,
     recorded_scene_scale: float,
@@ -250,6 +276,7 @@ def load_rgbd_episode(
             source_episode["source_to_robot_rotation"],
             dtype=np.float64,
         )
+        source_to_robot_translation = None
     else:
         camera_alignment = source_episode.get("camera_alignment")
         if not isinstance(camera_alignment, dict):
@@ -267,6 +294,10 @@ def load_rgbd_episode(
         )
         source_to_robot_rotation = np.asarray(
             camera_alignment["source_to_robot_rotation"],
+            dtype=np.float64,
+        )
+        source_to_robot_translation = np.asarray(
+            camera_alignment["source_to_robot_translation"],
             dtype=np.float64,
         )
     resolved_scene_scale = _resolve_scene_scale(
@@ -381,11 +412,13 @@ def load_rgbd_episode(
             handle["transforms/camera"],
             dtype=np.float64,
         )
-        source_hip_to_world = np.asarray(
-            handle["transforms/hip"],
-            dtype=np.float64,
+        source_hip_to_world = (
+            np.asarray(handle["transforms/hip"], dtype=np.float64)
+            if dataset_kind == "egodex"
+            else None
         )
     if dataset_kind == "egodex":
+        assert source_hip_to_world is not None
         source_hip_to_world = source_hip_to_world.copy()
         source_hip_to_world[:, :3, 3] = _smooth_points(
             source_hip_to_world[:, :3, 3]
@@ -393,21 +426,45 @@ def load_rgbd_episode(
     if not np.allclose(source_intrinsic, intrinsics[0], atol=1e-5):
         raise ValueError("Source and LeRobot camera intrinsics disagree")
     expected_transform_shape = (length, 4, 4)
-    if (
-        source_camera_to_world.shape != expected_transform_shape
+    if source_camera_to_world.shape != expected_transform_shape:
+        raise ValueError("Source camera transform shape is invalid")
+    if dataset_kind == "egodex" and (
+        source_hip_to_world is None
         or source_hip_to_world.shape != expected_transform_shape
     ):
-        raise ValueError("Source camera/hip transform shapes are invalid")
+        raise ValueError("Source hip transform shape is invalid")
 
     if source_to_robot_rotation.shape != (3, 3):
         raise ValueError("source_to_robot_rotation must be 3x3")
-    mapped_camera_pose = _mapped_camera_poses(
-        root_positions=root_pose[:, :3],
-        source_camera_to_world=source_camera_to_world,
-        source_hip_to_world=source_hip_to_world,
-        source_to_robot_rotation=source_to_robot_rotation,
-        scene_scale=resolved_scene_scale,
-    )
+    if dataset_kind == "egodex":
+        assert source_hip_to_world is not None
+        mapped_camera_pose = _mapped_camera_poses(
+            root_positions=root_pose[:, :3],
+            source_camera_to_world=source_camera_to_world,
+            source_hip_to_world=source_hip_to_world,
+            source_to_robot_rotation=source_to_robot_rotation,
+            scene_scale=resolved_scene_scale,
+        )
+    else:
+        if (
+            source_to_robot_translation is None
+            or source_to_robot_translation.shape != (3,)
+            or not np.isfinite(source_to_robot_translation).all()
+        ):
+            raise ValueError("source_to_robot_translation must be finite 3D")
+        if scene_scale is not None:
+            source_to_robot_translation = (
+                recorded_camera_pose[0, :3]
+                - resolved_scene_scale
+                * source_to_robot_rotation
+                @ source_camera_to_world[0, :3, 3]
+            )
+        mapped_camera_pose = _mapped_nymeria_camera_poses(
+            source_camera_to_world=source_camera_to_world,
+            source_to_robot_rotation=source_to_robot_rotation,
+            source_to_robot_translation=source_to_robot_translation,
+            scene_scale=resolved_scene_scale,
+        )
     rotation_error = (
         Rotation.from_quat(mapped_camera_pose[:, 3:7]).inv()
         * Rotation.from_quat(recorded_camera_pose[:, 3:7])

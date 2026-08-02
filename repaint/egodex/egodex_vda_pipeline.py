@@ -9,6 +9,7 @@ prepared stages retain it, and the final Isaac recording is checked against it.
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 import math
 from pathlib import Path
@@ -18,6 +19,8 @@ import time
 from typing import Any, Iterable, Sequence
 
 from tqdm import tqdm
+
+_write_notice = tqdm.write
 
 SCRIPT_PATH = Path(__file__).resolve()
 WORKSPACE_ROOT = SCRIPT_PATH.parents[2]
@@ -35,9 +38,9 @@ from repaint.scene_leveling import (  # noqa: E402
     SUPPORT_PLANE_LEVELING_STAGE,
 )
 from repaint.vda_pipeline_common import (  # noqa: E402
+    TOTAL_PROGRESS_BAR_FORMAT,
     VideoMetadata,
     build_command as _stage_command,
-    format_elapsed as _format_elapsed,
     load_previous_stages as _load_previous_stages,
     natural_key as _natural_key,
     probe_video,
@@ -122,12 +125,6 @@ class Stage:
     command: tuple[str, ...]
     artifact_paths: tuple[Path, ...]
     dependencies: tuple[str, ...] = ()
-
-    @property
-    def episode_label(self) -> str:
-        if self.episode_index is None:
-            return "all"
-        return f"{self.episode_index:06d}"
 
 
 @dataclass(frozen=True)
@@ -1235,26 +1232,26 @@ def _run_stage_process(
     stage: Stage,
     progress: tqdm[Any],
     *,
-    task_started: float,
     poll_seconds: float,
 ) -> None:
-    """Run one child while continuously refreshing the task's sole bar."""
+    """Run one child while refreshing the aggregate bar."""
 
     _run_process(
         command=stage.command,
         stage_id=stage.stage_id,
-        stage_name=stage.name,
-        item_key="episode",
-        item_label=stage.episode_label,
         progress=progress,
-        pipeline_started=task_started,
         poll_seconds=poll_seconds,
         cwd=WORKSPACE_ROOT,
     )
 
 
-def execute_task(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
-    """Execute or resume one task with exactly one visible progress bar."""
+def execute_task(
+    plan: TaskPlan,
+    config: PipelineConfig,
+    *,
+    progress: tqdm[Any] | None = None,
+) -> dict[str, Any]:
+    """Execute or resume one task on the caller's aggregate progress bar."""
 
     previous_report: dict[str, Any] = {}
     if config.resume and not config.overwrite:
@@ -1400,6 +1397,19 @@ def execute_task(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
             if skipped.get("source_stem") == episode.stem:
                 skipped_by_episode[episode_index] = dict(skipped)
     report["skipped_episodes"] = list(skipped_by_episode.values())
+    for episode_index in sorted(retained_render_indices):
+        _write_notice(
+            f"[SKIPPED] episode={plan.task}/"
+            f"{plan.episodes[episode_index].stem} "
+            "reason=already_completed"
+        )
+    for episode_index in sorted(skipped_by_episode):
+        skipped = skipped_by_episode[episode_index]
+        _write_notice(
+            f"[SKIPPED] episode={plan.task}/"
+            f"{plan.episodes[episode_index].stem} "
+            f"reason=previous_failure stage={skipped['failed_stage']}"
+        )
     dependents: dict[str, list[str]] = {}
     for planned_stage in plan.stages:
         for dependency in planned_stage.dependencies:
@@ -1438,6 +1448,7 @@ def execute_task(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
         failure_status: str = "exception",
     ) -> None:
         source = plan.episodes[episode_index]
+        is_new = episode_index not in skipped_by_episode
         skipped = skipped_by_episode.setdefault(
             episode_index,
             {
@@ -1462,6 +1473,12 @@ def execute_task(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
                 "recorded_at": _utc_now(),
             },
         )
+        if is_new:
+            _write_notice(
+                f"[FAILED] episode={plan.task}/{source.stem} "
+                f"stage={stage.name}; "
+                "remaining_stages=skipped"
+            )
         if not config.retain_intermediates:
             try:
                 if stage.name in {"prepare", "render"}:
@@ -1476,6 +1493,16 @@ def execute_task(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
                     }
                 )
         report["skipped_episodes"] = list(skipped_by_episode.values())
+
+    def write_global_failure(stage: Stage) -> None:
+        affected = sum(
+            source.episode_index not in retained_render_indices
+            for source in plan.episodes
+        )
+        _write_notice(
+            f"[FAILED] task={plan.task} stage={stage.name} "
+            f"affected_episodes={affected}"
+        )
 
     def cleanup_completed_episode(stage: Stage) -> None:
         assert stage.episode_index is not None
@@ -1528,13 +1555,20 @@ def execute_task(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
 
     persist_report()
 
-    with tqdm(
-        total=len(plan.stages),
-        desc=plan.task,
-        unit="stage",
-        dynamic_ncols=True,
-        leave=True,
-    ) as progress:
+    progress_context = (
+        nullcontext(progress)
+        if progress is not None
+        else tqdm(
+            total=len(plan.stages),
+            desc="EgoDex VDA",
+            unit="stage",
+            dynamic_ncols=True,
+            leave=True,
+            bar_format=TOTAL_PROGRESS_BAR_FORMAT,
+        )
+    )
+    with progress_context as progress:
+        assert progress is not None
         try:
             for stage in plan.stages:
                 stage_entry = report_by_id[stage.stage_id]
@@ -1671,15 +1705,6 @@ def execute_task(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
                             else validation_reason
                         ),
                     )
-                    progress.set_postfix(
-                        stage=f"{stage.name}:{stage_entry['status']}",
-                        episode=stage.episode_label,
-                        stage_elapsed="00:00:00",
-                        total_elapsed=_format_elapsed(
-                            time.perf_counter() - task_started
-                        ),
-                        refresh=True,
-                    )
                     progress.update(1)
                     report["updated_at"] = _utc_now()
                     report["elapsed_seconds"] = (
@@ -1711,7 +1736,6 @@ def execute_task(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
                     _run_stage_process(
                         stage,
                         progress,
-                        task_started=task_started,
                         poll_seconds=config.poll_seconds,
                     )
                     valid, validation_reason = validate_stage_artifacts(
@@ -1744,17 +1768,6 @@ def execute_task(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
                             ),
                         )
                         persist_report()
-                        progress.set_postfix(
-                            stage=f"{stage.name}:skipped",
-                            episode=stage.episode_label,
-                            stage_elapsed=_format_elapsed(
-                                time.perf_counter() - stage_started
-                            ),
-                            total_elapsed=_format_elapsed(
-                                time.perf_counter() - task_started
-                            ),
-                            refresh=True,
-                        )
                         progress.update(1)
                         continue
                     report.update(
@@ -1765,6 +1778,7 @@ def execute_task(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
                         elapsed_seconds=time.perf_counter() - task_started,
                     )
                     persist_report()
+                    write_global_failure(stage)
                     raise
 
                 repaint_failures = (
@@ -1873,15 +1887,6 @@ def execute_task(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
             if report.get("cleanup_errors"):
                 report["updated_at"] = _utc_now()
                 persist_report()
-            progress.set_postfix(
-                stage=str(report["status"]),
-                episode="all",
-                stage_elapsed="00:00:00",
-                total_elapsed=_format_elapsed(
-                    time.perf_counter() - task_started
-                ),
-                refresh=True,
-            )
             return report
         except BaseException:
             if report.get("status") == "running":
@@ -1897,10 +1902,18 @@ def execute_task(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
 def run_pipeline(tasks: Iterable[str], config: PipelineConfig) -> list[dict[str, Any]]:
     """Run tasks sequentially because Isaac and GPU models are process-global."""
 
+    plans = [build_task_plan(task, config) for task in tasks]
     reports: list[dict[str, Any]] = []
-    for task in tasks:
-        plan = build_task_plan(task, config)
-        reports.append(execute_task(plan, config))
+    with tqdm(
+        total=sum(len(plan.stages) for plan in plans),
+        desc="EgoDex VDA",
+        unit="stage",
+        dynamic_ncols=True,
+        leave=True,
+        bar_format=TOTAL_PROGRESS_BAR_FORMAT,
+    ) as progress:
+        for plan in plans:
+            reports.append(execute_task(plan, config, progress=progress))
     return reports
 
 
@@ -1959,8 +1972,16 @@ def _config_from_args(args: argparse.Namespace) -> PipelineConfig:
 
 def main() -> None:
     args = build_parser().parse_args()
-    config = _config_from_args(args)
-    run_pipeline(args.tasks, config)
+    try:
+        config = _config_from_args(args)
+        run_pipeline(args.tasks, config)
+    except Exception as exc:
+        lines = str(exc).splitlines()
+        _write_notice(
+            f"[FAILED] pipeline reason="
+            f"{lines[-1] if lines else type(exc).__name__}"
+        )
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":

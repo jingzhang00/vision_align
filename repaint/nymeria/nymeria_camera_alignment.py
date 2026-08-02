@@ -41,7 +41,6 @@ from repaint.nymeria.nymeria_adapter import (  # noqa: E402
     ResampledMotion,
     discover_nymeria_clips,
     load_motion_metadata,
-    load_participant_height_m,
     load_scaled_intrinsic,
     natural_key,
     probe_display_video,
@@ -145,6 +144,15 @@ class ClipMotion:
 
 
 @dataclass(frozen=True)
+class CameraClip:
+    clip: NymeriaClip
+    video: DisplayVideoInfo
+    metadata: MotionMetadata
+    body_times_seconds: np.ndarray
+    aria_times_us: np.ndarray
+
+
+@dataclass(frozen=True)
 class PreparedClip:
     clip: NymeriaClip
     adapter_hdf5: Path
@@ -153,12 +161,11 @@ class PreparedClip:
     body_time_end: float
     motion_time_start: float
     motion_time_end: float
-    left_visible_fraction: float
-    right_visible_fraction: float
     maximum_slam_time_error_us: float
+    minimum_slam_quality: float
+    low_quality_slam_pose_count: int
     maximum_camera_translation_m: float
     maximum_camera_rotation_degrees: float
-    maximum_hand_displacement_m: float
 
 
 def _format_duration(seconds: float) -> str:
@@ -601,6 +608,23 @@ def load_clip_motion(clip: NymeriaClip) -> ClipMotion:
     )
 
 
+def load_camera_clip(clip: NymeriaClip) -> CameraClip:
+    """Load only the source video timeline needed by Aria camera poses."""
+
+    video = probe_display_video(clip.video_path)
+    metadata = load_motion_metadata(clip)
+    return CameraClip(
+        clip=clip,
+        video=video,
+        metadata=metadata,
+        body_times_seconds=metadata.csv_start_time + video.display_timestamps,
+        aria_times_us=(
+            metadata.csv_original_start_time + video.display_timestamps
+        )
+        * 1.0e6,
+    )
+
+
 def _sample_indices(
     display_timestamps: np.ndarray,
     *,
@@ -902,8 +926,6 @@ def _world_from_device(
             "Aria pose timestamp gap exceeds 2 ms: "
             f"{np.max(time_errors):.1f} us"
         )
-    if np.any(qualities < 0.5):
-        raise ValueError("Clip contains unreliable Aria closed-loop poses")
     transforms = np.repeat(
         np.eye(4, dtype=np.float64)[None],
         len(target_times_us),
@@ -1074,95 +1096,139 @@ def write_adapter_hdf5(
         temporary.unlink(missing_ok=True)
 
 
-def prepare_clip(
+def write_camera_adapter_hdf5(
+    path: Path,
     *,
-    clip_motion: ClipMotion,
+    camera_clip: CameraClip,
+    camera: CameraCalibration,
+    camera_to_world: np.ndarray,
+) -> None:
+    frame_count = camera_clip.video.frame_count
+    if camera_to_world.shape != (frame_count, 4, 4):
+        raise ValueError("Camera transform array has an inconsistent shape")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        with h5py.File(temporary, "w") as handle:
+            handle.attrs["llm_description"] = camera_clip.metadata.action_text
+            handle.attrs["source_video"] = str(camera_clip.clip.video_path)
+            handle.attrs["source_frame_start"] = 0
+            handle.attrs["camera_alignment_contract"] = (
+                "raw Aria world-from-OpenCV-camera trajectory"
+            )
+            handle.create_dataset("camera/intrinsic", data=camera.intrinsic)
+            handle.create_dataset("transforms/camera", data=camera_to_world)
+            metadata = handle.create_group("nymeria")
+            metadata.attrs["source_video"] = str(camera_clip.clip.video_path)
+            metadata.attrs["source_smpl_metadata"] = str(
+                camera_clip.clip.smpl_path
+            )
+            metadata.attrs["camera_alignment"] = (
+                "Project Aria closed-loop device poses plus recording RGB "
+                "extrinsic; no 208-D pose is used"
+            )
+            metadata.attrs["csv_start_time"] = (
+                camera_clip.metadata.csv_start_time
+            )
+            metadata.attrs["actual_start_time"] = (
+                camera_clip.metadata.actual_start_time
+            )
+            metadata.attrs["csv_original_start_time"] = (
+                camera_clip.metadata.csv_original_start_time
+            )
+            metadata.create_dataset(
+                "body_time_seconds", data=camera_clip.body_times_seconds
+            )
+            metadata.create_dataset(
+                "motion_time_seconds",
+                data=(
+                    camera_clip.body_times_seconds
+                    - camera_clip.metadata.actual_start_time
+                ),
+            )
+            metadata.create_dataset(
+                "aria_time_seconds", data=camera_clip.aria_times_us / 1.0e6
+            )
+            metadata.create_dataset(
+                "video_display_timestamp_seconds",
+                data=camera_clip.video.display_timestamps,
+            )
+            metadata.create_dataset(
+                "source_full_video_frame",
+                data=np.arange(frame_count, dtype=np.int64),
+            )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def prepare_camera_clip(
+    *,
+    camera_clip: CameraClip,
     adapter_root: Path,
     camera: CameraCalibration,
     slam: SlamTrajectory,
-    hand_eye: HandEyeResult,
-    participant_height_m: float,
 ) -> PreparedClip:
     intrinsic = load_scaled_intrinsic(
-        clip_motion.clip,
-        video_width=clip_motion.video.width,
-        video_height=clip_motion.video.height,
+        camera_clip.clip,
+        video_width=camera_clip.video.width,
+        video_height=camera_clip.video.height,
     )
     clip_camera = replace(
         camera,
         intrinsic=intrinsic,
-        resolution=(clip_motion.video.width, clip_motion.video.height),
+        resolution=(camera_clip.video.width, camera_clip.video.height),
     )
-    world_from_device, time_errors, _ = _world_from_device(
+    world_from_device, time_errors, qualities = _world_from_device(
         slam,
-        clip_motion.aria_times_us,
+        camera_clip.aria_times_us,
     )
-    aligned_parts, camera_to_world = world_space_parts(
-        clip_motion.body_transforms,
+    camera_to_world = np.einsum(
+        "nij,jk->nik",
         world_from_device,
-        camera=clip_camera,
-        hand_eye=hand_eye,
-        head_index=HEAD_BODY_INDEX,
+        clip_camera.device_from_video_camera,
     )
-    aligned_by_name = {
-        name: aligned_parts[:, index]
-        for index, (name, _) in enumerate(MOTION_BODY_JOINTS)
-    }
-    left_hands = aligned_by_name["leftHand"]
-    right_hands = aligned_by_name["rightHand"]
-    world_to_camera = np.linalg.inv(camera_to_world)
-    left_observation = np.einsum(
-        "nij,njk->nik",
-        world_to_camera,
-        left_hands,
-    )
-    right_observation = np.einsum(
-        "nij,njk->nik",
-        world_to_camera,
-        right_hands,
-    )
-    left_visible = _visibility(
-        left_observation,
-        intrinsic=clip_camera.intrinsic,
-        resolution=clip_camera.resolution,
-    )
-    right_visible = _visibility(
-        right_observation,
-        intrinsic=clip_camera.intrinsic,
-        resolution=clip_camera.resolution,
-    )
-    motion_metrics = _fixed_base_motion_metrics(
-        camera_to_world=camera_to_world,
-        left_hands=left_hands,
-        right_hands=right_hands,
-    )
-    adapter_hdf5 = adapter_root / f"{clip_motion.clip.stem}.hdf5"
-    write_adapter_hdf5(
+    adapter_hdf5 = adapter_root / f"{camera_clip.clip.stem}.hdf5"
+    write_camera_adapter_hdf5(
         adapter_hdf5,
-        clip_motion=clip_motion,
+        camera_clip=camera_clip,
         camera=clip_camera,
         camera_to_world=camera_to_world,
-        aligned_parts=aligned_parts,
-        left_confidence=left_visible.astype(np.float32),
-        right_confidence=right_visible.astype(np.float32),
-        participant_height_m=participant_height_m,
+    )
+    reference_world_to_camera = np.linalg.inv(camera_to_world[0])
+    relative_camera = np.einsum(
+        "ij,njk->nik", reference_world_to_camera, camera_to_world
     )
     motion_times = (
-        clip_motion.body_times_seconds
-        - clip_motion.metadata.actual_start_time
+        camera_clip.body_times_seconds - camera_clip.metadata.actual_start_time
     )
     return PreparedClip(
-        clip=clip_motion.clip,
+        clip=camera_clip.clip,
         adapter_hdf5=adapter_hdf5,
-        frame_count=clip_motion.video.frame_count,
-        body_time_start=float(clip_motion.body_times_seconds[0]),
-        body_time_end=float(clip_motion.body_times_seconds[-1]),
+        frame_count=camera_clip.video.frame_count,
+        body_time_start=float(camera_clip.body_times_seconds[0]),
+        body_time_end=float(camera_clip.body_times_seconds[-1]),
         motion_time_start=float(motion_times[0]),
         motion_time_end=float(motion_times[-1]),
-        left_visible_fraction=float(np.mean(left_visible)),
-        right_visible_fraction=float(np.mean(right_visible)),
         maximum_slam_time_error_us=float(np.max(time_errors)),
-        **motion_metrics,
+        minimum_slam_quality=float(np.min(qualities)),
+        low_quality_slam_pose_count=int(np.count_nonzero(qualities < 0.5)),
+        maximum_camera_translation_m=float(
+            np.max(np.linalg.norm(relative_camera[:, :3, 3], axis=1))
+        ),
+        maximum_camera_rotation_degrees=float(
+            np.max(
+                np.degrees(
+                    Rotation.from_matrix(
+                        relative_camera[:, :3, :3]
+                    ).magnitude()
+                )
+            )
+        ),
     )
 
 
@@ -1218,7 +1284,6 @@ def _prepared_report(clip: PreparedClip) -> dict[str, Any]:
     return {
         "clip": clip.clip.stem,
         "source_video": str(clip.clip.video_path),
-        "source_motion_208": str(clip.clip.motion_208_path),
         "source_smpl_metadata": str(clip.clip.smpl_path),
         "adapter_hdf5": str(clip.adapter_hdf5),
         "frame_count": clip.frame_count,
@@ -1230,29 +1295,28 @@ def _prepared_report(clip: PreparedClip) -> dict[str, Any]:
             clip.motion_time_start,
             clip.motion_time_end,
         ],
-        "left_visible_fraction": clip.left_visible_fraction,
-        "right_visible_fraction": clip.right_visible_fraction,
         "maximum_slam_pose_time_error_us": (
             clip.maximum_slam_time_error_us
         ),
-        "fixed_base_motion": {
+        "slam_quality": {
+            "minimum": clip.minimum_slam_quality,
+            "below_0_5_frame_count": clip.low_quality_slam_pose_count,
+            "rejection_threshold": None,
+        },
+        "raw_camera_motion": {
             "maximum_camera_translation_m": (
                 clip.maximum_camera_translation_m
             ),
             "maximum_camera_rotation_degrees": (
                 clip.maximum_camera_rotation_degrees
             ),
-            "maximum_hand_displacement_m": (
-                clip.maximum_hand_displacement_m
-            ),
+            "rotation_rejection_threshold_degrees": None,
         },
     }
 
 
 def run(args: argparse.Namespace) -> int:
     started = time.perf_counter()
-    if not 0.0 < args.hand_eye_sample_fps <= 240.0:
-        raise ValueError("--hand-eye-sample-fps must be in (0, 240]")
     episode_root = Path(args.episode_root).expanduser().resolve()
     if not episode_root.is_dir():
         raise NotADirectoryError(f"Nymeria episode not found: {episode_root}")
@@ -1272,54 +1336,42 @@ def run(args: argparse.Namespace) -> int:
             raise ValueError("--max-clips must be positive")
         selected = selected[: args.max_clips]
 
-    clip_motions: list[ClipMotion] = []
-    calibration_rejected: list[dict[str, str]] = []
+    camera_clips: list[CameraClip] = []
+    rejected: list[dict[str, str]] = []
     with tqdm(
-        discovered,
-        desc="Nymeria session clips",
+        selected,
+        desc="Nymeria camera clips",
         unit="clip",
         dynamic_ncols=True,
     ) as progress:
         for clip in progress:
             try:
-                clip_motions.append(load_clip_motion(clip))
+                camera_clips.append(load_camera_clip(clip))
             except Exception as error:
-                calibration_rejected.append(
+                rejected.append(
                     {
                         "clip": clip.stem,
                         "error": f"{type(error).__name__}: {error}",
                     }
                 )
-    by_stem = {motion.clip.stem: motion for motion in clip_motions}
+    by_stem = {clip.clip.stem: clip for clip in camera_clips}
     missing_selected = [
         clip.stem for clip in selected if clip.stem not in by_stem
     ]
     if missing_selected:
         raise ValueError(
-            "Selected clips failed temporal/body preparation: "
+            "Selected clips failed camera timeline preparation: "
             f"{missing_selected}"
         )
 
     slam = load_slam_trajectory(
         episode_root / CAMERA_TRAJECTORY_RELATIVE_PATH
     )
-    hand_eye, calibration_stems = estimate_session_hand_eye(
-        clips=clip_motions,
-        slam=slam,
-        sample_fps=args.hand_eye_sample_fps,
-    )
-    tqdm.write(
-        "Session hand-eye calibrated from "
-        f"{hand_eye.clip_count} clips / {hand_eye.sample_count} motion pairs: "
-        f"median={hand_eye.median_rotation_error_degrees:.3f} deg / "
-        f"{1000.0 * hand_eye.median_translation_error_m:.2f} mm"
-    )
 
     camera = load_recording_camera(
         episode_root / CAMERA_CALIBRATION_RELATIVE_PATH,
-        discovered[0].camera_intrinsics_path,
+        selected[0].camera_intrinsics_path,
     )
-    participant_height_m = load_participant_height_m(discovered[0])
     adapter_base = (
         Path(args.adapter_output).expanduser().resolve()
         if args.adapter_output is not None
@@ -1332,24 +1384,18 @@ def run(args: argparse.Namespace) -> int:
     prepared: list[PreparedClip] = []
     for clip in selected:
         prepared.append(
-            prepare_clip(
-                clip_motion=by_stem[clip.stem],
+            prepare_camera_clip(
+                camera_clip=by_stem[clip.stem],
                 adapter_root=adapter_root,
                 camera=camera,
                 slam=slam,
-                hand_eye=hand_eye,
-                participant_height_m=participant_height_m,
             )
         )
 
     report = {
-        "schema_version": 5,
+        "schema_version": 6,
         "status": "prepared_only",
         "episode": episode_root.name,
-        "participant": {
-            "metadata": str(discovered[0].session_metadata_path),
-            "height_m": participant_height_m,
-        },
         "timeline_policy": {
             "aria_time": (
                 "csv_original_start_time + video_display_timestamp"
@@ -1361,7 +1407,7 @@ def run(args: argparse.Namespace) -> int:
             "video_timestamps": "ffprobe displayed frames",
         },
         "intrinsics": {
-            "path": str(discovered[0].camera_intrinsics_path),
+            "path": str(selected[0].camera_intrinsics_path),
             "distortion_coefficients": [],
         },
         "recording_head": {
@@ -1393,16 +1439,22 @@ def run(args: argparse.Namespace) -> int:
                 camera.device_from_video_camera.tolist()
             ),
         },
-        "hand_eye": hand_eye.as_dict(),
-        "hand_eye_calibration_clips": list(calibration_stems),
-        "hand_eye_rejected_clips": calibration_rejected,
+        "camera_trajectory": {
+            "source": "Project Aria closed-loop device poses",
+            "uses_208d_pose": False,
+            "rotation_rejection_threshold_degrees": None,
+            "quality_policy": (
+                "finite in-range SLAM poses with timestamp distance <= 2 ms; "
+                "tracking quality is audited but does not reject a clip"
+            ),
+        },
+        "camera_timeline_rejected_clips": rejected,
         "requested_clips": [clip.stem for clip in selected],
         "adapter_contract": {
             "camera_transform": (
                 "transforms/camera = T_SourceWorld_CameraOpenCV"
             ),
-            "hip_transform": "transforms/hip = T_SourceWorld_Hip",
-            "hand_targets": "rigid wrist/palm only; no synthesized fingertips",
+            "body_transforms": "not written; 208-D is retarget-only",
             "frame_mapping": "one adapter frame per displayed MP4 frame",
         },
         "prepared": [_prepared_report(clip) for clip in prepared],
@@ -1412,8 +1464,7 @@ def run(args: argparse.Namespace) -> int:
     }
     _atomic_write_json(report_path, report)
     tqdm.write(
-        f"Wrote {len(prepared)} selected alignment HDF5 file(s); "
-        f"session calibration used {len(calibration_stems)} clips; "
+        f"Wrote {len(prepared)} selected raw-camera HDF5 file(s); "
         f"elapsed={_format_duration(time.perf_counter() - started)}"
     )
     return 0
@@ -1422,8 +1473,8 @@ def run(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Calibrate Nymeria same-stem MP4/208-D/SMPL clips against "
-            "recording-level Aria MPS."
+            "Export raw recording-level Aria camera trajectories for "
+            "same-stem Nymeria clips."
         )
     )
     parser.add_argument(
@@ -1456,15 +1507,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-clips",
         type=int,
         help="Write only the first N selected/discovered clips",
-    )
-    parser.add_argument(
-        "--hand-eye-sample-fps",
-        type=float,
-        default=15.0,
-        help=(
-            "Per-clip hand-eye sampling rate; relative pairs never cross "
-            "clip boundaries (default: %(default)s)"
-        ),
     )
     return parser
 

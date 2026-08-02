@@ -1,0 +1,52 @@
+(vision-align) ai01@ai01-B650M-AORUS-PRO-AX:~/Downloads/vision_align$ ls egodex/
+arrange_topple_dominoes                     assemble_disassemble_furniture_bench_drawer        assemble_disassemble_furniture_bench_stool
+assemble_disassemble_furniture_bench_chair  assemble_disassemble_furniture_bench_lamp          assemble_disassemble_legos
+assemble_disassemble_furniture_bench_desk   assemble_disassemble_furniture_bench_square_table
+(vision-align) ai01@ai01-B650M-AORUS-PRO-AX:~/Downloads/vision_align$ bash batch_egodex.sh 
+add_remove_lid: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████| 4/4 [04:06<00:00, 61.51s/stage, episode=all, stage=completed, stage_elapsed=00:00:00, total_elapsed=00:04:06]
+arrange_topple_dominoes: 100%|███████████████████████████████████████████████████████████████████████████████████████████| 4/4 [03:00<00:00, 45.25s/stage, episode=all, stage=completed, stage_elapsed=00:00:00, total_elapsed=00:03:00]
+assemble_disassemble_furniture_bench_chair: 100%|████████████████████████████████████████████████████████████████████████| 4/4 [03:01<00:00, 45.40s/stage, episode=all, stage=completed, stage_elapsed=00:00:00, total_elapsed=00:03:01]
+assemble_disassemble_furniture_bench_desk: 100%|█████████████████████████████████████████████████████████████████████████| 4/4 [04:48<00:00, 72.05s/stage, episode=all, stage=completed, stage_elapsed=00:00:00, total_elapsed=00:04:48]
+assemble_disassemble_furniture_bench_drawer: 100%|███████████████████████████████████████████████████████████████████████| 4/4 [01:56<00:00, 29.01s/stage, episode=all, stage=completed, stage_elapsed=00:00:00, total_elapsed=00:01:56]
+assemble_disassemble_furniture_bench_lamp: 100%|█████████████████████████████████████████████████████████████████████████| 4/4 [02:13<00:00, 33.45s/stage, episode=all, stage=completed, stage_elapsed=00:00:00, total_elapsed=00:02:13]
+assemble_disassemble_furniture_bench_square_table: 100%|█████████████████████████████████████████████████████████████████| 4/4 [02:50<00:00, 42.73s/stage, episode=all, stage=completed, stage_elapsed=00:00:00, total_elapsed=00:02:50]
+assemble_disassemble_furniture_bench_stool: 100%|███████████████████████████████████████████████████████████████████████| 4/4 [15:06<00:00, 226.74s/stage, episode=all, stage=completed, stage_elapsed=00:00:00, total_elapsed=00:15:06]
+assemble_disassemble_legos: 100%|███████████████████████████████████████████████████████████████████████████████████████| 4/4 [08:49<00:00, 132.30s/stage, episode=all, stage=completed, stage_elapsed=00:00:00, total_elapsed=00:08:49]
+assemble_disassemble_soft_legos: 100%|███████████████████████████████████████████████████████████████████████| 4/4 [55:08<00:00, 827.06s/stage, episode=all, stage=completed_with_skips, stage_elapsed=00:00:00, total_elapsed=00:55:08]
+assemble_disassemble_structures:   0%|                                                                                            | 0/4 [03:03<?, ?stage/s, episodeassemble_disassemble_structures:   0%|                      | 0/4 [03:04<?, ?stage/s, episode=all, stage=retarget, stage_elapsed=00:03:04, total_elapsed=00:03:04] assemble_disassemble_structures: 100%|█| 4/4 [43:44<00:00, 656.03s/stage, episode=all, stage=completed_with_skips, stage_elapsed=00:00:00, total_elapsed=00:43:44]
+assemble_disassemble_tiles: 100%|█████████████████| 4/4 [11:58<00:00, 179.53s/stage, episode=all, stage=completed, stage_elapsed=00:00:00, total_elapsed=00:11:58]
+assemble_jenga: 100%|██████████████████| 4/4 [10:46<00:00, 161.58s/stage, episode=all, stage=completed_with_skips, stage_elapsed=00:00:00, total_elapsed=00:10:46]
+basic_fold: 100%|█████████████████████████████████| 4/4 [18:19<00:00, 274.78s/stage, episode=all, stage=completed, stage_elapsed=00:00:00, total_elapsed=00:18:19]
+basic_pick_place: 100%|████████████████████████████| 4/4 [05:23<00:00, 80.96s/stage, episode=all, stage=completed, stage_elapsed=00:00:00, total_elapsed=00:05:23]
+boil_serve_egg: 100%|██████████████████| 4/4 [32:33<00:00, 488.31s/stage, episode=all, stage=completed_with_skips, stage_elapsed=00:00:00, total_elapsed=00:32:33]
+braid_unbraid: 100%|██████████████████████████████| 4/4 [19:31<00:00, 292.77s/stage, episode=all, stage=completed, stage_elapsed=00:00:00, total_elapsed=00:19:31]
+build_unstack_lego: 100%|██████████████| 4/4 [16:29<00:00, 247.27s/stage, episode=all, stage=completed_with_skips, stage_elapsed=00:00:00, total_elapsed=00:16:29]
+charge_uncharge_airpods: 100%|█████████████████████| 4/4 [02:22<00:00, 35.52s/stage, episode=all, stage=completed, stage_elapsed=00:00:00, total_elapsed=00:02:22]
+charge_uncharge_device: 100%|██████████████████████| 4/4 [04:52<00:00, 73.09s/stage, episode=all, stage=completed, stage_elapsed=00:00:00, total_elapsed=00:04:52]
+clean_cups: 100%|██████████████████████| 4/4 [10:41<00:00, 160.27s/stage, episode=all, stage=completed_with_skips, stage_elapsed=00:00:00, total_elapsed=00:10:41]
+clean_surface: 100%|██████████████████████████████| 4/4 [11:58<00:00, 179.72s/stage, episode=all, stage=completed, stage_elapsed=00:00:00, total_elapsed=00:11:58]
+clean_tableware: 100%|█████████████████| 4/4 [10:58<00:00, 164.54s/stage, episode=all, stage=completed_with_skips, stage_elapsed=00:00:00, total_elapsed=00:10:58]
+clip_unclip_papers: 100%|██████████████| 4/4 [35:08<00:00, 527.20s/stage, episode=all, stage=completed_with_skips, stage_elapsed=00:00:00, total_elapsed=00:35:08]
+color: 100%|██████████████████████████████████████| 4/4 [23:05<00:00, 346.47s/stage, episode=all, stage=completed, stage_elapsed=00:00:00, total_elapsed=00:23:05]
+crumple_flatten_paper: 100%|████████████████████████████████████████████████████████████████████████████████████████████| 4/4 [38:44<00:00, 581.06s/stage, episode=all, stage=completed, stage_elapsed=00:00:00, total_elapsed=00:38:44]
+deal_gather_cards: 100%|████████████████████████████████████████████████████████████████████████████████████████████████| 4/4 [11:30<00:00, 172.58s/stage, episode=all, stage=completed, stage_elapsed=00:00:00, total_elapsed=00:11:30]
+declutter_desk: 100%|████████████████████████████████████████████████████████████████████████████████████████| 4/4 [51:22<00:00, 770.64s/stage, episode=all, stage=completed_with_skips, stage_elapsed=00:00:00, total_elapsed=00:51:22]
+dry_hands: 100%|█████████████████████████████████████████████████████████████████████████████████████████████| 4/4 [10:42<00:00, 160.58s/stage, episode=all, stage=completed_with_skips, stage_elapsed=00:00:00, total_elapsed=00:10:42]
+fidget_magnetic_spinner_rings:   0%|                                                                                              | 0/4 [00:03<?, ?stage/s, episode=all, stage=retarget, stage_elapsed=00:00:03, total_elapsed=00:00:03]
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/home/ai01/Downloads/vision_align/repaint/egodex/egodex_vda_pipeline.py", line 1967, in <module>
+    main()
+  File "/home/ai01/Downloads/vision_align/repaint/egodex/egodex_vda_pipeline.py", line 1963, in main
+    run_pipeline(args.tasks, config)
+  File "/home/ai01/Downloads/vision_align/repaint/egodex/egodex_vda_pipeline.py", line 1903, in run_pipeline
+    reports.append(execute_task(plan, config))
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ai01/Downloads/vision_align/repaint/egodex/egodex_vda_pipeline.py", line 1711, in execute_task
+    _run_stage_process(
+  File "/home/ai01/Downloads/vision_align/repaint/egodex/egodex_vda_pipeline.py", line 1243, in _run_stage_process
+    _run_process(
+  File "/home/ai01/Downloads/vision_align/repaint/vda_pipeline_common.py", line 299, in run_stage_process
+    raise RuntimeError(f"{stage_id} failed with exit code {return_code}")
+RuntimeError: retarget failed with exit code 1
