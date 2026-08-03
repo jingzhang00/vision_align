@@ -327,10 +327,10 @@ def _inpaint_step_count(frame_count: int, chunk_size: int) -> int:
 def _is_nymeria_dataset_root(path: str | Path | None) -> bool:
     if path is None:
         return False
-    metadata_root = Path(path).expanduser().resolve() / "meta"
-    return (
-        (metadata_root / "nymeria.json").is_file()
-        and not (metadata_root / "egodex.json").exists()
+    root = Path(path).expanduser().resolve()
+    return (root / "manifest.json").is_file() or (
+        (root / "meta/nymeria.json").is_file()
+        and not (root / "meta/egodex.json").exists()
     )
 
 

@@ -586,7 +586,7 @@ def prepare(args: argparse.Namespace) -> dict[str, object]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Prepare one LeRobot G1 episode as handless RGB plus automatically "
+            "Prepare one retargeted G1 episode as handless RGB plus automatically "
             "calibrated metric Video Depth Anything for the unified Isaac "
             "replay."
         )
@@ -603,7 +603,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         required=True,
         help=(
-            "Handless dataset root mirroring the LeRobot video_path layout"
+            "Handless root mirroring the retargeted video layout"
         ),
     )
     parser.add_argument("--episode", type=int, default=0)

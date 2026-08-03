@@ -30,12 +30,8 @@ if str(WORKSPACE_ROOT) not in sys.path:
 from repaint.robot_camera import BEINGBEYOND_HEAD_CAMERA_PROFILE  # noqa: E402
 from repaint.lighting_profile import load_lighting_profile  # noqa: E402
 from repaint.scene_hand_alignment import (  # noqa: E402
-    HAND_TCP_ALIGNMENT_METHOD,
-    HAND_TCP_ALIGNMENT_STAGE,
-)
-from repaint.scene_leveling import (  # noqa: E402
-    SUPPORT_PLANE_LEVELING_METHOD,
-    SUPPORT_PLANE_LEVELING_STAGE,
+    PALM_ALIGNMENT_METHOD,
+    PALM_ALIGNMENT_STAGE,
 )
 from repaint.vda_pipeline_common import (  # noqa: E402
     VideoMetadata,
@@ -62,8 +58,7 @@ LEROBOT_CHUNKS_SIZE = 1000
 BEINGBEYOND_REFERENCE_SIZE = (640, 480)
 BEINGBEYOND_RESET_GUARD_X_M = 0.005
 SCENE_GEOMETRY_OPERATION_ORDER = (
-    SUPPORT_PLANE_LEVELING_STAGE,
-    HAND_TCP_ALIGNMENT_STAGE,
+    PALM_ALIGNMENT_STAGE,
 )
 
 
@@ -287,7 +282,7 @@ def build_task_plan(task: str, config: PipelineConfig) -> TaskPlan:
             )
         )
 
-        output_video = final_root / "g1_view.mp4"
+        output_video = final_root / episode.video_path.name
         render_arguments: list[str | Path] = [
             "--prepared",
             prepared_root,
@@ -295,6 +290,10 @@ def build_task_plan(task: str, config: PipelineConfig) -> TaskPlan:
             output_video,
             "--capture-view",
             "robot-camera",
+            "--scene-alignment",
+            "initial-palms",
+            "--scene-leveling",
+            "none",
             "--headless" if config.headless else "--no-headless",
         ]
         stages.append(
@@ -330,6 +329,15 @@ def _episode_for_stage(stage: Stage, plan: TaskPlan) -> SourceEpisode:
     return plan.episodes[stage.episode_index]
 
 
+def _final_video_path(plan: TaskPlan, episode_index: int) -> Path:
+    episode = plan.episodes[episode_index]
+    return (
+        plan.paths.final
+        / f"episode_{episode_index:06d}"
+        / episode.video_path.name
+    )
+
+
 def _validate_retarget(plan: TaskPlan) -> None:
     info = _read_json_object(plan.paths.lerobot / "meta/info.json")
     manifest = _read_json_object(plan.paths.lerobot / "meta/egodex.json")
@@ -339,8 +347,8 @@ def _validate_retarget(plan: TaskPlan) -> None:
             "regenerated"
         )
     if manifest.get("hand_target_adapter") != (
-        "source action -> inverse articulated O6 wrist/action transform -> "
-        "GMR wrist pose"
+        "tracked Hand pose -> fixed side-specific local-axis map -> "
+        "GMR wrist target"
     ):
         raise ValueError(
             "LeRobot EgoDex manifest has an unsupported hand target adapter"
@@ -560,11 +568,7 @@ def _validate_prepared(stage: Stage, plan: TaskPlan) -> None:
 
 def _validate_render(stage: Stage, plan: TaskPlan) -> None:
     source = _episode_for_stage(stage, plan)
-    output_video = (
-        plan.paths.final
-        / f"episode_{source.episode_index:06d}"
-        / "g1_view.mp4"
-    )
+    output_video = _final_video_path(plan, source.episode_index)
     output_report = output_video.with_suffix(".json")
     rendered = probe_video(output_video)
     if not rendered.compatible_with(source.video):
@@ -579,6 +583,10 @@ def _validate_render(stage: Stage, plan: TaskPlan) -> None:
         )
     if str(report.get("capture_view")) != "robot-camera":
         raise ValueError("Final Isaac report is not a robot-camera capture")
+    if not str(report.get("mesh_pose_source", "")).startswith(
+        "prepared virtual source-camera pose backprojection rigidly following"
+    ):
+        raise ValueError("Final virtual camera did not follow fixed extrinsics")
     if int(report.get("frame_count", -1)) != source.video.frame_count:
         raise ValueError("Final Isaac report frame_count differs from source")
     lighting = report.get("lighting")
@@ -699,44 +707,16 @@ def _validate_render(stage: Stage, plan: TaskPlan) -> None:
         SCENE_GEOMETRY_OPERATION_ORDER
     ):
         raise ValueError(
-            "Final Isaac scene operation_order must level before "
-            "fingertip-TCP placement"
+            "Final Isaac scene operation_order must contain only "
+            "tracked-Hand palm placement"
         )
-    if int(scene_leveling.get("schema_version", -1)) < 2:
-        raise ValueError("Final Isaac scene-leveling audit schema is obsolete")
-    if scene_leveling.get("method") != SUPPORT_PLANE_LEVELING_METHOD:
-        raise ValueError(
-            "Final Isaac scene did not use Z-only affine support-plane "
-            "leveling"
-        )
-    if scene_leveling.get("status") != "applied":
-        raise ValueError("Final Isaac support-plane leveling was not applied")
-    if int(scene_leveling.get("pipeline_order", -1)) != 1:
-        raise ValueError("Support-plane leveling is not pipeline operation 1")
-    if int(scene_leveling.get("application_count", -1)) != 1:
-        raise ValueError("Final Isaac scene-leveling application count is wrong")
-    quality_gates = scene_leveling.get("quality_gates")
-    if not isinstance(quality_gates, dict) or not bool(
-        quality_gates.get("passed")
-    ):
-        raise ValueError("Final Isaac scene-leveling quality gates did not pass")
     if (
-        scene_leveling.get("fits_yaw") is not False
-        or scene_leveling.get("fits_scale") is not False
+        scene_leveling.get("method") != "disabled"
+        or scene_leveling.get("requested_mode") != "none"
+        or scene_leveling.get("status") != "disabled"
+        or int(scene_leveling.get("application_count", -1)) != 0
     ):
-        raise ValueError("Scene leveling must not fit yaw or scale")
-    if scene_leveling.get("fits_rotation") is not False:
-        raise ValueError("Z-only affine scene leveling must not fit rotation")
-    if scene_leveling.get("fits_height_shear") is not True:
-        raise ValueError("Scene leveling did not fit the required Z-only shear")
-    if scene_leveling.get("fits_translation") is not False:
-        raise ValueError("Scene leveling must not fit a translation")
-    if scene_leveling.get("preserves_world_xy") is not True:
-        raise ValueError("Scene leveling must preserve world XY")
-    if scene_leveling.get("preserves_camera_orientation") is not True:
-        raise ValueError("Scene leveling must preserve camera orientation")
-    if scene_leveling.get("preserves_per_frame_camera_motion") is not True:
-        raise ValueError("Scene leveling must preserve source camera motion")
+        raise ValueError("Final Isaac scene leveling must be disabled")
 
     leveling_linear = scene_leveling.get("linear_world")
     try:
@@ -752,34 +732,29 @@ def _validate_render(stage: Stage, plan: TaskPlan) -> None:
         or not all(math.isfinite(value) for row in linear for value in row)
     ):
         raise ValueError("Scene-leveling linear_world is not a finite 3x3 matrix")
-    z_only_template = (
+    identity = (
         (1.0, 0.0, 0.0),
         (0.0, 1.0, 0.0),
+        (0.0, 0.0, 1.0),
     )
     if any(
-        abs(linear[row][column] - z_only_template[row][column]) > 1e-9
-        for row in range(2)
+        abs(linear[row][column] - identity[row][column]) > 1e-9
+        for row in range(3)
         for column in range(3)
-    ) or any(
-        abs(linear[2][column] - expected) > 1e-9
-        for column, expected in ((2, 1.0),)
     ):
-        raise ValueError(
-            "Scene-leveling linear_world is not a world-Z-only affine "
-            "correction"
-        )
+        raise ValueError("Disabled scene leveling must use the identity affine")
 
     scene_alignment = report.get("scene_alignment")
     if not isinstance(scene_alignment, dict):
         raise ValueError("Final Isaac report has no scene-alignment audit")
     if int(scene_alignment.get("schema_version", -1)) < 2:
         raise ValueError("Final Isaac scene-alignment audit schema is obsolete")
-    if scene_alignment.get("method") != HAND_TCP_ALIGNMENT_METHOD:
+    if scene_alignment.get("method") != PALM_ALIGNMENT_METHOD:
         raise ValueError(
-            "Final Isaac scene did not use semantic fingertip-TCP alignment"
+            "Final Isaac scene did not use tracked-Hand palm alignment"
         )
-    if int(scene_alignment.get("pipeline_order", -1)) != 2:
-        raise ValueError("Fingertip-TCP placement is not pipeline operation 2")
+    if int(scene_alignment.get("pipeline_order", -1)) != 1:
+        raise ValueError("Tracked-palm placement is not pipeline operation 1")
     if int(scene_alignment.get("application_count", -1)) != 1:
         raise ValueError("Scene alignment must apply one constant translation")
     if (
@@ -788,7 +763,7 @@ def _validate_render(stage: Stage, plan: TaskPlan) -> None:
         or scene_alignment.get("fits_linear_leveling") is not False
     ):
         raise ValueError(
-            "Fingertip-TCP scene alignment must fit only a translation"
+            "Tracked-palm scene alignment must fit only a translation"
         )
     translation = scene_alignment.get("world_translation_xyz_m")
     if (
@@ -820,66 +795,31 @@ def _validate_render(stage: Stage, plan: TaskPlan) -> None:
             "Scene alignment world_translation_z_m disagrees with its "
             "constant translation"
         )
-    support_height_before = float(
-        scene_alignment.get(
-            "support_height_before_anchor_m",
-            float("nan"),
-        )
-    )
-    support_height_after = float(
-        scene_alignment.get(
-            "support_height_after_anchor_m",
-            float("nan"),
-        )
-    )
-    if (
-        not math.isfinite(support_height_before)
-        or not math.isfinite(support_height_after)
-        or abs(
-            (support_height_after - support_height_before)
-            - translation_xyz[2]
-        )
-        > 1e-6
-    ):
-        raise ValueError(
-            "Scene support height was not updated by the fingertip-TCP "
-            "translation"
-        )
-    support_height_delta = float(
-        scene_alignment.get(
-            "support_height_delta_from_anchor_m",
-            float("nan"),
-        )
-    )
-    if (
-        not math.isfinite(support_height_delta)
-        or abs(support_height_delta - translation_xyz[2]) > 1e-9
-    ):
-        raise ValueError(
-            "Scene alignment support-height delta disagrees with its "
-            "fingertip-TCP Z translation"
-        )
-
     anchor_semantics = scene_alignment.get("anchor_semantics")
     if not isinstance(anchor_semantics, dict):
         raise ValueError("Scene alignment has no anchor-semantics audit")
-    if anchor_semantics.get("matches_retarget_arm_ik_tcp") is not True:
-        raise ValueError("Scene alignment does not use the retarget semantic TCP")
+    if (
+        anchor_semantics.get("matches_retarget_tracked_hand_palm_targets")
+        is not True
+    ):
+        raise ValueError(
+            "Scene alignment does not use the retarget tracked-Hand palms"
+        )
     if anchor_semantics.get("uses_hand_base_origins") is not False:
         raise ValueError("Scene alignment must not use hand-base origins")
-    if anchor_semantics.get("uses_ring_or_little_fingertips") is not False:
-        raise ValueError(
-            "Scene alignment does not match the semantic retarget TCP"
-        )
+    if anchor_semantics.get("uses_source_wrist_origins") is not True:
+        raise ValueError("Scene alignment must use tracked Hand wrist roots")
+    if anchor_semantics.get("uses_fingertips") is not False:
+        raise ValueError("Scene alignment must not use fingertip anchors")
     height_policy = scene_alignment.get("height_policy")
     if not isinstance(height_policy, str):
         raise ValueError("Scene alignment has no explicit height policy")
     normalized_height_policy = height_policy.lower()
-    if "same 3-d tcp residual" not in normalized_height_policy or (
+    if "same 3-d palm residual" not in normalized_height_policy or (
         "no fixed" not in normalized_height_policy
     ):
         raise ValueError(
-            "Scene alignment height policy must use the same 3-D TCP "
+            "Scene alignment height policy must use the same 3-D palm "
             "residual with no fixed scene height"
         )
 
@@ -905,8 +845,7 @@ def _validate_render(stage: Stage, plan: TaskPlan) -> None:
         )
     ):
         raise ValueError(
-            "Scene alignment was not estimated after the reported leveling "
-            "affine"
+            "Scene alignment did not use the identity scene affine"
         )
     leveling_pivot = scene_leveling.get("pivot_world_xyz_m")
     alignment_pivot = alignment_affine.get("pivot_world_xyz_m")
@@ -927,11 +866,11 @@ def _validate_render(stage: Stage, plan: TaskPlan) -> None:
         )
     ):
         raise ValueError(
-            "Scene alignment did not use the reported scene-leveling pivot"
+            "Scene alignment did not use the disabled-leveling pivot"
         )
     if alignment_affine.get("application_order") != (
         "source camera -> raw scene world -> scene affine -> "
-        "hand-TCP translation"
+        "palm translation"
     ):
         raise ValueError(
             "Scene alignment affine application order is not explicit"
@@ -945,12 +884,10 @@ def _validate_render(stage: Stage, plan: TaskPlan) -> None:
     ):
         raise ValueError(
             "Scene-placement operation order differs from the top-level "
-            "level-then-anchor contract"
+            "anchor-only contract"
         )
-    if int(scene_placement.get("application_count", -1)) != 2:
-        raise ValueError(
-            "Scene placement did not apply exactly leveling then anchoring"
-        )
+    if int(scene_placement.get("application_count", -1)) != 1:
+        raise ValueError("Scene placement did not apply exactly one anchor")
     try:
         placement_translation = tuple(
             float(value)
@@ -959,22 +896,8 @@ def _validate_render(stage: Stage, plan: TaskPlan) -> None:
                 (),
             )
         )
-        placement_height_after_leveling = float(
-            scene_placement.get(
-                "support_height_after_leveling_m",
-                float("nan"),
-            )
-        )
-        placement_height_final = float(
-            scene_placement.get(
-                "support_height_after_anchor_m",
-                float("nan"),
-            )
-        )
     except (TypeError, ValueError) as exc:
-        raise ValueError(
-            "Scene-placement translation or support height is not numeric"
-        ) from exc
+        raise ValueError("Scene-placement translation is not numeric") from exc
     if (
         len(placement_translation) != 3
         or not all(math.isfinite(value) for value in placement_translation)
@@ -985,27 +908,6 @@ def _validate_render(stage: Stage, plan: TaskPlan) -> None:
     ):
         raise ValueError(
             "Scene-placement translation differs from scene alignment"
-        )
-    if (
-        not math.isfinite(placement_height_after_leveling)
-        or abs(placement_height_after_leveling - support_height_before) > 1e-9
-    ):
-        raise ValueError(
-            "Scene-placement post-leveling support height is inconsistent"
-        )
-    if (
-        not math.isfinite(placement_height_final)
-        or abs(placement_height_final - support_height_after) > 1e-9
-        or abs(
-            placement_height_final
-            - placement_height_after_leveling
-            - translation_xyz[2]
-        )
-        > 1e-6
-    ):
-        raise ValueError(
-            "Scene-placement final support height is inconsistent with the "
-            "fingertip-TCP Z translation"
         )
 
 
@@ -1041,11 +943,7 @@ def _clear_stage_output(stage: Stage, plan: TaskPlan) -> None:
         )
     elif stage.name == "render":
         assert stage.episode_index is not None
-        final_video = (
-            plan.paths.final
-            / f"episode_{stage.episode_index:06d}"
-            / "g1_view.mp4"
-        )
+        final_video = _final_video_path(plan, stage.episode_index)
         targets = (
             final_video,
             final_video.with_suffix(".json"),
@@ -1157,7 +1055,8 @@ def _new_report(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
             "handless": str(plan.paths.handless),
             "prepared": str(plan.paths.prepared / "episode_XXXXXX"),
             "final_video": str(
-                plan.paths.final / "episode_XXXXXX/g1_view.mp4"
+                plan.paths.final
+                / "episode_XXXXXX/<source-video-basename>"
             ),
             "failed_episodes": str(
                 plan.paths.root / "failed_episodes.json"
@@ -1182,6 +1081,10 @@ def _new_report(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
             "robot_camera_geometry": (
                 "fixed 640x480 4:3 intrinsic uniformly scaled and centered "
                 "letterboxed into the source-sized output"
+            ),
+            "mesh_projection_camera": (
+                "prepared virtual source camera rigidly following the G1 "
+                "capture camera through one fixed initial extrinsic"
             ),
             "trajectory_commit_validation": (
                 "every G1 joint/root write is read back from Isaac"
@@ -1469,9 +1372,7 @@ def execute_task(
                         / f"episode_{episode_index:06d}"
                     ),
                     "final_video": str(
-                        plan.paths.final
-                        / f"episode_{episode_index:06d}"
-                        / "g1_view.mp4"
+                        _final_video_path(plan, episode_index)
                     ),
                 },
                 "recorded_at": _utc_now(),
@@ -1834,10 +1735,9 @@ def execute_task(
                 ]
                 if render_entry["status"] not in {"completed", "reused"}:
                     continue
-                video_path = (
-                    plan.paths.final
-                    / f"episode_{episode.episode_index:06d}"
-                    / "g1_view.mp4"
+                video_path = _final_video_path(
+                    plan,
+                    episode.episode_index,
                 )
                 final_videos.append(
                     {

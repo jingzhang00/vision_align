@@ -44,7 +44,6 @@ class SceneLeveling:
     """
 
     camera_pose_cv_xyzw: np.ndarray
-    transformed_camera_origins_world_xyz_m: np.ndarray
     linear_world: np.ndarray
     pivot_world_xyz_m: np.ndarray
     report: dict[str, object]
@@ -55,9 +54,6 @@ class _PlaneFit:
     normal_world: np.ndarray
     centroid_world_xyz_m: np.ndarray
     support_fraction: float
-    inlier_count: int
-    point_count: int
-    residual_p50_m: float
     residual_p95_m: float
 
 
@@ -278,9 +274,6 @@ def _fit_gravity_prior_plane(
         normal_world=normal,
         centroid_world_xyz_m=centroid,
         support_fraction=support_fraction,
-        inlier_count=int(len(inlier_points)),
-        point_count=int(len(points)),
-        residual_p50_m=float(np.percentile(residual, 50.0)),
         residual_p95_m=float(np.percentile(residual, 95.0)),
     )
 
@@ -462,12 +455,6 @@ def level_scene_camera_poses_from_support_plane(
             f"{condition_number:.6g} > "
             f"{maximum_affine_condition_number:.6g}"
         )
-    transformed_camera_origins = apply_world_affine_to_points(
-        poses[:, :3],
-        linear_world=leveling_linear,
-        pivot_world_xyz_m=pivot,
-        maximum_condition_number=maximum_affine_condition_number,
-    )
     leveled_normal = _transform_plane_normal(
         consensus,
         linear_world=leveling_linear,
@@ -574,15 +561,12 @@ def level_scene_camera_poses_from_support_plane(
         "preserves_camera_orientation": True,
         "application_count": 1,
         "applied_to": (
-            "reconstructed world points before exact fingertip-TCP XYZ "
+            "reconstructed world points before tracked-Hand palm XYZ "
             "translation; never encoded into camera quaternions"
         ),
     }
     return SceneLeveling(
         camera_pose_cv_xyzw=poses.copy(),
-        transformed_camera_origins_world_xyz_m=(
-            transformed_camera_origins
-        ),
         linear_world=leveling_linear,
         pivot_world_xyz_m=pivot,
         report=report,

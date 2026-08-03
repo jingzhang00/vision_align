@@ -9,7 +9,7 @@ import numpy as np
 import pinocchio as pin
 from scipy.spatial.transform import Rotation
 
-from human_to_robot.retarget_g1_pinocchio import (
+from repaint.g1_hand import (
     HAND_TIP_LOCAL_OFFSETS,
     build_pinocchio_g1,
 )

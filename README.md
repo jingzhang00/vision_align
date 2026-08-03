@@ -1,57 +1,50 @@
-# EgoDex / Nymeria to G1
-
-The supported end-to-end entrypoints are:
-
-- `repaint.egodex.egodex_vda_pipeline`
-- `repaint.nymeria.nymeria_vda_pipeline`
-- `repaint/egodex/run_single_task.py`
-- `repaint/nymeria/run_single_task.py`
-
-Both use the same VDA route:
-
-```text
-dataset motion + MP4
-  -> G1 retarget + LeRobot v3
-  -> shared human-arm removal
-  -> Metric Video Depth Anything
-  -> dataset-specific semantic scene anchor
-  -> Isaac G1 + exact BeingBeyond torso/head-camera replay
-```
-
-EgoDex reads same-stem HDF5/MP4 pairs. Nymeria reads same-stem
-MP4/208-D/SMPL clips while retaining the recording-level Aria trajectory and
-calibration files for camera alignment.
-
-EgoDex first levels the support surface, then aligns the exact bilateral
-retarget TCP (`0.5*thumb + 0.35*index + 0.15*middle`) in XYZ. Nymeria keeps
-support-plane leveling disabled, then aligns the bilateral
-`leftHand/rightHand` rigid-palm action frames to the matching replayed G1
-canonical palms with one XYZ scene translation.
-
-## Run the four EgoDex tasks
+# Installation
 
 ```bash
-.venv/bin/python -m repaint.egodex.egodex_vda_pipeline \
-  --tasks basic_pick_place flip_coin insert_remove_usb pour \
-  --dataset-root dataset \
-  --output-root egodex \
-  --headless
+git submodule update --init --recursive
+```
+Download [Releases V0.1.0](https://github.com/sczhou/ProPainter/releases/tag/v0.1.0) to the `ProPainter/weights` folder.
+
+```bash
+uv sync
+pip install "isaacsim[all,extscache]==5.1.0" --extra-index-url https://pypi.nvidia.com
 ```
 
+- follow `Inpaint-Anything/README.md -> Download the weights` to put the weights
+```
+pretrained_models/
+├── sam3.pt                 # SAM 3, images + video tracking   (gated, see above)
+├── config.json             # SAM 3 config, downloaded alongside sam3.pt
+├── big-lama/               # LaMa, default image removal      (auto)
+│   ├── config.yaml
+│   └── models/best.ckpt
+└── propainter/             # ProPainter, default video inpainting (auto)
+    ├── ProPainter.pth
+    ├── recurrent_flow_completion.pth
+    └── raft-things.pth
+pytracking/pretrain/
+└── vitb_384_mae_ce_32x4_ep300.pth   # legacy --tracker ostrack only  (manual)
+weights/
+└── mobile_sam.pt           # MobileSAM, ships with the repo
+```
+- replace `sam3/sam3/model_builder.py` with `utils/model_builder.py` to bypass Hugginface check
+
+## Run tasks
 To process episode 0 of every task under `dataset/egodex_test`:
 
 ```bash
 bash batch_egodex.sh
 ```
 
-## Run one task and retain intermediates
+```bash
+bash batch_nymeria.sh
+```
 
-These commands retain alignment (Nymeria), LeRobot, handless, prepared, and
-final artifacts. Isaac is visible by default; add `--headless` for batch use.
+## Run one task and retain intermediates
 
 ```bash
 .venv/bin/python repaint/egodex/run_single_task.py \
-  --task pour \
+  --task flip_coin \
   --dataset-root dataset \
   --output-root egodex_single_task
 
@@ -76,7 +69,7 @@ scratch.
 
 ## Adjustable Isaac view
 
-To inspect a prepared episode interactively:
+To inspect a prepared episode in isaacsim:
 
 ```bash
 .venv/bin/python -m repaint.vda_scene_isaac \
@@ -91,20 +84,10 @@ To inspect a prepared episode interactively:
   --loop \
   --no-headless \
   --scene-leveling none \
-  --scene-alignment initial-palms
+  --scene-alignment none
 ```
 
-To render one prepared episode directly:
-
-```bash
-.venv/bin/python -m repaint.vda_scene_isaac \
-  --prepared egodex_single_task/pour/prepared/episode_000000 \
-  --output egodex_single_task/pour/manual/g1_view.mp4 \
-  --capture-view robot-camera \
-  --headless
-```
-
-## Nymeria clips
+## Nymeria
 
 ```bash
 .venv/bin/python -m repaint.nymeria.nymeria_vda_pipeline \
@@ -112,15 +95,4 @@ To render one prepared episode directly:
   --output-root nymeria/vda \
   --session 20230814_s1_david_hall_act0_n9k3wo \
   --clip c024
-```
-
-Camera alignment and its reports are generated under
-`<output-root>/camera_alignment` and `<output-root>/alignment_reports`.
-Existing valid stages are resumed automatically, and the command always runs
-through the final robot-camera render.
-
-To run the complete Nymeria dataset with the standard output location:
-
-```bash
-bash batch_nymeria.sh
 ```

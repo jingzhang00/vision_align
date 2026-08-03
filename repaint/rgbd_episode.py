@@ -1,9 +1,8 @@
-"""Load one calibrated EgoDex or Nymeria LeRobot G1 episode."""
+"""Load one calibrated EgoDex or Nymeria G1 episode."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-import json
 from pathlib import Path
 from typing import Any
 
@@ -13,7 +12,7 @@ import pyarrow.parquet as pq
 from scipy.signal import savgol_filter
 from scipy.spatial.transform import Rotation
 
-from repaint.vda_pipeline_common import probe_video
+from repaint.vda_pipeline_common import probe_video, read_json as _read_json
 
 
 VIDEO_FEATURE = "observation.images.ego"
@@ -48,15 +47,6 @@ class RgbdEpisode:
     @property
     def frame_count(self) -> int:
         return int(len(self.frame_indices))
-
-
-def _read_json(path: Path) -> dict[str, Any]:
-    if not path.is_file():
-        raise FileNotFoundError(path)
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise TypeError(f"Expected an object in {path}")
-    return payload
 
 
 def _episode_rows(dataset_root: Path) -> list[dict[str, Any]]:
@@ -236,6 +226,169 @@ def _resolve_scene_scale(
     return resolved
 
 
+def _load_nymeria_robot_episode(
+    *,
+    dataset_root: Path,
+    source_root: Path,
+    removed_root: Path,
+    episode_index: int,
+    field: str,
+    start_frame: int,
+    end_frame: int | None,
+    scene_scale: float | None,
+) -> RgbdEpisode:
+    if field != "observation.state":
+        raise ValueError("Native Nymeria trajectories contain state, not action")
+    manifest = _read_json(dataset_root / "manifest.json")
+    if manifest.get("format") != "nymeria-g1-trajectory-v1":
+        raise ValueError("Unsupported Nymeria robot trajectory format")
+    matching = [
+        item
+        for item in manifest.get("episodes", ())
+        if int(item.get("episode_index", -1)) == episode_index
+    ]
+    if len(matching) != 1:
+        raise ValueError(
+            f"Nymeria episode {episode_index} was found "
+            f"{len(matching)} times"
+        )
+    episode = matching[0]
+    alignment = episode.get("camera_alignment")
+    if not isinstance(alignment, dict) or alignment.get("status") != "validated":
+        raise ValueError(f"Nymeria episode {episode_index} lacks camera alignment")
+    recorded_scene_scale = float(
+        alignment["source_to_robot_camera_translation_scale"]
+    )
+    resolved_scene_scale = _resolve_scene_scale(
+        recorded_scene_scale=recorded_scene_scale,
+        override=scene_scale,
+    )
+    source_to_robot_rotation = np.asarray(
+        alignment["source_to_robot_rotation"], dtype=np.float64
+    )
+    source_to_robot_translation = np.asarray(
+        alignment["source_to_robot_translation"], dtype=np.float64
+    )
+    if (
+        source_to_robot_rotation.shape != (3, 3)
+        or source_to_robot_translation.shape != (3,)
+    ):
+        raise ValueError("Nymeria source-to-robot transform is invalid")
+
+    trajectory_path = (dataset_root / str(episode["trajectory_path"])).resolve()
+    if (
+        not trajectory_path.is_relative_to(dataset_root)
+        or not trajectory_path.is_file()
+    ):
+        raise FileNotFoundError(trajectory_path)
+    with np.load(trajectory_path) as trajectory:
+        joint_positions = np.asarray(
+            trajectory["joint_positions"], dtype=np.float64
+        )
+        root_pose = np.asarray(trajectory["root_pose_xyzw"], dtype=np.float64)
+        recorded_camera_pose = np.asarray(
+            trajectory["camera_pose_cv_xyzw"], dtype=np.float64
+        )
+        intrinsic = np.asarray(trajectory["camera_intrinsic"], dtype=np.float64)
+        frame_indices = np.asarray(trajectory["frame_indices"], dtype=np.int64)
+    joint_names = tuple(str(name) for name in manifest.get("joint_names", ()))
+    length = int(episode["frame_count"])
+    if (
+        not joint_names
+        or joint_positions.shape != (length, len(joint_names))
+        or root_pose.shape != (length, 7)
+        or recorded_camera_pose.shape != (length, 7)
+        or intrinsic.shape != (3, 3)
+        or not np.array_equal(frame_indices, np.arange(length))
+    ):
+        raise ValueError(f"Nymeria episode {episode_index} trajectory is invalid")
+    stop = length if end_frame is None else end_frame
+    if not 0 <= start_frame < stop <= length:
+        raise ValueError(
+            f"Expected 0 <= start < end <= {length}, got {start_frame} and {stop}"
+        )
+
+    source_video = _manifest_path(episode["source_video"], source_root=source_root)
+    source_hdf5 = _manifest_path(alignment["adapter_hdf5"], source_root=source_root)
+    removed_video = (removed_root / str(episode["video_path"])).resolve()
+    for path in (source_video, source_hdf5, removed_video):
+        if not path.is_file():
+            raise FileNotFoundError(path)
+    source_meta = _video_metadata(source_video)
+    removed_meta = _video_metadata(removed_video)
+    if source_meta[:3] != removed_meta[:3] or source_meta[2] != length:
+        raise ValueError("Nymeria source/removed video geometry is inconsistent")
+    if abs(source_meta[3] - removed_meta[3]) > 0.01:
+        raise ValueError("Nymeria source/removed video FPS values disagree")
+
+    with h5py.File(source_hdf5, "r") as handle:
+        source_intrinsic = np.asarray(handle["camera/intrinsic"], dtype=np.float64)
+        source_camera_to_world = np.asarray(
+            handle["transforms/camera"], dtype=np.float64
+        )
+    if (
+        source_camera_to_world.shape != (length, 4, 4)
+        or not np.allclose(source_intrinsic, intrinsic, atol=1e-5)
+    ):
+        raise ValueError("Nymeria camera adapter and trajectory disagree")
+    if scene_scale is not None:
+        source_to_robot_translation = (
+            recorded_camera_pose[0, :3]
+            - resolved_scene_scale
+            * source_to_robot_rotation
+            @ source_camera_to_world[0, :3, 3]
+        )
+    mapped_camera_pose = _mapped_nymeria_camera_poses(
+        source_camera_to_world=source_camera_to_world,
+        source_to_robot_rotation=source_to_robot_rotation,
+        source_to_robot_translation=source_to_robot_translation,
+        scene_scale=resolved_scene_scale,
+    )
+    rotation_error = (
+        Rotation.from_quat(mapped_camera_pose[:, 3:7]).inv()
+        * Rotation.from_quat(recorded_camera_pose[:, 3:7])
+    ).magnitude()
+    if float(np.max(rotation_error)) > 1e-5:
+        raise ValueError("Mapped and recorded Nymeria camera rotations disagree")
+    position_error = np.linalg.norm(
+        mapped_camera_pose[:, :3] - recorded_camera_pose[:, :3],
+        axis=1,
+    )
+    if scene_scale is None and float(np.max(position_error)) > 1e-5:
+        raise ValueError("Mapped and recorded Nymeria camera positions disagree")
+    source_camera_pose = np.concatenate(
+        [
+            source_camera_to_world[:, :3, 3],
+            Rotation.from_matrix(source_camera_to_world[:, :3, :3]).as_quat(),
+        ],
+        axis=1,
+    )
+    selection = slice(start_frame, stop)
+    return RgbdEpisode(
+        dataset_root=dataset_root,
+        source_dataset_kind="nymeria",
+        episode_index=episode_index,
+        source_stem=str(episode["source_stem"]),
+        source_video=source_video,
+        source_hdf5=source_hdf5,
+        removed_video=removed_video,
+        fps=float(source_meta[3]),
+        source_size=(source_meta[0], source_meta[1]),
+        full_frame_count=length,
+        frame_indices=frame_indices[selection],
+        joint_names=joint_names,
+        joint_positions=joint_positions[selection],
+        root_pose_xyzw=root_pose[selection],
+        camera_pose_cv_xyzw=mapped_camera_pose[selection],
+        source_camera_pose_cv_xyzw=source_camera_pose[selection],
+        recorded_camera_pose_cv_xyzw=recorded_camera_pose[selection],
+        intrinsic=source_intrinsic,
+        scene_scale=resolved_scene_scale,
+        recorded_scene_scale=recorded_scene_scale,
+        source_to_robot_rotation=source_to_robot_rotation,
+    )
+
+
 def load_rgbd_episode(
     *,
     dataset_root: Path,
@@ -252,6 +405,17 @@ def load_rgbd_episode(
     dataset_root = dataset_root.resolve()
     source_root = source_root.resolve()
     removed_root = removed_root.resolve()
+    if (dataset_root / "manifest.json").is_file():
+        return _load_nymeria_robot_episode(
+            dataset_root=dataset_root,
+            source_root=source_root,
+            removed_root=removed_root,
+            episode_index=episode_index,
+            field=field,
+            start_frame=start_frame,
+            end_frame=end_frame,
+            scene_scale=scene_scale,
+        )
     if field not in SUPPORTED_FIELDS:
         raise ValueError(f"Unsupported trajectory field: {field}")
 
@@ -424,7 +588,7 @@ def load_rgbd_episode(
             source_hip_to_world[:, :3, 3]
         )
     if not np.allclose(source_intrinsic, intrinsics[0], atol=1e-5):
-        raise ValueError("Source and LeRobot camera intrinsics disagree")
+        raise ValueError("Source and stored camera intrinsics disagree")
     expected_transform_shape = (length, 4, 4)
     if source_camera_to_world.shape != expected_transform_shape:
         raise ValueError("Source camera transform shape is invalid")

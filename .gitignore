@@ -5,7 +5,6 @@ build/
 dist/
 wheels/
 *.egg-info
-/models/
 mano_v1_2/
 dataset/
 outputs/
@@ -18,4 +17,6 @@ output_new/
 nymeria_scripts
 tests/
 /nymeria/vda/
-/egodex/
+/egodex_single_task/
+debug/
+/nymeria/david_*

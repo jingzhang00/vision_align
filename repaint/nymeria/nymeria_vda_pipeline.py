@@ -5,15 +5,14 @@ The route mirrors the current EgoDex repaint pipeline after adapting Nymeria's
 native inputs:
 
     raw Aria MPS camera trajectory
-      -> Nymeria full-body GMR LeRobot (fixed-open hands)
+      -> Nymeria full-body GMR robot trajectory (fixed-open hands)
       -> human-arm repaint
       -> metric Video Depth Anything RGB-D preparation
       -> source-sized Isaac robot-camera replay
 
-The original Aria camera trajectory is retained as source provenance without a
-rotation rejection threshold.  Isaac places every RGB-D frame at that frame's
-exact G1 FK capture-camera pose, so rendering does not depend on a fixed
-first-five-frame Aria-to-G1 alignment.
+The initial calibrated Aria-to-G1 extrinsic places each RGB-D frame through a
+virtual projection camera that rigidly follows the exact G1 FK camera.  Scene
+leveling and scene alignment remain disabled.
 """
 
 from __future__ import annotations
@@ -29,10 +28,9 @@ import math
 from pathlib import Path
 import sys
 import time
-from typing import Any, Sequence
+from typing import Any
 
 import numpy as np
-import pyarrow.parquet as pq
 from tqdm import tqdm
 
 _write_notice = tqdm.write
@@ -48,13 +46,12 @@ for import_root in (WORKSPACE_ROOT, STREAM_ROOT):
 from repaint.nymeria.nymeria_adapter import (  # noqa: E402
     NymeriaClip,
     discover_nymeria_clips,
-    load_motion_metadata,
     natural_key,
 )
 from repaint.lighting_profile import load_lighting_profile  # noqa: E402
 with redirect_stdout(StringIO()):
-    from repaint.nymeria.nymeria_to_lerobot import (  # noqa: E402
-        VIDEO_KEY,
+    from repaint.nymeria.nymeria_to_robot import (  # noqa: E402
+        ROBOT_FORMAT,
         load_source_episode,
     )
 from repaint.robot_camera import (  # noqa: E402
@@ -107,7 +104,7 @@ class PipelinePaths:
     root: Path
     camera_alignment: Path
     alignment_reports: Path
-    lerobot: Path
+    robot: Path
     handless: Path
     prepared: Path
     final: Path
@@ -119,7 +116,7 @@ class PipelinePaths:
             root=root,
             camera_alignment=root / "camera_alignment",
             alignment_reports=root / "alignment_reports",
-            lerobot=root / "lerobot",
+            robot=root / "robot",
             handless=root / "handless",
             prepared=root / "prepared",
             final=root / "final",
@@ -138,7 +135,6 @@ class PipelineConfig:
     resume: bool
     overwrite: bool
     headless: bool
-    require_visible_hands: bool
     hardware_encoding: bool
     scene_scale: float | None
     vda_checkpoint: Path | None
@@ -232,16 +228,16 @@ def _repaint_episode_video_paths(
     episode_index: int,
 ) -> tuple[Path, Path]:
     paths = plan.config.paths
-    info = _read_json(paths.lerobot / "meta/info.json")
-    rows = _episode_rows(paths.lerobot)
+    info = _read_json(paths.robot / "manifest.json")
+    rows = _episode_rows(paths.robot)
     try:
         row = rows[episode_index]
     except KeyError as exc:
         raise ValueError(
-            f"LeRobot has no metadata row for episode {episode_index}"
+            f"robot trajectory has no metadata row for episode {episode_index}"
         ) from exc
     return (
-        _video_path(paths.lerobot, info, row),
+        _video_path(paths.robot, info, row),
         _video_path(paths.handless, info, row),
     )
 
@@ -255,6 +251,12 @@ def _update_repaint_episode_fingerprint(
     source_video, output_video = _repaint_episode_video_paths(
         plan,
         episode_index,
+    )
+    episode = _episode_rows(paths.robot)[episode_index]
+    _update_path_fingerprint(
+        digest,
+        paths.robot / str(episode["trajectory_path"]),
+        hash_contents=True,
     )
     source_video = source_video.resolve()
     _update_path_fingerprint(digest, output_video)
@@ -347,10 +349,10 @@ def _stage_input_fingerprint(
                 clip.source.smpl_path,
             ):
                 _update_path_fingerprint(digest, source)
-        _update_path_fingerprint(digest, paths.lerobot)
+        _update_path_fingerprint(digest, paths.robot)
     elif stage.name == "repaint":
         if include_pruned_outputs:
-            _update_path_fingerprint(digest, paths.lerobot)
+            _update_path_fingerprint(digest, paths.robot)
             _update_path_fingerprint(digest, paths.handless)
     elif stage.name in {"prepare", "render"}:
         assert stage.episode_index is not None
@@ -359,7 +361,11 @@ def _stage_input_fingerprint(
             _update_path_fingerprint(digest, paths.prepared / label)
         if stage.name == "prepare":
             if include_pruned_outputs:
-                _update_path_fingerprint(digest, paths.lerobot / "meta")
+                _update_path_fingerprint(
+                    digest,
+                    paths.robot / "manifest.json",
+                    hash_contents=True,
+                )
                 _update_repaint_episode_fingerprint(
                     digest,
                     plan,
@@ -382,7 +388,9 @@ def _stage_input_fingerprint(
             _update_path_fingerprint(digest, final_root)
             _update_path_fingerprint(
                 digest,
-                final_root / "g1_view.json",
+                _final_video_path(plan, stage.episode_index).with_suffix(
+                    ".json"
+                ),
                 hash_contents=True,
             )
     return digest.hexdigest()
@@ -392,7 +400,7 @@ def _retained_render_fingerprint(
     render_stage: Stage,
     plan: PipelinePlan,
 ) -> str:
-    """Receipt for pruned stages; retained LeRobot is checked separately."""
+    """Receipt for pruned stages; retained robot trajectory is checked separately."""
 
     assert render_stage.name == "render"
     assert render_stage.episode_index is not None
@@ -547,7 +555,7 @@ def build_plan(
             "--src-root",
             config.src_root,
             "--output-root",
-            config.paths.lerobot,
+            config.paths.robot,
             "--camera-alignment-root",
             config.alignment_root,
             "--camera-alignment-report-root",
@@ -566,7 +574,7 @@ def build_plan(
                     config.python_executable,
                     (
                         WORKSPACE_ROOT
-                        / "repaint/nymeria/nymeria_to_lerobot.py"
+                        / "repaint/nymeria/nymeria_to_robot.py"
                     ),
                     *arguments,
                 ),
@@ -583,7 +591,7 @@ def build_plan(
                     config.python_executable,
                     WORKSPACE_ROOT / "repaint/remove_hands.py",
                     "--input_dir",
-                    config.paths.lerobot,
+                    config.paths.robot,
                     "--output_dir",
                     config.paths.handless,
                     "--min_coverage",
@@ -599,7 +607,7 @@ def build_plan(
             prepared_root = config.paths.prepared / label
             arguments = [
                 "--dataset",
-                config.paths.lerobot,
+                config.paths.robot,
                 "--source-root",
                 config.src_root,
                 "--removed-root",
@@ -634,7 +642,9 @@ def build_plan(
             )
             if not _stage_enabled(config.stop_after, "render"):
                 continue
-            output_video = config.paths.final / label / "g1_view.mp4"
+            output_video = (
+                config.paths.final / label / clip.source.video_path.name
+            )
             stages.append(
                 Stage(
                     stage_id=f"render_{clip.episode_index:06d}",
@@ -674,13 +684,23 @@ def _clip_by_index(plan: PipelinePlan, episode_index: int) -> SelectedClip:
     return clip
 
 
+def _final_video_path(plan: PipelinePlan, episode_index: int) -> Path:
+    clip = _clip_by_index(plan, episode_index)
+    return (
+        plan.config.paths.final
+        / f"episode_{episode_index:06d}"
+        / clip.source.video_path.name
+    )
+
+
 def _episode_rows(root: Path) -> dict[int, dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    for path in sorted((root / "meta/episodes").glob("chunk-*/*.parquet")):
-        rows.extend(pq.read_table(path).to_pylist())
+    manifest = _read_json(root / "manifest.json")
+    rows = manifest.get("episodes")
+    if not isinstance(rows, list):
+        raise ValueError("Robot manifest has no episode list")
     result = {int(row["episode_index"]): row for row in rows}
     if len(result) != len(rows):
-        raise ValueError("LeRobot episode metadata contains duplicate indices")
+        raise ValueError("Robot manifest contains duplicate episode indices")
     return result
 
 
@@ -690,11 +710,9 @@ def _video_path(
     row: dict[str, Any],
 ) -> Path:
     resolved_root = root.resolve()
-    path = (root / str(info["video_path"]).format(
-        video_key=VIDEO_KEY,
-        chunk_index=int(row[f"videos/{VIDEO_KEY}/chunk_index"]),
-        file_index=int(row[f"videos/{VIDEO_KEY}/file_index"]),
-    )).resolve()
+    if info.get("format") != ROBOT_FORMAT:
+        raise ValueError(f"Unsupported robot trajectory format in {root}")
+    path = (root / str(row["video_path"])).resolve()
     if not path.is_relative_to(resolved_root):
         raise ValueError(f"Video path escapes its dataset root: {path}")
     return path
@@ -721,6 +739,12 @@ def _validate_alignment(stage: Stage, plan: PipelinePlan) -> None:
         raise ValueError(
             f"Nymeria alignment report is not complete: "
             f"{report.get('status')!r}"
+        )
+    if int(report.get("schema_version", -1)) < 7 or not isinstance(
+        report.get("hand_eye"), dict
+    ):
+        raise ValueError(
+            "Nymeria alignment predates registered 208-D palm trajectories"
         )
     trajectory = report.get("camera_trajectory")
     if (
@@ -762,220 +786,121 @@ def _validate_retarget(
     *,
     allow_pruned_alignment: bool = False,
 ) -> None:
-    root = plan.config.paths.lerobot
-    info = _read_json(root / "meta/info.json")
-    manifest = _read_json(root / "meta/nymeria.json")
-    quality_gate = manifest.get("camera_alignment_quality_gate", {})
-    if not isinstance(quality_gate, dict) or quality_gate.get("status") != "passed":
-        raise ValueError("Nymeria LeRobot camera alignment gate did not pass")
-    report_entries = quality_gate.get("camera_trajectory_reports")
-    if not isinstance(report_entries, list):
-        raise ValueError("Nymeria LeRobot has no camera trajectory provenance")
-    expected_sessions = {clip.session for clip in plan.clips}
+    root = plan.config.paths.robot.resolve()
+    manifest = _read_json(root / "manifest.json")
+    if manifest.get("format") != ROBOT_FORMAT:
+        raise ValueError("Nymeria retarget output is not a native robot trajectory")
+    gate = manifest.get("camera_alignment_quality_gate")
+    if not isinstance(gate, dict) or gate.get("status") != "passed":
+        raise ValueError("Nymeria robot camera alignment gate did not pass")
+    reports = gate.get("camera_trajectory_reports")
+    if not isinstance(reports, list):
+        raise ValueError("Nymeria robot output has no camera provenance")
     recorded_reports: dict[str, dict[str, Any]] = {}
-    for item in report_entries:
+    for item in reports:
         if not isinstance(item, dict):
             raise ValueError("Invalid camera trajectory provenance entry")
         report_path = Path(str(item.get("path", ""))).resolve()
-        if report_path.name != "visual_alignment_report.json":
-            raise ValueError("Invalid camera trajectory provenance path")
         session = report_path.parent.name
-        expected_path = (
+        expected = (
             plan.config.alignment_report_root
             / session
             / "visual_alignment_report.json"
         ).resolve()
-        if report_path != expected_path or session in recorded_reports:
+        if report_path != expected or session in recorded_reports:
             raise ValueError("Camera trajectory provenance does not match config")
         if report_path.is_file():
             if hashlib.sha256(report_path.read_bytes()).hexdigest() != item.get(
                 "sha256"
             ):
-                raise ValueError(
-                    f"Camera trajectory report changed after retarget: {session}"
-                )
+                raise ValueError(f"Camera report changed after retarget: {session}")
         elif not allow_pruned_alignment:
             raise FileNotFoundError(report_path)
         recorded_reports[session] = item
-    if set(recorded_reports) != expected_sessions:
+    if set(recorded_reports) != {clip.session for clip in plan.clips}:
         raise ValueError("Camera trajectory provenance has incorrect sessions")
-    if "observation.camera_pose" not in info.get("features", {}):
-        raise ValueError("Nymeria LeRobot has no observation.camera_pose")
-    episodes = manifest.get("episodes")
-    if not isinstance(episodes, list) or len(episodes) != len(plan.clips):
-        raise ValueError("Nymeria LeRobot manifest episode count is incorrect")
-    if int(info.get("total_episodes", -1)) != len(plan.clips):
-        raise ValueError("Nymeria LeRobot info episode count is incorrect")
-    rows = _episode_rows(root)
-    if set(rows) != set(range(len(plan.clips))):
-        raise ValueError("Nymeria LeRobot episode indices are not contiguous")
 
-    for clip, episode in zip(plan.clips, episodes, strict=True):
-        if int(episode.get("episode_index", -1)) != clip.episode_index:
-            raise ValueError("Nymeria manifest episode order changed")
+    joint_names = tuple(manifest.get("joint_names", ()))
+    rows = _episode_rows(root)
+    if not joint_names or set(rows) != set(range(len(plan.clips))):
+        raise ValueError("Nymeria robot episode or joint schema is invalid")
+    for clip in plan.clips:
+        episode = rows[clip.episode_index]
         if episode.get("source_stem") != clip.stem:
-            raise ValueError("Nymeria manifest source stem changed")
+            raise ValueError("Nymeria robot episode order changed")
         alignment = episode.get("camera_alignment")
         if not isinstance(alignment, dict) or alignment.get("status") != "validated":
             raise ValueError(f"{clip.stem} camera alignment is not validated")
-        adapter_path = Path(str(alignment.get("adapter_hdf5", ""))).resolve()
+        adapter = Path(str(alignment.get("adapter_hdf5", ""))).resolve()
         expected_adapter = (
-            plan.config.alignment_root
-            / clip.session
-            / f"{clip.stem}.hdf5"
+            plan.config.alignment_root / clip.session / f"{clip.stem}.hdf5"
         ).resolve()
-        if adapter_path != expected_adapter or (
-            not allow_pruned_alignment and not adapter_path.is_file()
-        ):
+        if adapter != expected_adapter:
             raise ValueError(f"{clip.stem} camera adapter path changed")
-        if adapter_path.is_file():
+        if adapter.is_file():
             digest = hashlib.sha256()
-            with adapter_path.open("rb") as handle:
+            with adapter.open("rb") as handle:
                 for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                     digest.update(chunk)
             if digest.hexdigest() != alignment.get("adapter_hdf5_sha256"):
                 raise ValueError(f"{clip.stem} camera adapter content changed")
+        elif not allow_pruned_alignment:
+            raise FileNotFoundError(adapter)
         if alignment.get("camera_trajectory_report") != recorded_reports[
             clip.session
         ]:
-            raise ValueError(f"{clip.stem} camera trajectory provenance changed")
-        metrics = alignment.get("metrics", {})
-        if (
-            metrics.get("mapping")
-            != "raw Aria camera to G1 camera, fixed first-five-frame similarity"
-            or metrics.get("source_camera_rotation_rejection_threshold_degrees")
-            is not None
-        ):
-            raise ValueError(f"{clip.stem} camera mapping policy changed")
-        if int(metrics.get("scene_scale_application_count", -1)) != 1:
-            raise ValueError(f"{clip.stem} scene scale was not applied exactly once")
-        scale = float(
-            alignment["source_to_robot_camera_translation_scale"]
-        )
-        if not math.isfinite(scale) or scale <= 0.0:
-            raise ValueError(f"{clip.stem} has an invalid camera scale")
+            raise ValueError(f"{clip.stem} camera provenance changed")
+        scale = float(alignment["source_to_robot_camera_translation_scale"])
         rotation = np.asarray(
-            alignment.get("source_to_robot_rotation"),
-            dtype=np.float64,
+            alignment.get("source_to_robot_rotation"), dtype=np.float64
         )
         translation = np.asarray(
-            alignment.get("source_to_robot_translation"),
-            dtype=np.float64,
+            alignment.get("source_to_robot_translation"), dtype=np.float64
         )
         if (
-            rotation.shape != (3, 3)
+            not math.isfinite(scale)
+            or scale <= 0.0
+            or rotation.shape != (3, 3)
             or translation.shape != (3,)
             or not np.isfinite(rotation).all()
             or not np.isfinite(translation).all()
         ):
-            raise ValueError(f"{clip.stem} has an invalid fixed camera transform")
+            raise ValueError(f"{clip.stem} has an invalid camera transform")
 
-        row = rows[clip.episode_index]
-        length = int(row["length"])
-        if length != clip.video.frame_count:
-            raise ValueError(f"{clip.stem} LeRobot length differs from source")
-        if int(metrics.get("fit_window_frames", -1)) != min(5, length):
-            raise ValueError(f"{clip.stem} did not use the first five camera frames")
-        data_path = root / str(info["data_path"]).format(
-            chunk_index=int(row["data/chunk_index"]),
-            file_index=int(row["data/file_index"]),
-        )
-        table = pq.read_table(
-            data_path,
-            columns=[
-                "observation.state",
-                "action",
-                "episode_index",
-                "frame_index",
-                "timestamp",
-                "observation.root_pose",
-                "observation.camera_pose",
-                "observation.camera_intrinsics",
-            ],
-        )
-        episode_column = np.asarray(
-            table["episode_index"].to_pylist(),
-            dtype=np.int64,
-        )
-        selected = np.flatnonzero(episode_column == clip.episode_index)
-        if len(selected) != length:
-            raise ValueError(f"{clip.stem} parquet row count is incorrect")
-        frame_indices = np.asarray(
-            table["frame_index"].to_pylist(),
-            dtype=np.int64,
-        )[selected]
-        if not np.array_equal(frame_indices, np.arange(length)):
-            raise ValueError(f"{clip.stem} frame indices are not contiguous")
-        joint_count = len(manifest.get("joint_order", ()))
-        for column_name, width in (
-            ("observation.state", joint_count),
-            ("action", joint_count),
-            ("observation.root_pose", 7),
-            ("observation.camera_pose", 7),
-            ("observation.camera_intrinsics", 9),
-        ):
-            values = np.asarray(
-                table[column_name].to_pylist(),
-                dtype=np.float64,
-            )[selected]
-            if (
-                width <= 0
-                or values.shape != (length, width)
-                or not np.isfinite(values).all()
-            ):
-                raise ValueError(
-                    f"{clip.stem} {column_name} has an invalid shape/value"
-                )
-        timestamps = np.asarray(
-            table["timestamp"].to_pylist(),
-            dtype=np.float64,
-        )[selected]
-        if (
-            timestamps.shape != (length,)
-            or not np.isfinite(timestamps).all()
-            or not np.isclose(timestamps[0], 0.0, atol=1e-5)
-            or (length > 1 and np.any(np.diff(timestamps) <= 0.0))
-        ):
-            raise ValueError(f"{clip.stem} timestamps are invalid")
-        root_pose = np.asarray(
-            table["observation.root_pose"].to_pylist(),
-            dtype=np.float64,
-        )[selected]
-        root_quaternion_norm = np.linalg.norm(root_pose[:, 3:], axis=1)
-        if not np.allclose(root_quaternion_norm, 1.0, atol=1e-4):
-            raise ValueError(f"{clip.stem} root quaternions are not unit length")
-        camera_pose = np.asarray(
-            table["observation.camera_pose"].to_pylist(),
-            dtype=np.float64,
-        )[selected]
-        if camera_pose.shape != (length, 7) or not np.isfinite(camera_pose).all():
-            raise ValueError(f"{clip.stem} camera pose is invalid")
-        quaternion_norm = np.linalg.norm(camera_pose[:, 3:], axis=1)
-        if not np.allclose(quaternion_norm, 1.0, atol=1e-4):
-            raise ValueError(f"{clip.stem} camera quaternions are not unit length")
-        intrinsics = np.asarray(
-            table["observation.camera_intrinsics"].to_pylist(),
-            dtype=np.float64,
-        )[selected].reshape(length, 3, 3)
-        if (
-            not np.allclose(intrinsics, intrinsics[:1], atol=1e-6)
-            or np.any(intrinsics[:, 0, 0] <= 0.0)
-            or np.any(intrinsics[:, 1, 1] <= 0.0)
-            or not np.allclose(
-                intrinsics[:, 2],
-                np.array([0.0, 0.0, 1.0])[None],
-                atol=1e-6,
-            )
-        ):
-            raise ValueError(f"{clip.stem} camera intrinsics are invalid")
-        copied_video = _video_path(root, info, row)
+        trajectory_path = (root / str(episode["trajectory_path"])).resolve()
+        if not trajectory_path.is_relative_to(root) or not trajectory_path.is_file():
+            raise FileNotFoundError(trajectory_path)
+        with np.load(trajectory_path) as trajectory:
+            length = clip.video.frame_count
+            expected_shapes = {
+                "joint_positions": (length, len(joint_names)),
+                "root_pose_xyzw": (length, 7),
+                "camera_pose_cv_xyzw": (length, 7),
+                "camera_intrinsic": (3, 3),
+                "frame_indices": (length,),
+                "timestamps": (length,),
+            }
+            for name, shape in expected_shapes.items():
+                values = np.asarray(trajectory[name])
+                if values.shape != shape or not np.isfinite(values).all():
+                    raise ValueError(f"{clip.stem} {name} is invalid")
+            if not np.array_equal(trajectory["frame_indices"], np.arange(length)):
+                raise ValueError(f"{clip.stem} frame indices are not contiguous")
+            for name in ("root_pose_xyzw", "camera_pose_cv_xyzw"):
+                if not np.allclose(
+                    np.linalg.norm(trajectory[name][:, 3:], axis=1),
+                    1.0,
+                    atol=1e-4,
+                ):
+                    raise ValueError(f"{clip.stem} {name} quaternions are invalid")
+        copied_video = _video_path(root, manifest, episode)
         if not probe_video(copied_video).compatible_with(clip.video):
-            raise ValueError(f"{clip.stem} LeRobot video differs from source")
+            raise ValueError(f"{clip.stem} robot video differs from source")
 
 
 def _validate_repaint(plan: PipelinePlan) -> None:
-    info = _read_json(plan.config.paths.lerobot / "meta/info.json")
-    rows = _episode_rows(plan.config.paths.lerobot)
+    info = _read_json(plan.config.paths.robot / "manifest.json")
+    rows = _episode_rows(plan.config.paths.robot)
     failed, entries = _repaint_manifest(plan)
     for clip in plan.clips:
         if clip.episode_index in failed:
@@ -1012,8 +937,8 @@ def _validate_repaint(plan: PipelinePlan) -> None:
 def _repaint_manifest(
     plan: PipelinePlan,
 ) -> tuple[dict[int, dict[str, str]], dict[int, dict[str, Any]]]:
-    info = _read_json(plan.config.paths.lerobot / "meta/info.json")
-    rows = _episode_rows(plan.config.paths.lerobot)
+    info = _read_json(plan.config.paths.robot / "manifest.json")
+    rows = _episode_rows(plan.config.paths.robot)
     manifest = _read_json(plan.config.paths.handless / "manifest.json")
     entries = manifest.get("episodes")
     if not isinstance(entries, list) or len(entries) != len(plan.clips):
@@ -1024,7 +949,7 @@ def _repaint_manifest(
     successful = {"ok", "skipped", "passthrough_no_target"}
     for clip in plan.clips:
         source_video = _video_path(
-            plan.config.paths.lerobot,
+            plan.config.paths.robot,
             info,
             rows[clip.episode_index],
         ).resolve()
@@ -1380,11 +1305,7 @@ def _validate_render(
 ) -> None:
     assert stage.episode_index is not None
     clip = _clip_by_index(plan, stage.episode_index)
-    output = (
-        plan.config.paths.final
-        / f"episode_{clip.episode_index:06d}"
-        / "g1_view.mp4"
-    )
+    output = _final_video_path(plan, clip.episode_index)
     rendered = probe_video(output)
     if not rendered.compatible_with(clip.video):
         raise ValueError(
@@ -1398,6 +1319,10 @@ def _validate_render(
         )
     if report.get("capture_view") != "robot-camera":
         raise ValueError("Final video is not a robot-camera capture")
+    if not str(report.get("mesh_pose_source", "")).startswith(
+        "prepared virtual source-camera pose backprojection rigidly following"
+    ):
+        raise ValueError("Final virtual camera did not follow fixed extrinsics")
     if int(report.get("frame_count", -1)) != clip.video.frame_count:
         raise ValueError("Final report frame count differs from source")
     lighting = report.get("lighting")
@@ -1520,7 +1445,7 @@ def _clear_stage(stage: Stage, plan: PipelinePlan) -> None:
             owner_root=paths.root,
         )
     elif stage.name == "retarget":
-        _remove_exact(paths.lerobot, owner_root=paths.root)
+        _remove_exact(paths.robot, owner_root=paths.root)
     elif stage.name == "repaint":
         _remove_exact(paths.handless, owner_root=paths.root)
     elif stage.name == "prepare":
@@ -1642,7 +1567,7 @@ def _new_report(plan: PipelinePlan) -> dict[str, Any]:
     return {
         "schema_version": 2,
         "pipeline": (
-            "nymeria_camera_alignment -> nymeria full-body GMR LeRobot -> "
+            "nymeria_camera_alignment -> nymeria full-body GMR robot trajectory -> "
             "arm repaint -> metric VDA RGB-D -> Isaac robot camera"
         ),
         "status": "running",
@@ -1672,8 +1597,9 @@ def _new_report(plan: PipelinePlan) -> dict[str, Any]:
             "visuals are hidden"
         ),
         "scene_alignment_policy": (
-            "support-plane leveling and Isaac scene alignment disabled; "
-            "retargeting already anchors the raw Aria camera to G1 world"
+            "support-plane leveling and scene alignment disabled; each "
+            "RGB-D frame uses a virtual source camera rigidly following the "
+            "exact G1 FK capture camera through one fixed initial extrinsic"
         ),
         "video_metadata_policy": (
             "ffprobe decoded/displayed frame count, source FPS and source "
@@ -1688,12 +1614,12 @@ def _new_report(plan: PipelinePlan) -> dict[str, Any]:
             "prepare/render exceptions are retried on the next run"
         ),
         "intermediate_retention": (
-            "alignment, LeRobot, handless, prepared, and final artifacts are "
+            "alignment, robot trajectory, handless, prepared, and final artifacts are "
             "retained"
             if config.retain_intermediates
             else (
                 "handless, prepared, and pipeline-owned alignment artifacts "
-                "are removed after render; only LeRobot, final outputs, and "
+                "are removed after render; only robot trajectory, final outputs, and "
                 "this report are retained; failed prepare/render inputs are "
                 "retained for retry"
             )
@@ -1733,7 +1659,7 @@ def _initialize_output(plan: PipelinePlan) -> None:
     config = plan.config
     paths = config.paths
     owned_targets = [
-        paths.lerobot,
+        paths.robot,
         paths.handless,
         paths.prepared,
         paths.final,
@@ -1811,7 +1737,7 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
         == (None if stage.command is None else list(stage.command))
         for stage in plan.stages
     )
-    retained_lerobot_valid = False
+    retained_robot_valid = False
     retained_render_indices: set[int] = set()
     if plan.config.resume and commands_unchanged:
         retarget_stage = next(
@@ -1858,10 +1784,10 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
                         not plan.config.alignment_is_external
                     ),
                 )
-                retained_lerobot_valid = True
+                retained_robot_valid = True
             except Exception:
                 pass
-        if retained_lerobot_valid:
+        if retained_robot_valid:
             for stage in plan.stages:
                 if (
                     stage.name != "render"
@@ -1911,7 +1837,7 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
             and all_episodes_retained
         )
         or (
-            retained_lerobot_valid
+            retained_robot_valid
             and stage.name in {"alignment", "retarget"}
         )
         or (
@@ -2033,16 +1959,14 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
                 "failed_stage": stage.stage_id,
                 "error": error,
                 "stage_paths": {
-                    "lerobot_root": str(plan.config.paths.lerobot),
+                    "robot_root": str(plan.config.paths.robot),
                     "handless_root": str(plan.config.paths.handless),
                     "prepared_episode": str(
                         plan.config.paths.prepared
                         / f"episode_{episode_index:06d}"
                     ),
                     "final_video": str(
-                        plan.config.paths.final
-                        / f"episode_{episode_index:06d}"
-                        / "g1_view.mp4"
+                        _final_video_path(plan, episode_index)
                     ),
                 },
                 "recorded_at": _utc_now(),
@@ -2149,7 +2073,7 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
                     stage.name in {"alignment", "retarget", "repaint"}
                     and all_episodes_retained
                 ) or (
-                    retained_lerobot_valid
+                    retained_robot_valid
                     and stage.name in {"alignment", "retarget"}
                 ) or (
                     stage.name in {"prepare", "render"}
@@ -2559,11 +2483,7 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
                     in {"completed", "reused"}
                 }
                 report["final_videos"] = [
-                    str(
-                        plan.config.paths.final
-                        / f"episode_{clip.episode_index:06d}"
-                        / "g1_view.mp4"
-                    )
+                    str(_final_video_path(plan, clip.episode_index))
                     for clip in plan.clips
                     if clip.episode_index in completed_render_indices
                 ]
@@ -2718,7 +2638,6 @@ def _config_from_args(args: argparse.Namespace) -> PipelineConfig:
         resume=True,
         overwrite=False,
         headless=bool(args.headless),
-        require_visible_hands=False,
         hardware_encoding=bool(args.hardware_encoding),
         scene_scale=None,
         vda_checkpoint=None,

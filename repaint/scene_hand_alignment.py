@@ -9,9 +9,13 @@ import h5py
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from human_to_robot.trajectory import (
-    HAND_TARGET_MODE_ATTRIBUTE,
+from repaint.g1_hand import (
+    TRACKED_HAND_TO_G1_PALM_ROTATIONS,
+)
+from repaint.hand_trajectory import (
+    FINGERTIP_GRASP_TARGET,
     RIGID_PALM_TARGET,
+    hdf5_hand_target_mode,
 )
 from repaint.robot_camera import (
     ROBOT_WRIST_FRAMES,
@@ -31,18 +35,18 @@ HAND_TCP_ALIGNMENT_STAGE = (
     "semantic-fingertip-tcp-constant-xyz-translation"
 )
 PALM_ALIGNMENT_METHOD = (
-    "initial bilateral rigid-palm action-frame midpoint, "
+    "initial bilateral tracked-Hand palm midpoint, "
     "coordinate-median constant world translation"
 )
 PALM_ALIGNMENT_STAGE = (
-    "semantic-rigid-palm-action-frame-constant-xyz-translation"
+    "tracked-hand-palm-constant-xyz-translation"
 )
 MAXIMUM_SCENE_AFFINE_CONDITION_NUMBER = 10.0
 
 
 @dataclass(frozen=True)
 class SceneHandAlignment:
-    """One constant world translation applied after scene leveling."""
+    """Scene camera poses plus any downstream constant world translation."""
 
     camera_pose_cv_xyzw: np.ndarray
     translation_world_xyz_m: np.ndarray
@@ -392,11 +396,12 @@ def estimate_initial_palm_midpoint_translation(
     robot_wrist_to_palm_offsets_local_m: np.ndarray,
     scene_camera_pose_cv_xyzw: np.ndarray,
     scene_scale: float,
+    source_hand_target_mode: str = RIGID_PALM_TARGET,
     max_translation_m: float = 0.3,
     scene_world_linear: np.ndarray | None = None,
     scene_world_pivot: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict[str, object]]:
-    """Fit one XYZ translation between matching rigid-palm action frames."""
+    """Fit one XYZ translation between tracked-Hand and G1 palm anchors."""
 
     source = np.asarray(source_palm_camera_cv, dtype=np.float64)
     source_offsets = np.asarray(
@@ -407,6 +412,13 @@ def estimate_initial_palm_midpoint_translation(
         robot_wrist_to_palm_offsets_local_m,
         dtype=np.float64,
     )
+    if source_hand_target_mode not in {
+        FINGERTIP_GRASP_TARGET,
+        RIGID_PALM_TARGET,
+    }:
+        raise ValueError(
+            f"Unsupported source hand target mode: {source_hand_target_mode!r}"
+        )
     if (
         source_offsets.shape != (2, 3)
         or robot_offsets.shape != (2, 3)
@@ -432,7 +444,7 @@ def estimate_initial_palm_midpoint_translation(
         {
             "method": PALM_ALIGNMENT_METHOD,
             "estimator": (
-                "per-frame equal-left/right rigid-palm midpoint residual, "
+                "per-frame equal-left/right tracked-palm midpoint residual, "
                 "coordinate median without temporal stability rejection"
             ),
             "formula": (
@@ -444,14 +456,15 @@ def estimate_initial_palm_midpoint_translation(
                     "transforms/leftHand",
                     "transforms/rightHand",
                 ],
-                "source_action_mode": RIGID_PALM_TARGET,
-                "source_transform_semantics": "wrist joint origins",
+                "source_action_mode": source_hand_target_mode,
+                "source_transform_semantics": "tracked Hand wrist-root poses",
                 "source_wrist_to_palm_offsets_local_m": (
                     source_offsets.tolist()
                 ),
                 "source_palm_offset_policy": (
-                    "canonical G1 wrist-to-palm offsets divided by "
-                    "scene_scale before source scene scaling"
+                    "fixed side-specific Hand-to-G1-palm axis map applied to "
+                    "canonical wrist-to-palm offsets, then divided by "
+                    "scene_scale"
                 ),
                 "robot_parent_frame_origins": list(ROBOT_WRIST_FRAMES),
                 "robot_palm_local_offsets_m": (
@@ -461,7 +474,7 @@ def estimate_initial_palm_midpoint_translation(
                 "bilateral_aggregation": (
                     "equal-weight midpoint of left and right palms"
                 ),
-                "matches_retarget_rigid_palm_action_frames": True,
+                "matches_retarget_tracked_hand_palm_targets": True,
                 "uses_source_wrist_origins": True,
                 "uses_fingertips": False,
                 "uses_hand_base_origins": False,
@@ -610,7 +623,7 @@ def align_scene_camera_poses_to_initial_palms(
     scene_world_linear: np.ndarray | None = None,
     scene_world_pivot: np.ndarray | None = None,
 ) -> SceneHandAlignment:
-    """Place a scene from matching source/G1 rigid-palm action frames."""
+    """Place a scene from matching tracked-Hand/G1 palm anchors."""
 
     if window_frames <= 0:
         raise ValueError("window_frames must be positive")
@@ -620,23 +633,18 @@ def align_scene_camera_poses_to_initial_palms(
     if selected_count < 3:
         raise ValueError("Prepared sequence has fewer than three frames")
     source_hdf5 = source_hdf5.resolve()
-    with h5py.File(source_hdf5, "r") as handle:
-        target_mode = handle.attrs.get(HAND_TARGET_MODE_ATTRIBUTE)
-    if isinstance(target_mode, (bytes, np.bytes_)):
-        target_mode = target_mode.decode("utf-8")
-    if target_mode != RIGID_PALM_TARGET:
-        raise ValueError(
-            "initial-palms requires source HDF5 "
-            f"{HAND_TARGET_MODE_ATTRIBUTE}={RIGID_PALM_TARGET!r}, "
-            f"got {target_mode!r}"
-        )
+    target_mode = hdf5_hand_target_mode(source_hdf5)
     if not np.isfinite(scene_scale) or scene_scale <= 0.0:
         raise ValueError("scene_scale must be positive and finite")
 
     initial_indices = frame_indices[:selected_count]
     initial_camera_pose = camera_pose[:selected_count]
     robot_palm_offsets = robot_palm_offsets_local_m(urdf_path)
-    source_palm_offsets = robot_palm_offsets / scene_scale
+    source_palm_offsets = np.einsum(
+        "sij,sj->si",
+        TRACKED_HAND_TO_G1_PALM_ROTATIONS,
+        robot_palm_offsets,
+    ) / scene_scale
     source_palm = load_source_palm_points_camera_cv(
         source_hdf5,
         initial_indices,
@@ -658,6 +666,7 @@ def align_scene_camera_poses_to_initial_palms(
         robot_wrist_to_palm_offsets_local_m=robot_palm_offsets,
         scene_camera_pose_cv_xyzw=initial_camera_pose,
         scene_scale=scene_scale,
+        source_hand_target_mode=target_mode,
         max_translation_m=max_translation_m,
         scene_world_linear=scene_world_linear,
         scene_world_pivot=scene_world_pivot,
@@ -672,15 +681,15 @@ def align_scene_camera_poses_to_initial_palms(
             "window_source_frame_indices": initial_indices.tolist(),
             "hand_frame_mapping": {
                 "source": (
-                    "leftHand/rightHand wrist origins plus scale-matched "
-                    "local palm offsets"
+                    "tracked leftHand/rightHand poses plus the fixed "
+                    "side-specific GMR palm-axis map"
                 ),
                 "robot": (
                     "left/right wrist_yaw_link plus the canonical retarget "
                     "palm offset"
                 ),
                 "aggregation": (
-                    "equal bilateral rigid-palm midpoint"
+                    "equal bilateral tracked-palm midpoint"
                 ),
             },
             "camera_pose_output_semantics": (

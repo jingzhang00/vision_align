@@ -13,7 +13,7 @@ retargeting:
 
 In particular, the displayed frame list returned by ``ffprobe -show_frames``
 honours MP4 edit lists.  Encoded GOP preroll packets therefore never become
-phantom LeRobot samples.
+phantom output samples.
 """
 
 from __future__ import annotations
@@ -23,7 +23,6 @@ import subprocess
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 from scipy.spatial.transform import Rotation, Slerp
@@ -40,15 +39,7 @@ class DisplayVideoInfo:
     width: int
     height: int
     fps: float
-    frame_rate: str
     display_timestamps: np.ndarray
-    display_duration: float
-    declared_frame_count: int | None
-    decoded_frame_count: int
-    discarded_preroll_frames: int | None
-    codec: str
-    pixel_format: str
-    has_audio: bool
 
     @property
     def frame_count(self) -> int:
@@ -74,7 +65,6 @@ class MotionMetadata:
     csv_start_time: float
     csv_original_start_time: float
     actual_start_time: float
-    actual_end_time: float
     sample_count: int
 
 
@@ -124,10 +114,8 @@ def probe_display_video(path: Path) -> DisplayVideoInfo:
         "-show_frames",
         "-show_entries",
         (
-            "stream=index,codec_type,codec_name,pix_fmt,width,height,"
-            "avg_frame_rate,r_frame_rate,nb_frames,nb_read_frames:"
-            "frame=best_effort_timestamp_time,pkt_duration_time,duration_time:"
-            "format=duration"
+            "stream=codec_type,width,height,avg_frame_rate,r_frame_rate,"
+            "nb_read_frames:frame=best_effort_timestamp_time"
         ),
         "-of",
         "json",
@@ -159,7 +147,6 @@ def probe_display_video(path: Path) -> DisplayVideoInfo:
             f"found {len(streams)}"
         )
     stream = streams[0]
-    rate_text = ""
     fps: float | None = None
     for candidate in (
         stream.get("avg_frame_rate"),
@@ -174,27 +161,17 @@ def probe_display_video(path: Path) -> DisplayVideoInfo:
             )
         except ValueError:
             continue
-        rate_text = str(candidate)
         fps = candidate_fps
         break
     if fps is None:
         raise ValueError(f"No valid video frame rate reported for {path}")
 
     raw_timestamps: list[float] = []
-    durations: list[float] = []
     for frame in payload.get("frames", []):
         timestamp_text = frame.get("best_effort_timestamp_time")
         if timestamp_text in (None, "", "N/A"):
             raise ValueError(f"Displayed frame in {path} has no timestamp")
         raw_timestamps.append(float(timestamp_text))
-        duration_text = (
-            frame.get("pkt_duration_time")
-            or frame.get("duration_time")
-        )
-        if duration_text not in (None, "", "N/A"):
-            duration = float(duration_text)
-            if np.isfinite(duration) and duration > 0:
-                durations.append(duration)
     if not raw_timestamps:
         raise ValueError(f"ffprobe decoded no displayed frames from {path}")
 
@@ -205,68 +182,17 @@ def probe_display_video(path: Path) -> DisplayVideoInfo:
     if len(timestamps) > 1 and np.any(np.diff(timestamps) <= 0):
         raise ValueError(f"Displayed timestamps are not strictly increasing: {path}")
 
-    nominal_period = 1.0 / fps
-    if len(timestamps) > 1:
-        inferred_period = float(np.median(np.diff(timestamps)))
-    elif durations:
-        inferred_period = float(np.median(durations))
-    else:
-        inferred_period = nominal_period
-    if not np.isfinite(inferred_period) or inferred_period <= 0:
-        inferred_period = nominal_period
-    display_duration = float(timestamps[-1] + inferred_period)
-
     decoded_count = _optional_int(stream.get("nb_read_frames"))
     if decoded_count is not None and decoded_count != len(timestamps):
         raise ValueError(
             f"ffprobe frame accounting disagrees for {path}: "
             f"nb_read_frames={decoded_count}, displayed={len(timestamps)}"
         )
-    decoded_count = len(timestamps)
-    declared_count = _optional_int(stream.get("nb_frames"))
-    discarded = (
-        max(0, declared_count - decoded_count)
-        if declared_count is not None
-        else None
-    )
-
-    audio_command = [
-        "ffprobe",
-        "-v",
-        "error",
-        "-show_entries",
-        "stream=codec_type",
-        "-of",
-        "json",
-        str(path),
-    ]
-    try:
-        audio_result = subprocess.run(
-            audio_command,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
-        raise RuntimeError(f"ffprobe could not inspect audio layout for {path}") from exc
-    audio_payload = json.loads(audio_result.stdout)
-    has_audio = any(
-        item.get("codec_type") == "audio"
-        for item in audio_payload.get("streams", [])
-    )
     return DisplayVideoInfo(
         width=int(stream["width"]),
         height=int(stream["height"]),
         fps=fps,
-        frame_rate=rate_text,
         display_timestamps=timestamps,
-        display_duration=display_duration,
-        declared_frame_count=declared_count,
-        decoded_frame_count=decoded_count,
-        discarded_preroll_frames=discarded,
-        codec=str(stream.get("codec_name", "unknown")),
-        pixel_format=str(stream.get("pix_fmt", "unknown")),
-        has_audio=has_audio,
     )
 
 
@@ -424,7 +350,6 @@ def load_motion_metadata(clip: NymeriaClip) -> MotionMetadata:
         csv_start_time=csv_start,
         csv_original_start_time=csv_original_start,
         actual_start_time=start,
-        actual_end_time=end,
         sample_count=sample_count,
     )
 

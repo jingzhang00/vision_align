@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Replay a prepared Video Depth Anything scene and G1 trajectory in Isaac.
 
-Each prepared RGB-D frame is reconstructed as a textured USD mesh in the
-active capture-camera pose while the frame-aligned G1 root and joint trajectory
-are applied to an Isaac articulation.  The combined replay can either be
-captured to one fixed-camera MP4 or viewed in an interactive Isaac viewport.
+Each prepared RGB-D frame is reconstructed as a textured USD mesh using a
+virtual camera at one fixed extrinsic from the active capture camera while the
+frame-aligned G1 trajectory is applied to an Isaac articulation.
 """
 
 from __future__ import annotations
@@ -89,6 +88,7 @@ JOINT_COMMIT_ATOL_RAD = 1.0e-4
 ROOT_POSITION_COMMIT_ATOL_M = 1.0e-4
 ROOT_ORIENTATION_COMMIT_ATOL_RAD = 1.0e-4
 INITIAL_HAND_ALIGNMENT_FRAME_COUNT = 5
+INITIAL_CAMERA_EXTRINSIC_FRAME_COUNT = 5
 
 
 @dataclass(frozen=True)
@@ -452,7 +452,7 @@ def _resolve_mesh_camera_poses(
     prepared_camera_poses_cv_xyzw: np.ndarray,
     robot_camera_poses_cv_xyzw: np.ndarray | None,
 ) -> tuple[np.ndarray, str]:
-    """Use the capture trajectory to place first-person RGB-D meshes."""
+    """Keep the virtual RGB-D camera at one fixed G1-camera extrinsic."""
 
     if capture_view == "robot-camera":
         if (
@@ -461,15 +461,45 @@ def _resolve_mesh_camera_poses(
             != prepared_camera_poses_cv_xyzw.shape
         ):
             raise ValueError("Robot mesh/capture camera poses are unavailable")
+        window = min(
+            INITIAL_CAMERA_EXTRINSIC_FRAME_COUNT,
+            len(prepared_camera_poses_cv_xyzw),
+        )
+        prepared_rotation = Rotation.from_quat(
+            prepared_camera_poses_cv_xyzw[:, 3:7]
+        )
+        robot_rotation = Rotation.from_quat(
+            robot_camera_poses_cv_xyzw[:, 3:7]
+        )
+        robot_from_virtual_rotation = (
+            robot_rotation[:window].inv()
+            * prepared_rotation[:window]
+        ).mean()
+        robot_from_virtual_translation = np.median(
+            robot_rotation[:window].inv().apply(
+                prepared_camera_poses_cv_xyzw[:window, :3]
+                - robot_camera_poses_cv_xyzw[:window, :3]
+            ),
+            axis=0,
+        )
+        resolved = robot_camera_poses_cv_xyzw.copy()
+        resolved[:, :3] += robot_rotation.apply(
+            robot_from_virtual_translation
+        )
+        resolved[:, 3:7] = (
+            robot_rotation * robot_from_virtual_rotation
+        ).as_quat()
         return (
-            robot_camera_poses_cv_xyzw,
-            "per-frame G1 FK robot-camera pose backprojection",
+            resolved,
+            "prepared virtual source-camera pose backprojection rigidly "
+            f"following the G1 camera with a fixed initial-{window}-frame "
+            "extrinsic",
         )
     if capture_view != "scene":
         raise ValueError(f"Unsupported capture view: {capture_view!r}")
     return (
         prepared_camera_poses_cv_xyzw,
-        "prepared camera_pose_cv_xyzw backprojection",
+        "prepared virtual source-camera pose backprojection",
     )
 
 
@@ -1240,7 +1270,7 @@ def render(args: argparse.Namespace) -> dict[str, object]:
         )
     scene_anchor_description = {
         "initial-hands": "bilateral exact fingertip-TCP XYZ anchor",
-        "initial-palms": "bilateral rigid-palm action-frame XYZ anchor",
+        "initial-palms": "bilateral tracked-Hand palm XYZ anchor",
     }.get(args.scene_alignment)
     scene_alignment_stage = {
         "initial-hands": HAND_TCP_ALIGNMENT_STAGE,
@@ -1310,16 +1340,6 @@ def render(args: argparse.Namespace) -> dict[str, object]:
         assert scene.scene_scale is not None
         assert scene_anchor_description is not None
         assert scene_alignment_stage is not None
-        alignment_window = AlignmentWindow(
-            requested_seconds=(
-                INITIAL_HAND_ALIGNMENT_FRAME_COUNT / scene.fps
-            ),
-            resolved_frames=min(
-                INITIAL_HAND_ALIGNMENT_FRAME_COUNT,
-                scene.frame_count,
-            ),
-            source="fixed first five frames",
-        )
         alignment_kwargs = {
             "source_hdf5": scene.source_hdf5,
             "frame_indices": scene.frame_indices,
@@ -1329,10 +1349,20 @@ def render(args: argparse.Namespace) -> dict[str, object]:
             "joint_names": scene.joint_names,
             "joint_positions": scene.joint_positions,
             "root_pose_xyzw": scene.root_poses_xyzw,
-            "window_frames": alignment_window.resolved_frames,
+            "window_frames": min(
+                INITIAL_HAND_ALIGNMENT_FRAME_COUNT,
+                scene.frame_count,
+            ),
             "scene_world_linear": scene_leveling_linear_world,
             "scene_world_pivot": scene_leveling_pivot_world,
         }
+        alignment_window = AlignmentWindow(
+            requested_seconds=(
+                INITIAL_HAND_ALIGNMENT_FRAME_COUNT / scene.fps
+            ),
+            resolved_frames=alignment_kwargs["window_frames"],
+            source="fixed first five frames",
+        )
         if args.scene_alignment == "initial-hands":
             alignment = align_scene_camera_poses_to_initial_hand_tcp(
                 **alignment_kwargs,
@@ -1346,10 +1376,10 @@ def render(args: argparse.Namespace) -> dict[str, object]:
         scene_alignment_report.update(
             {
                 "requested_mode": args.scene_alignment,
-                "pipeline_order": 2,
-                "window_seconds_requested": (
-                    alignment_window.requested_seconds
+                "pipeline_order": (
+                    2 if args.scene_leveling == "support-plane" else 1
                 ),
+                "window_seconds_requested": alignment_window.requested_seconds,
                 "window_frames_resolved": alignment_window.resolved_frames,
                 "window_resolution_source": alignment_window.source,
                 "window_source_fps": scene.fps,
@@ -1360,34 +1390,27 @@ def render(args: argparse.Namespace) -> dict[str, object]:
             "support_height_after_m"
         )
         if support_height_after_leveling is not None:
-            support_height_before_anchor = float(
-                support_height_after_leveling
-            )
-            support_height_final = (
-                support_height_before_anchor
-                + float(scene_translation_world[2])
-            )
+            support_height_before_anchor = float(support_height_after_leveling)
             scene_alignment_report.update(
                 {
-                    "support_height_before_anchor_m": (
+                    "support_height_before_anchor_m": support_height_before_anchor,
+                    "support_height_after_anchor_m": (
                         support_height_before_anchor
+                        + float(scene_translation_world[2])
                     ),
-                    "support_height_after_anchor_m": support_height_final,
                     "support_height_delta_from_anchor_m": float(
                         scene_translation_world[2]
                     ),
                 }
             )
         print(
-            f"Initial {scene_anchor_description} placement "
-            "(after leveling): "
+            f"Initial {scene_anchor_description} placement (after leveling): "
             f"delta_world={scene_translation_world.tolist()} m, "
             f"frames={scene_alignment_report['paired_frame_count']}"
             + (
                 ", support_height="
                 f"{scene_alignment_report['support_height_after_anchor_m']:.4f} m"
-                if "support_height_after_anchor_m"
-                in scene_alignment_report
+                if "support_height_after_anchor_m" in scene_alignment_report
                 else ""
             ),
             flush=True,
@@ -1422,6 +1445,9 @@ def render(args: argparse.Namespace) -> dict[str, object]:
         ),
         "anchor_translation_world_xyz_m": (
             scene_translation_world.tolist()
+        ),
+        "anchor_application_count": int(
+            scene_alignment_report.get("application_count", 0)
         ),
         "application_count": len(scene_operation_order),
     }
@@ -2334,8 +2360,8 @@ def render(args: argparse.Namespace) -> dict[str, object]:
                     else ""
                 )
                 + (
-                    " plus one constant world translation using the initial "
-                    f"{scene_anchor_description}"
+                    " plus one constant world translation using the "
+                    f"initial {scene_anchor_description}"
                     if scene_anchor_description is not None
                     else ""
                 )
@@ -2356,6 +2382,7 @@ def render(args: argparse.Namespace) -> dict[str, object]:
                 "before_hand_anchor_translation_max": (
                     scan.bounds_max - scene_translation_world
                 ).tolist(),
+                "before_hand_anchor_translation_note": None,
                 "before_support_leveling": (
                     "not represented by an axis-aligned bound because the "
                     "inverse affine correction does not preserve AABB extrema"
@@ -2480,13 +2507,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--scene-alignment",
         choices=("initial-hands", "initial-palms", "none"),
-        default="initial-hands",
+        default="initial-palms",
         help=(
             "At replay start, place the complete scene with one "
             "source/G1 bilateral semantic-anchor XYZ translation after "
             "optional support-plane leveling: exact fingertip TCPs for "
-            "initial-hands, rigid-palm action frames for initial-palms, "
-            "or disable it for legacy data (default: initial-hands)"
+            "initial-hands, tracked Hand palms for initial-palms, or disable it for "
+            "legacy data (default: initial-palms)"
         ),
     )
     parser.add_argument(
@@ -2496,7 +2523,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Minimum weighted source-HDF5 fingertip confidence for both "
             "retarget TCPs in initial-hands mode (default: 0.5; absent "
-            "confidences mean 1; unused by initial-palms)"
+            "confidences mean 1; unused by tracked-Hand initial-palms)"
         ),
     )
     parser.add_argument(

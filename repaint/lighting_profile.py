@@ -11,7 +11,7 @@ from typing import Any
 import cv2
 import numpy as np
 
-from human_to_robot.video_io import video_metadata
+from repaint.vda_pipeline_common import VideoMetadata, probe_video
 
 
 DEFAULT_ISAAC_PROFILE: dict[str, object] = {
@@ -64,23 +64,6 @@ def load_lighting_profile(path: Path | None) -> dict[str, Any] | None:
         if not isinstance(profile.get(section), dict):
             raise ValueError(f"Lighting profile has no '{section}' section: {path}")
     return profile
-
-
-def resolve_profile_value(
-    *,
-    explicit: object | None,
-    profile: dict[str, Any] | None,
-    section: str,
-    key: str,
-    default: object,
-) -> object:
-    """Resolve CLI override > lighting profile > stable fallback."""
-
-    if explicit is not None:
-        return explicit
-    if profile is not None and key in profile[section]:
-        return profile[section][key]
-    return default
 
 
 def _srgb_to_linear(rgb: np.ndarray) -> np.ndarray:
@@ -163,8 +146,11 @@ def _sample_frames(
     *,
     sample_count: int,
     max_dimension: int,
-) -> tuple[list[int], list[np.ndarray], float]:
-    width, height, frame_count, fps = video_metadata(video_path)
+) -> tuple[list[int], list[np.ndarray], VideoMetadata]:
+    metadata = probe_video(video_path)
+    width = metadata.width
+    height = metadata.height
+    frame_count = metadata.frame_count
     if frame_count <= 0:
         raise ValueError(f"Video has no frames: {video_path}")
     indices = np.unique(
@@ -197,7 +183,7 @@ def _sample_frames(
             frames.append(frame)
     finally:
         capture.release()
-    return indices, frames, fps
+    return indices, frames, metadata
 
 
 def _read_reliability_masks(
@@ -367,14 +353,15 @@ def estimate_lighting_profile(
     if max_dimension < 64:
         raise ValueError("max_dimension must be at least 64")
 
-    width, height, frame_count, fps = video_metadata(inpaint_video)
-    indices, frames, sampled_fps = _sample_frames(
+    indices, frames, metadata = _sample_frames(
         inpaint_video,
         sample_count=sample_count,
         max_dimension=max_dimension,
     )
-    if abs(fps - sampled_fps) > 0.01:
-        raise RuntimeError("Video FPS changed while sampling")
+    width = metadata.width
+    height = metadata.height
+    frame_count = metadata.frame_count
+    fps = metadata.fps
     excluded_masks = _read_reliability_masks(
         reliability_mask_root, indices, frames
     )
@@ -591,190 +578,6 @@ def estimate_lighting_profile(
             raise RuntimeError("validated output_path unexpectedly missing")
         _write_profile(output_path, profile)
     return profile
-
-
-def _weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
-    order = np.argsort(values)
-    ordered_values = values[order]
-    ordered_weights = weights[order]
-    midpoint = 0.5 * float(ordered_weights.sum())
-    index = int(np.searchsorted(np.cumsum(ordered_weights), midpoint, side="left"))
-    return float(ordered_values[min(index, len(ordered_values) - 1)])
-
-
-def aggregate_task_lighting_profiles(
-    *,
-    task_name: str,
-    episode_profiles: list[dict[str, Any]],
-    output_path: Path,
-) -> dict[str, Any]:
-    """Aggregate episode observations into one fixed profile for a task."""
-
-    if not episode_profiles:
-        raise ValueError("Cannot build a task profile without episode observations")
-
-    episode_srgb = (
-        np.asarray(
-            [
-                profile["observations"]["selected_srgb_8bit"]
-                for profile in episode_profiles
-            ],
-            dtype=np.float64,
-        )
-        / 255.0
-    )
-    episode_color_confidence = np.asarray(
-        [profile["confidence"]["color"] for profile in episode_profiles],
-        dtype=np.float64,
-    )
-    color_weights = np.maximum(episode_color_confidence, 0.02)
-    robust_srgb = np.asarray(
-        [
-            _weighted_median(episode_srgb[:, channel], color_weights)
-            for channel in range(3)
-        ],
-        dtype=np.float64,
-    )
-    robust_linear_rgb = _srgb_to_linear(robust_srgb)
-    apparent_temperature, chromaticity_xy = _linear_rgb_to_cct(
-        robust_linear_rgb
-    )
-
-    log_chroma = np.log(
-        np.maximum(episode_srgb, 1e-6)
-        / np.maximum(episode_srgb[:, 1:2], 1e-6)
-    )
-    log_chroma_center = np.asarray(
-        [
-            _weighted_median(log_chroma[:, channel], color_weights)
-            for channel in range(log_chroma.shape[1])
-        ]
-    )
-    between_episode_color_mad = _weighted_median(
-        np.linalg.norm(log_chroma - log_chroma_center, axis=1),
-        color_weights,
-    )
-    within_episode_confidence = _weighted_median(
-        episode_color_confidence, color_weights
-    )
-    between_episode_stability = max(
-        0.0, 1.0 - between_episode_color_mad / 0.12
-    )
-    task_color_confidence = float(
-        np.clip(
-            within_episode_confidence * between_episode_stability,
-            0.0,
-            1.0,
-        )
-    )
-
-    episode_luminance = np.asarray(
-        [
-            profile["observations"]["selected_linear_luminance"]
-            for profile in episode_profiles
-        ],
-        dtype=np.float64,
-    )
-    robust_luminance = float(np.median(episode_luminance))
-    episode_luminance_stops = np.log2(np.maximum(episode_luminance, 1e-6))
-    between_episode_luminance_p90_p10 = float(
-        np.percentile(episode_luminance_stops, 90.0)
-        - np.percentile(episode_luminance_stops, 10.0)
-    )
-
-    dome_temperature, key_temperature = _render_temperature(
-        apparent_temperature, task_color_confidence
-    )
-    light_ev = float(
-        np.clip(
-            0.65 * math.log2(max(robust_luminance, 1e-4) / 0.26),
-            -0.65,
-            0.53,
-        )
-    )
-    dome_intensity = float(np.clip(900.0 * 2.0**light_ev, 550.0, 1300.0))
-    key_intensity = 0.20 * dome_intensity
-
-    warnings: list[str] = []
-    if task_color_confidence < 0.05:
-        warnings.append("task_color_confidence_below_0.05")
-        dome_temperature, key_temperature = 5500.0, 5700.0
-    if between_episode_color_mad > 0.08:
-        warnings.append("task_color_varies_between_episodes")
-    if between_episode_luminance_p90_p10 > 0.75:
-        warnings.append("task_exposure_varies_between_episodes")
-
-    per_episode = []
-    for profile in episode_profiles:
-        per_episode.append(
-            {
-                "analysis_video": profile["analysis_video"],
-                "frame_count": profile["analysis_video_metadata"]["frame_count"],
-                "selected_srgb_8bit": profile["observations"][
-                    "selected_srgb_8bit"
-                ],
-                "selected_linear_luminance": profile["observations"][
-                    "selected_linear_luminance"
-                ],
-                "apparent_cct_kelvin": profile["observations"][
-                    "apparent_cct_kelvin"
-                ],
-                "color_confidence": profile["confidence"]["color"],
-                "warnings": profile["warnings"],
-            }
-        )
-
-    task_profile: dict[str, Any] = {
-        "profile_version": 1,
-        "scope": "task",
-        "task_name": task_name,
-        "episode_count": len(episode_profiles),
-        "analysis_episodes": per_episode,
-        "decode_policy": {
-            "working_assumption": "decoded RGB is sRGB-like display-referred",
-            "linearization": "sRGB EOTF working approximation",
-            "note": (
-                "One robust fixed profile is shared by all episodes in this "
-                "task; it is an effective display match, not inverse rendering."
-            ),
-        },
-        "aggregation": {
-            "color": "confidence-weighted median of episode observations",
-            "luminance": "median of episode linear-luminance P75",
-        },
-        "observations": {
-            "selected_srgb_8bit": (robust_srgb * 255.0).tolist(),
-            "selected_linear_rgb": robust_linear_rgb.tolist(),
-            "selected_linear_luminance": robust_luminance,
-            "apparent_cct_kelvin": apparent_temperature,
-            "chromaticity_xy": chromaticity_xy,
-            "between_episode_log_chroma_mad": between_episode_color_mad,
-            "between_episode_luminance_p90_p10_stops": (
-                between_episode_luminance_p90_p10
-            ),
-        },
-        "confidence": {
-            "color": task_color_confidence,
-            "within_episode_color": within_episode_confidence,
-            "between_episode_color_stability": between_episode_stability,
-            "fixed_profile_reliable": not warnings,
-        },
-        "warnings": warnings,
-        "isaac": {
-            "dome_intensity": dome_intensity,
-            "dome_temperature": dome_temperature,
-            "key_intensity": key_intensity,
-            "key_temperature": key_temperature,
-            "key_angle": DEFAULT_ISAAC_PROFILE["key_angle"],
-            "key_rotation": DEFAULT_ISAAC_PROFILE["key_rotation"],
-            "interpretation": (
-                "one bounded effective render cast shared by the task"
-            ),
-        },
-        "composite": dict(DEFAULT_COMPOSITE_PROFILE),
-    }
-    _write_profile(output_path, task_profile, skip_if_unchanged=True)
-    return task_profile
 
 
 def build_parser() -> argparse.ArgumentParser:

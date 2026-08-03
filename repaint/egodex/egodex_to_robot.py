@@ -17,7 +17,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -50,12 +49,14 @@ if str(STREAM_ROOT) not in sys.path:
 from general_motion_retargeting import (  # noqa: E402
     GeneralMotionRetargeting as GMR,
 )
-from human_to_robot.retarget_g1_pinocchio import (  # noqa: E402
+from repaint.g1_hand import (  # noqa: E402
     HAND_JOINTS,
     O6HandRetargetTrajectory,
+    TRACKED_HAND_TO_G1_PALM_ROTATIONS,
     build_pinocchio_g1,
     retarget_o6_hands,
 )
+from repaint.vda_pipeline_common import natural_key  # noqa: E402
 
 
 VIDEO_KEY = "observation.images.ego"
@@ -71,7 +72,6 @@ DATA_FILE_SIZE_MB = 100
 VIDEO_FILE_SIZE_MB = 200
 STAT_QUANTILES = (0.01, 0.10, 0.50, 0.90, 0.99)
 STAT_KEYS = ("min", "max", "mean", "std", "count", "q01", "q10", "q50", "q90", "q99")
-IDENTITY_WXYZ = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
 G1_URDF = (
     WORKSPACE_ROOT
     / "assets/unitree_description/urdf/g1/main_with_hand_new.urdf"
@@ -373,7 +373,7 @@ def _build_gmr_with_hand_model(urdf_path: Path) -> mj.MjModel:
 def _configure_gmr_hand_constraints(
     retarget: GMR,
     hand_joint_names: tuple[str, ...],
-) -> tuple[dict[str, object], tuple[tuple[int, int], ...]]:
+) -> dict[str, object]:
     """Freeze the retargeted fingers without constraining the two hands."""
 
     if tuple(hand_joint_names) != tuple(HAND_JOINTS):
@@ -400,7 +400,7 @@ def _configure_gmr_hand_constraints(
             GMR_COLLISION_PHASE2_MAX_ITERATIONS,
         ],
     }
-    return diagnostics, ()
+    return diagnostics
 
 
 def _solve_complete_gmr_phase(
@@ -427,7 +427,7 @@ def _solve_complete_gmr_phase(
 def _complete_gmr_retarget(
     retarget: GMR,
     human_frame: dict[str, tuple[np.ndarray, np.ndarray]],
-) -> np.ndarray:
+) -> None:
     """Solve both GMR phases with frozen O6 joints."""
 
     retarget.update_targets(human_frame)
@@ -443,7 +443,6 @@ def _complete_gmr_retarget(
             retarget.tasks2,
             iterations=GMR_COLLISION_PHASE2_MAX_ITERATIONS,
         )
-    return retarget.configuration.data.qpos.copy()
 
 
 def _set_gmr_hand_configuration(
@@ -514,13 +513,6 @@ def _validate_o6_mimic_trajectory(
     }
 
 
-def _natural_key(value: str) -> list[Any]:
-    return [
-        int(part) if part.isdigit() else part.lower()
-        for part in re.split(r"(\d+)", value)
-    ]
-
-
 def probe_video(path: Path) -> VideoInfo:
     command = [
         "ffprobe",
@@ -586,7 +578,7 @@ def discover_source_pairs(src_root: Path) -> list[SourcePair]:
     hdf5_files = list(src_root.rglob("*.hdf5"))
     hdf5_files = sorted(
         set(path.resolve() for path in hdf5_files),
-        key=lambda path: _natural_key(str(path.relative_to(src_root.resolve()))),
+        key=lambda path: natural_key(str(path.relative_to(src_root.resolve()))),
     )
     if not hdf5_files:
         raise FileNotFoundError(f"No .hdf5 files found under {src_root}")
@@ -811,14 +803,14 @@ def _egodex_gmr_frames(
     retarget: GMR,
     hand: O6HandRetargetTrajectory,
 ) -> list[dict[str, tuple[np.ndarray, np.ndarray]]]:
-    if (
-        hand.source_action_transforms_reference_camera.shape
-        != (episode.frame_count, 2, 4, 4)
-        or hand.wrist_from_action_transforms.shape
-        != (episode.frame_count, 2, 4, 4)
+    if hand.source_hand_transforms_reference_camera.shape != (
+        episode.frame_count,
+        2,
+        4,
+        4,
     ):
         raise ValueError(
-            f"Hand action trajectory length differs for {episode.stem}"
+            f"Tracked Hand trajectory length differs for {episode.stem}"
         )
 
     basis = episode.source_to_robot_rotation
@@ -901,48 +893,49 @@ def _egodex_gmr_frames(
                 scalar_first=True
             )
 
-        # EgoDex's tracked Hand transform is the wrist root. For articulated
-        # input this pipeline deliberately derives a fingertip grasp action
-        # frame, then removes the state-dependent O6 wrist-to-action transform.
-        # This preserves the source task point without pretending that the
-        # fingertips and wrist_yaw_link share an origin.
-        source_action = (
-            hand.source_action_transforms_reference_camera[:, side_index]
+        # Finger landmarks drive only O6 articulation. The GMR wrist target is
+        # the tracked Hand pose with one fixed side-specific local-axis map.
+        source_hand = (
+            hand.source_hand_transforms_reference_camera[:, side_index]
         )
-        source_action_position = (
+        source_hand_position = (
             reference_camera_to_source[:3, 3]
             + (
                 reference_camera_to_source[:3, :3]
-                @ source_action[:, :3, 3].T
+                @ source_hand[:, :3, 3].T
             ).T
         )
-        action_rotation = np.einsum(
-            "ij,njk->nik",
+        desired_wrist_rotation = np.einsum(
+            "ij,njk,kl->nil",
             robot_from_reference_camera,
-            source_action[:, :3, :3],
+            source_hand[:, :3, :3],
+            TRACKED_HAND_TO_G1_PALM_ROTATIONS[side_index],
         )
-        wrist_from_action = (
-            hand.wrist_from_action_transforms[:, side_index]
+        # GMR appends its configured SMPL-X-to-G1 wrist rotation offset.
+        # Remove it here so the solved robot frame, not the pre-offset human
+        # task frame, matches the tracked Hand orientation.
+        raw_wrist_rotation = (
+            Rotation.from_matrix(desired_wrist_rotation)
+            * retarget.rot_offsets1[wrist_name].inv()
         )
-        wrist_rotation = np.einsum(
-            "nij,nkj->nik",
-            action_rotation,
-            wrist_from_action[:, :3, :3],
-        )
+        if not np.allclose(
+            (
+                raw_wrist_rotation
+                * retarget.rot_offsets1[wrist_name]
+            ).as_matrix(),
+            desired_wrist_rotation,
+            atol=1e-9,
+        ):
+            raise RuntimeError(f"Failed to compensate GMR {wrist_name} offset")
         wrist_scale = float(retarget.human_scale_table[wrist_name])
         standing_shoulder_position = np.asarray(
             retarget.scaled_human_data[shoulder_name][0],
             dtype=np.float64,
         )
-        action_position = (
+        wrist_position = (
             standing_shoulder_position
             + wrist_scale
-            * (basis @ (source_action_position - source_shoulder).T).T
-        )
-        wrist_position = action_position - np.einsum(
-            "nij,nj->ni",
-            wrist_rotation,
-            wrist_from_action[:, :3, 3],
+            * (basis @ (source_hand_position - source_shoulder).T).T
         )
         wrist_position_offset = retarget.pos_offsets1[wrist_name]
         upper_positions[wrist_name] = (
@@ -951,7 +944,7 @@ def _egodex_gmr_frames(
                 wrist_position
                 - np.einsum(
                     "nij,j->ni",
-                    wrist_rotation,
+                    desired_wrist_rotation,
                     wrist_position_offset,
                 )
                 + ground_offset
@@ -959,10 +952,9 @@ def _egodex_gmr_frames(
             )
             / wrist_scale
         )
-        upper_quaternions[wrist_name] = (
-            Rotation.from_matrix(wrist_rotation)
-            * retarget.rot_offsets1[wrist_name].inv()
-        ).as_quat(scalar_first=True)
+        upper_quaternions[wrist_name] = raw_wrist_rotation.as_quat(
+            scalar_first=True
+        )
 
     frames: list[dict[str, tuple[np.ndarray, np.ndarray]]] = []
     for frame_index in range(episode.frame_count):
@@ -1013,7 +1005,6 @@ def _gmr_body_trajectory(
         tgt_robot="unitree_g1_with_hands",
         verbose=False,
         robot_model=gmr_model,
-        robot_model_source=str(G1_URDF.resolve()),
     )
     source_to_robot_scale = float(
         np.mean(
@@ -1029,10 +1020,7 @@ def _gmr_body_trajectory(
         scale=source_to_robot_scale,
     )
     mimic_diagnostics = _validate_o6_mimic_trajectory(model, hand)
-    (
-        gmr_model_diagnostics,
-        _,
-    ) = _configure_gmr_hand_constraints(
+    gmr_model_diagnostics = _configure_gmr_hand_constraints(
         retarget,
         hand.joint_names,
     )
@@ -1474,13 +1462,11 @@ def retarget_episode(
     hand_diagnostics["target_adapter"] = {
         "source_action_mode": hand.action_mode,
         "mapping": (
-            "source action frame -> articulated O6 wrist/action transform "
-            "-> GMR wrist target"
+            "tracked Hand pose -> fixed side-specific local-axis map -> "
+            "GMR wrist target"
         ),
-        "wrist_rotation_source": "source semantic hand action orientation",
-        "wrist_position_source": (
-            "source semantic hand action position with O6 geometry removed"
-        ),
+        "wrist_rotation_source": "tracked EgoDex Hand orientation",
+        "wrist_position_source": "tracked EgoDex Hand wrist-root position",
     }
     hand_diagnostics["cross_hand_collision_validation"] = (
         collision_diagnostics
@@ -2046,12 +2032,12 @@ def write_lerobot_v3(
                 },
                 "lower_body_target": "G1 neutral standing FK",
                 "hand_retargeter": (
-                    "semantic action-frame to O6 wrist target plus "
-                    "25-landmark articulated finger mapping"
+                    "tracked Hand pose to GMR wrist target plus 25-landmark "
+                    "articulated finger mapping"
                 ),
                 "hand_target_adapter": (
-                    "source action -> inverse articulated O6 wrist/action "
-                    "transform -> GMR wrist pose"
+                    "tracked Hand pose -> fixed side-specific local-axis map "
+                    "-> GMR wrist target"
                 ),
                 "cross_hand_collision_validation": {
                     "geometry_pairs": 144,

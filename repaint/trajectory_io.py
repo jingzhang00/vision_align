@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import json
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pyarrow.parquet as pq
 
-from repaint.vda_pipeline_common import probe_video
+from repaint.vda_pipeline_common import probe_video, read_json as _read_json
 
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
@@ -40,15 +39,6 @@ class Trajectory:
     @property
     def frame_count(self) -> int:
         return int(len(self.frame_indices))
-
-
-def _read_json(path: Path) -> dict[str, Any]:
-    if not path.is_file():
-        raise FileNotFoundError(f"Missing metadata file: {path}")
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise TypeError(f"Expected a JSON object in {path}")
-    return payload
 
 
 def _episode_metadata_rows(dataset_root: Path) -> list[dict[str, Any]]:

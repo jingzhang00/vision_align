@@ -24,7 +24,7 @@ from repaint.nymeria.nymeria_vda_pipeline import (  # noqa: E402
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Run one Nymeria clip and retain alignment, LeRobot, handless, "
+            "Run one Nymeria clip and retain alignment, robot, handless, "
             "prepared, and final artifacts. Isaac is visible by default."
         )
     )

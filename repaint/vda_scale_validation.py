@@ -23,7 +23,7 @@ import h5py
 import numpy as np
 import pandas as pd
 
-from human_to_robot.trajectory import HAND_LANDMARK_NAMES
+from repaint.hand_trajectory import HAND_LANDMARK_NAMES
 from repaint.vda_depth import (
     DEFAULT_CHECKPOINT,
     DecodedVideoFrames,
@@ -32,6 +32,7 @@ from repaint.vda_depth import (
     infer_metric_vda_sequence,
     validate_frame_indices,
 )
+from repaint.vda_pipeline_common import probe_video
 
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
@@ -42,19 +43,8 @@ SEMIDENSE_MAX_POINTS = 50_000
 
 
 def _video_metadata(path: Path) -> tuple[int, int, int, float]:
-    capture = cv2.VideoCapture(str(path))
-    try:
-        if not capture.isOpened():
-            raise RuntimeError(f"Failed to open video: {path}")
-        width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
-        fps = float(capture.get(cv2.CAP_PROP_FPS))
-    finally:
-        capture.release()
-    if min(width, height, frame_count) <= 0 or fps <= 0.0:
-        raise ValueError(f"Invalid video metadata: {path}")
-    return width, height, frame_count, fps
+    metadata = probe_video(path)
+    return metadata.width, metadata.height, metadata.frame_count, metadata.fps
 
 
 def _declared_hdf5_source_video(path: Path) -> Path | None:
