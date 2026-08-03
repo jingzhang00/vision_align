@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-import h5py
 import numpy as np
 from scipy.spatial.transform import Rotation
 
@@ -19,21 +18,12 @@ from repaint.hand_trajectory import (
 )
 from repaint.robot_camera import (
     ROBOT_WRIST_FRAMES,
-    load_source_hand_tcp_points_camera_cv,
     load_source_palm_points_camera_cv,
     robot_frame_points_in_camera_cv,
-    robot_hand_tcp_points_in_camera_cv,
     robot_palm_offsets_local_m,
 )
 
 
-HAND_TCP_ALIGNMENT_METHOD = (
-    "initial bilateral retarget fingertip-TCP midpoint, "
-    "coordinate-median constant world translation"
-)
-HAND_TCP_ALIGNMENT_STAGE = (
-    "semantic-fingertip-tcp-constant-xyz-translation"
-)
 PALM_ALIGNMENT_METHOD = (
     "initial bilateral tracked-Hand palm midpoint, "
     "coordinate-median constant world translation"
@@ -41,6 +31,8 @@ PALM_ALIGNMENT_METHOD = (
 PALM_ALIGNMENT_STAGE = (
     "tracked-hand-palm-constant-xyz-translation"
 )
+
+
 @dataclass(frozen=True)
 class SceneHandAlignment:
     """Scene camera poses plus any downstream constant world translation."""
@@ -213,87 +205,6 @@ def _estimate_initial_bilateral_midpoint_translation(
     return translation_world, report, paired_valid
 
 
-def estimate_initial_hand_tcp_midpoint_translation(
-    *,
-    source_hand_tcp_camera_cv: np.ndarray,
-    source_hand_tcp_confidence: np.ndarray,
-    robot_hand_tcp_camera_cv: np.ndarray,
-    scene_camera_pose_cv_xyzw: np.ndarray,
-    scene_scale: float,
-    confidence_threshold: float = 0.5,
-    max_translation_m: float = 0.3,
-) -> tuple[np.ndarray, dict[str, object]]:
-    """Fit one XYZ translation from the exact retarget TCP."""
-
-    source = np.asarray(source_hand_tcp_camera_cv, dtype=np.float64)
-    confidence = np.asarray(source_hand_tcp_confidence, dtype=np.float64)
-    frame_count = len(source)
-    if (
-        confidence.shape != (frame_count, 2)
-        or not np.isfinite(confidence_threshold)
-        or not 0.0 <= confidence_threshold <= 1.0
-    ):
-        raise ValueError("TCP alignment confidence inputs are invalid")
-    translation_world, report, paired_valid = (
-        _estimate_initial_bilateral_midpoint_translation(
-            source_anchor_camera_cv=source,
-            robot_anchor_camera_cv=robot_hand_tcp_camera_cv,
-            scene_camera_pose_cv_xyzw=scene_camera_pose_cv_xyzw,
-            scene_scale=scene_scale,
-            frame_validity=(
-                np.isfinite(confidence).all(axis=1)
-                & np.all(confidence >= confidence_threshold, axis=1)
-            ),
-            anchor_name="hand-TCP",
-            require_positive_source_depth=True,
-            max_translation_m=max_translation_m,
-        )
-    )
-    valid_confidence = confidence[paired_valid]
-    report.update(
-        {
-            "method": HAND_TCP_ALIGNMENT_METHOD,
-            "estimator": (
-                "per-frame equal-left/right semantic TCP midpoint residual, "
-                "coordinate median without temporal stability rejection"
-            ),
-            "formula": (
-                "delta_world = median(G1_TCP_midpoint_world - "
-                "source_TCP_midpoint_scene_world)"
-            ),
-            "anchor_semantics": {
-                "source_and_robot_tcp_position": (
-                    "0.5*thumb_tip + 0.35*index_tip + 0.15*middle_tip"
-                ),
-                "source_tcp_confidence": (
-                    "0.5*thumb_confidence + 0.35*index_confidence + "
-                    "0.15*middle_confidence"
-                ),
-                "bilateral_aggregation": (
-                    "equal-weight midpoint of left and right TCPs"
-                ),
-                "matches_retarget_arm_ik_tcp": True,
-                "uses_hand_base_origins": False,
-                "uses_ring_or_little_fingertips": False,
-            },
-            "height_policy": (
-                "world Z is estimated from the same 3-D TCP residual; "
-                "no fixed scene or table height is used"
-            ),
-            "confidence_threshold": float(confidence_threshold),
-            "bilateral_tcp_confidence": {
-                "minimum": float(np.min(valid_confidence)),
-                "p50": float(np.percentile(valid_confidence, 50.0)),
-            },
-            "individual_hand_tcp_residual_after_m": report.pop(
-                "individual_anchor_residual_after_m"
-            ),
-            "individual_hand_tcp_residual_is_diagnostic_only": True,
-        }
-    )
-    return translation_world, report
-
-
 def estimate_initial_palm_midpoint_translation(
     *,
     source_palm_camera_cv: np.ndarray,
@@ -401,106 +312,6 @@ def estimate_initial_palm_midpoint_translation(
         }
     )
     return translation_world, report
-
-
-def align_scene_camera_poses_to_initial_hand_tcp(
-    *,
-    source_hdf5: Path,
-    frame_indices: np.ndarray,
-    scene_scale: float,
-    scene_camera_pose_cv_xyzw: np.ndarray,
-    urdf_path: Path,
-    joint_names: tuple[str, ...],
-    joint_positions: np.ndarray,
-    root_pose_xyzw: np.ndarray,
-    window_frames: int,
-    confidence_threshold: float = 0.5,
-    max_translation_m: float = 0.3,
-) -> SceneHandAlignment:
-    """Place a scene from the exact bilateral retarget TCP midpoint."""
-
-    if window_frames <= 0:
-        raise ValueError("window_frames must be positive")
-    frame_indices = np.asarray(frame_indices, dtype=np.int64)
-    camera_pose = np.asarray(scene_camera_pose_cv_xyzw, dtype=np.float64)
-    selected_count = min(int(window_frames), len(frame_indices))
-    if selected_count < 3:
-        raise ValueError("Prepared sequence has fewer than three frames")
-    initial_indices = frame_indices[:selected_count]
-    initial_camera_pose = camera_pose[:selected_count]
-    source_tcp, confidence = load_source_hand_tcp_points_camera_cv(
-        source_hdf5,
-        initial_indices,
-    )
-    robot_tcp = robot_hand_tcp_points_in_camera_cv(
-        urdf_path=urdf_path,
-        joint_names=joint_names,
-        joint_positions=np.asarray(joint_positions)[:selected_count],
-        root_pose_xyzw=np.asarray(root_pose_xyzw)[:selected_count],
-        camera_pose_cv_xyzw=initial_camera_pose,
-    )
-    translation_world, report = estimate_initial_hand_tcp_midpoint_translation(
-        source_hand_tcp_camera_cv=source_tcp,
-        source_hand_tcp_confidence=confidence,
-        robot_hand_tcp_camera_cv=robot_tcp,
-        scene_camera_pose_cv_xyzw=initial_camera_pose,
-        scene_scale=scene_scale,
-        confidence_threshold=confidence_threshold,
-        max_translation_m=max_translation_m,
-    )
-
-    confidence_keys = tuple(
-        f"confidences/{side}{digit}Tip"
-        for side in ("left", "right")
-        for digit in ("Thumb", "IndexFinger", "MiddleFinger")
-    )
-    with h5py.File(source_hdf5, "r") as handle:
-        missing_confidence = [
-            key for key in confidence_keys if key not in handle
-        ]
-    if not missing_confidence:
-        confidence_source = "source HDF5"
-    elif len(missing_confidence) == len(confidence_keys):
-        confidence_source = (
-            "implicit ones because source HDF5 confidence is absent"
-        )
-    else:
-        confidence_source = (
-            "source HDF5 with missing tracks defaulted to one"
-        )
-    report.update(
-        {
-            "source_hdf5": str(source_hdf5.resolve()),
-            "g1_urdf": str(urdf_path.resolve()),
-            "window_local_frame_start": 0,
-            "window_local_frame_end_exclusive": selected_count,
-            "window_source_frame_indices": initial_indices.tolist(),
-            "confidence_source": confidence_source,
-            "missing_confidence_keys_defaulted_to_one": (
-                missing_confidence
-            ),
-            "hand_frame_mapping": {
-                "source": (
-                    "left/right thumb, index, middle fingertip weighted TCP"
-                ),
-                "robot": (
-                    "left/right distal links plus canonical tip offsets"
-                ),
-                "aggregation": (
-                    "exact retarget TCP per side, then equal bilateral "
-                    "midpoint"
-                ),
-            },
-            "camera_pose_output_semantics": "translation-only scene placement",
-        }
-    )
-    aligned_pose = camera_pose.copy()
-    aligned_pose[:, :3] += translation_world
-    return SceneHandAlignment(
-        camera_pose_cv_xyzw=aligned_pose,
-        translation_world_xyz_m=translation_world,
-        report=report,
-    )
 
 
 def align_scene_camera_poses_to_initial_palms(

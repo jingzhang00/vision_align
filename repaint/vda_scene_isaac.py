@@ -55,9 +55,7 @@ from repaint.robot_camera import (  # noqa: E402
     robot_frame_points_in_camera_cv,
 )
 from repaint.scene_hand_alignment import (  # noqa: E402
-    HAND_TCP_ALIGNMENT_STAGE,
     PALM_ALIGNMENT_STAGE,
-    align_scene_camera_poses_to_initial_hand_tcp,
     align_scene_camera_poses_to_initial_palms,
 )
 
@@ -76,7 +74,7 @@ HAND_CAPTURE_WARNING_THRESHOLD = 0.8
 JOINT_COMMIT_ATOL_RAD = 1.0e-4
 ROOT_POSITION_COMMIT_ATOL_M = 1.0e-4
 ROOT_ORIENTATION_COMMIT_ATOL_RAD = 1.0e-4
-INITIAL_HAND_ALIGNMENT_FRAME_COUNT = 5
+INITIAL_PALM_ALIGNMENT_FRAME_COUNT = 5
 INITIAL_CAMERA_EXTRINSIC_FRAME_COUNT = 5
 
 
@@ -1204,14 +1202,16 @@ def render(args: argparse.Namespace) -> dict[str, object]:
             "prepared episode_data.npz; use "
             "--scene-alignment none only for legacy prepared data"
         )
-    scene_anchor_description = {
-        "initial-hands": "bilateral exact fingertip-TCP XYZ anchor",
-        "initial-palms": "bilateral tracked-Hand palm XYZ anchor",
-    }.get(args.scene_alignment)
-    scene_alignment_stage = {
-        "initial-hands": HAND_TCP_ALIGNMENT_STAGE,
-        "initial-palms": PALM_ALIGNMENT_STAGE,
-    }.get(args.scene_alignment)
+    scene_anchor_description = (
+        "bilateral tracked-Hand palm XYZ anchor"
+        if args.scene_alignment == "initial-palms"
+        else None
+    )
+    scene_alignment_stage = (
+        PALM_ALIGNMENT_STAGE
+        if args.scene_alignment == "initial-palms"
+        else None
+    )
 
     if args.scene_alignment != "none":
         assert scene.source_hdf5 is not None
@@ -1219,7 +1219,7 @@ def render(args: argparse.Namespace) -> dict[str, object]:
         assert scene_anchor_description is not None
         assert scene_alignment_stage is not None
         alignment_window_frames = min(
-            INITIAL_HAND_ALIGNMENT_FRAME_COUNT,
+            INITIAL_PALM_ALIGNMENT_FRAME_COUNT,
             scene.frame_count,
         )
         alignment_kwargs = {
@@ -1233,22 +1233,16 @@ def render(args: argparse.Namespace) -> dict[str, object]:
             "root_pose_xyzw": scene.root_poses_xyzw,
             "window_frames": alignment_window_frames,
         }
-        if args.scene_alignment == "initial-hands":
-            alignment = align_scene_camera_poses_to_initial_hand_tcp(
-                **alignment_kwargs,
-                confidence_threshold=args.scene_hand_confidence,
-            )
-        else:
-            alignment = align_scene_camera_poses_to_initial_palms(
-                **alignment_kwargs,
-            )
+        alignment = align_scene_camera_poses_to_initial_palms(
+            **alignment_kwargs,
+        )
         scene_alignment_report = alignment.report
         scene_alignment_report.update(
             {
                 "requested_mode": args.scene_alignment,
                 "pipeline_order": 1,
                 "window_seconds_requested": (
-                    INITIAL_HAND_ALIGNMENT_FRAME_COUNT / scene.fps
+                    INITIAL_PALM_ALIGNMENT_FRAME_COUNT / scene.fps
                 ),
                 "window_frames_resolved": alignment_window_frames,
                 "window_resolution_source": "fixed first five frames",
@@ -2283,24 +2277,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--scene-alignment",
-        choices=("initial-hands", "initial-palms", "none"),
+        choices=("initial-palms", "none"),
         default="initial-palms",
         help=(
             "At replay start, place the complete scene with one "
             "source/G1 bilateral semantic-anchor XYZ translation: "
-            "exact fingertip TCPs for "
-            "initial-hands, tracked Hand palms for initial-palms, or disable it for "
+            "tracked Hand palms for initial-palms, or disable it for "
             "legacy data (default: initial-palms)"
-        ),
-    )
-    parser.add_argument(
-        "--scene-hand-confidence",
-        type=float,
-        default=0.5,
-        help=(
-            "Minimum weighted source-HDF5 fingertip confidence for both "
-            "retarget TCPs in initial-hands mode (default: 0.5; absent "
-            "confidences mean 1; unused by tracked-Hand initial-palms)"
         ),
     )
     parser.add_argument(
