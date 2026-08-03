@@ -771,7 +771,7 @@ def _capture_camera_report(
         "offset_rotation_world_wxyz": (
             HEAD_CAM_OFFSET_ROT_WXYZ.tolist()
         ),
-        "native_size": list(HEAD_CAMERA_REFERENCE_SIZE),
+        "native_size": list(D435_REFERENCE_SIZE),
         "reference_size": list(D435_REFERENCE_SIZE),
         "content_size": [int(value) for value in content_size],
         "output_size": [int(value) for value in output_size],
