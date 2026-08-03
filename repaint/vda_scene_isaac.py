@@ -45,14 +45,13 @@ from repaint.rgbd_geometry import (  # noqa: E402
     grid_uvs,
 )
 from repaint.robot_camera import (  # noqa: E402
-    BEINGBEYOND_HEAD_CAMERA_PARENT_FRAME,
-    BEINGBEYOND_HEAD_CAMERA_PROFILE,
-    BEINGBEYOND_HEAD_CAM_OFFSET_POS_ACTIVE,
-    BEINGBEYOND_HEAD_CAM_OFFSET_POS_BASE,
-    BEINGBEYOND_HEAD_CAM_OFFSET_ROT_WXYZ,
-    BEINGBEYOND_HEAD_CAM_RESET_GUARD_X_M,
-    beingbeyond_head_camera_poses_cv,
-    beingbeyond_head_camera_poses_world,
+    HEAD_CAMERA_PARENT_FRAME,
+    HEAD_CAM_OFFSET_POS_ACTIVE,
+    HEAD_CAM_OFFSET_POS_BASE,
+    HEAD_CAM_OFFSET_ROT_WXYZ,
+    HEAD_CAM_RESET_GUARD_X_M,
+    head_camera_poses_cv,
+    head_camera_poses_world,
     robot_frame_points_in_camera_cv,
 )
 from repaint.scene_hand_alignment import (  # noqa: E402
@@ -61,19 +60,9 @@ from repaint.scene_hand_alignment import (  # noqa: E402
     align_scene_camera_poses_to_initial_hand_tcp,
     align_scene_camera_poses_to_initial_palms,
 )
-from repaint.scene_leveling import (  # noqa: E402
-    SUPPORT_PLANE_LEVELING_STAGE,
-    apply_world_affine_to_points,
-    level_scene_camera_poses_from_support_plane,
-)
 
-
-# Fixed ideal pinhole calibration from the active BeingBeyond CameraCfg.
-# It always stays 4:3 and is uniformly scaled into the largest centered 4:3
-# rectangle contained by the source video. Replay never consults a RealSense
-# device or profile.
-BEINGBEYOND_D435_REFERENCE_SIZE = (640, 480)
-BEINGBEYOND_D435_INTRINSIC = np.asarray(
+D435_REFERENCE_SIZE = (640, 480)
+D435_INTRINSIC = np.asarray(
     [
         [607.212158203125, 0.0, 311.9999084472656],
         [0.0, 607.0084838867188, 261.152099609375],
@@ -138,15 +127,6 @@ class RunOptions:
     playback_fps: float
     output_video: Path | None
     report_path: Path | None
-
-
-@dataclass(frozen=True)
-class AlignmentWindow:
-    """A source-time request resolved to a bounded prepared-frame window."""
-
-    requested_seconds: float
-    resolved_frames: int
-    source: str
 
 
 def _numbered_png_paths(directory: Path) -> tuple[Path, ...]:
@@ -388,8 +368,6 @@ def scan_scene(
     camera_poses_cv_xyzw: np.ndarray,
     absolute_threshold_m: float,
     relative_threshold: float,
-    scene_leveling_linear_world: np.ndarray,
-    scene_leveling_pivot_world_xyz_m: np.ndarray,
     scene_translation_world_xyz_m: np.ndarray,
 ) -> SceneScan:
     """Validate all depth frames and collect bounds/topology diagnostics."""
@@ -413,11 +391,6 @@ def scan_scene(
             camera_poses_cv_xyzw[frame_id],
         )
         valid = np.isfinite(points_world).all(axis=-1)
-        points_world[valid] = apply_world_affine_to_points(
-            points_world[valid],
-            linear_world=scene_leveling_linear_world,
-            pivot_world_xyz_m=scene_leveling_pivot_world_xyz_m,
-        )
         points_world[valid] += scene_translation_world_xyz_m
         valid_points = points_world[valid]
         if len(valid_points) == 0:
@@ -538,15 +511,14 @@ def _resolve_d435_calibration(
         )
     content_size = (4 * unit_count, 3 * unit_count)
     uniform_scale = (
-        content_size[0] / BEINGBEYOND_D435_REFERENCE_SIZE[0]
+        content_size[0] / D435_REFERENCE_SIZE[0]
     )
-    render_intrinsic = BEINGBEYOND_D435_INTRINSIC.copy()
+    render_intrinsic = D435_INTRINSIC.copy()
     render_intrinsic[0, :] *= uniform_scale
     render_intrinsic[1, :] *= uniform_scale
     calibration_source = (
-        "active BeingBeyond torso/head CameraCfg ideal pinhole calibration, "
-        f"uniformly scaled from {BEINGBEYOND_D435_REFERENCE_SIZE[0]}x"
-        f"{BEINGBEYOND_D435_REFERENCE_SIZE[1]} into the largest centered "
+        f"uniformly scaled from {D435_REFERENCE_SIZE[0]}x"
+        f"{D435_REFERENCE_SIZE[1]} into the largest centered "
         "4:3 capture contained by prepared source_size"
     )
     return render_intrinsic, content_size, calibration_source
@@ -753,7 +725,7 @@ def _hand_projection_report(
     }
 
 
-def _beingbeyond_capture_camera_report(
+def _capture_camera_report(
     *,
     content_intrinsic: np.ndarray,
     output_intrinsic: np.ndarray,
@@ -774,23 +746,21 @@ def _beingbeyond_capture_camera_report(
     ):
         raise ValueError("camera report intrinsics must be finite 3x3")
     return {
-        "profile": BEINGBEYOND_HEAD_CAMERA_PROFILE,
-        "type": "G1 torso-mounted BeingBeyond ideal pinhole",
-        "parent_urdf_frame": BEINGBEYOND_HEAD_CAMERA_PARENT_FRAME,
+        "parent_urdf_frame": HEAD_CAMERA_PARENT_FRAME,
         "parent_prim": (
             "/World/G1/torso_link (resolved through URDF FK)"
         ),
         "pose_source": (
             "per-frame torso_link URDF forward kinematics from prepared "
             "G1 root and joint trajectory, composed with the active "
-            "BeingBeyond CameraCfg offset"
+            "Head CameraCfg offset"
         ),
         "set_world_pose_camera_axes": "world",
         "offset_position_base_xyz_m": (
-            BEINGBEYOND_HEAD_CAM_OFFSET_POS_BASE.tolist()
+            HEAD_CAM_OFFSET_POS_BASE.tolist()
         ),
         "reset_guard_forward_x_m": (
-            BEINGBEYOND_HEAD_CAM_RESET_GUARD_X_M
+            HEAD_CAM_RESET_GUARD_X_M
         ),
         "reset_guard_applied": True,
         "reset_guard_reason": (
@@ -798,17 +768,17 @@ def _beingbeyond_capture_camera_report(
             "reject threshold, so fallback clamps delta_x to +0.005 m"
         ),
         "offset_position_active_xyz_m": (
-            BEINGBEYOND_HEAD_CAM_OFFSET_POS_ACTIVE.tolist()
+            HEAD_CAM_OFFSET_POS_ACTIVE.tolist()
         ),
         "offset_rotation_world_wxyz": (
-            BEINGBEYOND_HEAD_CAM_OFFSET_ROT_WXYZ.tolist()
+            HEAD_CAM_OFFSET_ROT_WXYZ.tolist()
         ),
-        "native_size": list(BEINGBEYOND_D435_REFERENCE_SIZE),
-        "reference_size": list(BEINGBEYOND_D435_REFERENCE_SIZE),
+        "native_size": list(HEAD_CAMERA_REFERENCE_SIZE),
+        "reference_size": list(D435_REFERENCE_SIZE),
         "content_size": [int(value) for value in content_size],
         "output_size": [int(value) for value in output_size],
         "letterbox": letterbox,
-        "reference_intrinsic": BEINGBEYOND_D435_INTRINSIC.tolist(),
+        "reference_intrinsic": D435_INTRINSIC.tolist(),
         "content_intrinsic": content_intrinsic.tolist(),
         "output_intrinsic_after_letterbox": output_intrinsic.tolist(),
         "intrinsic_scaling": "uniform x/y scale",
@@ -944,40 +914,6 @@ def _commit_articulation_for_render(
             "physics-only commit did not advance after resuming the timeline"
         )
     return step_delta
-
-
-def _resolve_alignment_window(
-    *,
-    source_fps: float,
-    frame_count: int,
-    requested_seconds: float,
-    option_name: str = "--scene-alignment-window-seconds",
-) -> AlignmentWindow:
-    """Convert a time window to source frames, bounded by the sequence."""
-
-    if (
-        not np.isfinite(source_fps)
-        or source_fps <= 0.0
-        or frame_count <= 0
-    ):
-        raise ValueError("source FPS and frame count must be positive")
-    if frame_count < 3:
-        raise ValueError(
-            "Prepared sequence has fewer than three frames for hand alignment"
-        )
-    seconds = float(requested_seconds)
-    if not np.isfinite(seconds) or seconds <= 0.0:
-        raise ValueError(
-            f"{option_name} must be positive and finite"
-        )
-    requested_frames = int(np.floor(seconds * source_fps + 0.5))
-    source = option_name
-    resolved_frames = min(frame_count, max(3, requested_frames))
-    return AlignmentWindow(
-        requested_seconds=seconds,
-        resolved_frames=resolved_frames,
-        source=source,
-    )
 
 
 def _look_at_usd_wxyz(eye: np.ndarray, target: np.ndarray) -> np.ndarray:
@@ -1240,13 +1176,13 @@ def render(args: argparse.Namespace) -> dict[str, object]:
     robot_camera_poses_world_xyzw: np.ndarray | None = None
     robot_camera_poses_cv_xyzw: np.ndarray | None = None
     if args.capture_view == "robot-camera":
-        robot_camera_poses_world_xyzw = beingbeyond_head_camera_poses_world(
+        robot_camera_poses_world_xyzw = head_camera_poses_world(
             urdf_path=scene.g1_urdf,
             joint_names=scene.joint_names,
             joint_positions=scene.joint_positions,
             root_pose_xyzw=scene.root_poses_xyzw,
         )
-        robot_camera_poses_cv_xyzw = beingbeyond_head_camera_poses_cv(
+        robot_camera_poses_cv_xyzw = head_camera_poses_cv(
             urdf_path=scene.g1_urdf,
             joint_names=scene.joint_names,
             joint_positions=scene.joint_positions,
@@ -1277,69 +1213,15 @@ def render(args: argparse.Namespace) -> dict[str, object]:
         "initial-palms": PALM_ALIGNMENT_STAGE,
     }.get(args.scene_alignment)
 
-    scene_leveling_linear_world = np.eye(3, dtype=np.float64)
-    scene_leveling_pivot_world = np.zeros(3, dtype=np.float64)
-    if args.scene_leveling == "support-plane":
-        leveling_window = _resolve_alignment_window(
-            source_fps=scene.fps,
-            frame_count=scene.frame_count,
-            requested_seconds=args.scene_leveling_window_seconds,
-            option_name="--scene-leveling-window-seconds",
-        )
-        leveling = level_scene_camera_poses_from_support_plane(
-            depth_paths=scene.depth_paths,
-            mesh_size=scene.mesh_size,
-            mesh_intrinsic=scene.mesh_intrinsic,
-            camera_pose_cv_xyzw=mesh_camera_poses_cv_xyzw,
-            window_frames=leveling_window.resolved_frames,
-        )
-        scene_leveling_linear_world = leveling.linear_world
-        scene_leveling_pivot_world = leveling.pivot_world_xyz_m
-        scene_leveling_report = leveling.report
-        scene_leveling_report.update(
-            {
-                "pipeline_order": 1,
-                "window_seconds_requested": (
-                    leveling_window.requested_seconds
-                ),
-                "window_frames_resolved": leveling_window.resolved_frames,
-                "window_resolution_source": leveling_window.source,
-                "window_source_fps": scene.fps,
-            }
-        )
-        print(
-            "Initial support-plane scene leveling: "
-            "mode=world-Z-only-affine, "
-            f"input_tilt={scene_leveling_report['correction_degrees']:.3f} "
-            "deg, support_height="
-            f"{scene_leveling_report['support_height_after_m']:.4f} m, "
-            f"temporal_p95="
-            f"{scene_leveling_report['temporal_normal_residual_degrees']['p95']:.3f} "
-            "deg",
-            flush=True,
-        )
-    else:
-        scene_leveling_report = {
-            "schema_version": 2,
-            "method": "disabled",
-            "requested_mode": "none",
-            "status": "disabled",
-            "linear_world": scene_leveling_linear_world.tolist(),
-            "pivot_world_xyz_m": scene_leveling_pivot_world.tolist(),
-            "correction_degrees": 0.0,
-            "fits_yaw": False,
-            "fits_rotation": False,
-            "fits_height_shear": False,
-            "fits_translation": False,
-            "fits_scale": False,
-            "application_count": 0,
-        }
-
     if args.scene_alignment != "none":
         assert scene.source_hdf5 is not None
         assert scene.scene_scale is not None
         assert scene_anchor_description is not None
         assert scene_alignment_stage is not None
+        alignment_window_frames = min(
+            INITIAL_HAND_ALIGNMENT_FRAME_COUNT,
+            scene.frame_count,
+        )
         alignment_kwargs = {
             "source_hdf5": scene.source_hdf5,
             "frame_indices": scene.frame_indices,
@@ -1349,20 +1231,8 @@ def render(args: argparse.Namespace) -> dict[str, object]:
             "joint_names": scene.joint_names,
             "joint_positions": scene.joint_positions,
             "root_pose_xyzw": scene.root_poses_xyzw,
-            "window_frames": min(
-                INITIAL_HAND_ALIGNMENT_FRAME_COUNT,
-                scene.frame_count,
-            ),
-            "scene_world_linear": scene_leveling_linear_world,
-            "scene_world_pivot": scene_leveling_pivot_world,
+            "window_frames": alignment_window_frames,
         }
-        alignment_window = AlignmentWindow(
-            requested_seconds=(
-                INITIAL_HAND_ALIGNMENT_FRAME_COUNT / scene.fps
-            ),
-            resolved_frames=alignment_kwargs["window_frames"],
-            source="fixed first five frames",
-        )
         if args.scene_alignment == "initial-hands":
             alignment = align_scene_camera_poses_to_initial_hand_tcp(
                 **alignment_kwargs,
@@ -1376,43 +1246,20 @@ def render(args: argparse.Namespace) -> dict[str, object]:
         scene_alignment_report.update(
             {
                 "requested_mode": args.scene_alignment,
-                "pipeline_order": (
-                    2 if args.scene_leveling == "support-plane" else 1
+                "pipeline_order": 1,
+                "window_seconds_requested": (
+                    INITIAL_HAND_ALIGNMENT_FRAME_COUNT / scene.fps
                 ),
-                "window_seconds_requested": alignment_window.requested_seconds,
-                "window_frames_resolved": alignment_window.resolved_frames,
-                "window_resolution_source": alignment_window.source,
+                "window_frames_resolved": alignment_window_frames,
+                "window_resolution_source": "fixed first five frames",
                 "window_source_fps": scene.fps,
             }
         )
         scene_translation_world = alignment.translation_world_xyz_m
-        support_height_after_leveling = scene_leveling_report.get(
-            "support_height_after_m"
-        )
-        if support_height_after_leveling is not None:
-            support_height_before_anchor = float(support_height_after_leveling)
-            scene_alignment_report.update(
-                {
-                    "support_height_before_anchor_m": support_height_before_anchor,
-                    "support_height_after_anchor_m": (
-                        support_height_before_anchor
-                        + float(scene_translation_world[2])
-                    ),
-                    "support_height_delta_from_anchor_m": float(
-                        scene_translation_world[2]
-                    ),
-                }
-            )
         print(
-            f"Initial {scene_anchor_description} placement (after leveling): "
+            f"Initial {scene_anchor_description} placement: "
             f"delta_world={scene_translation_world.tolist()} m, "
-            f"frames={scene_alignment_report['paired_frame_count']}"
-            + (
-                ", support_height="
-                f"{scene_alignment_report['support_height_after_anchor_m']:.4f} m"
-                if "support_height_after_anchor_m" in scene_alignment_report
-                else ""
-            ),
+            f"frames={scene_alignment_report['paired_frame_count']}",
             flush=True,
         )
     else:
@@ -1426,23 +1273,12 @@ def render(args: argparse.Namespace) -> dict[str, object]:
         }
 
     scene_operation_order: list[str] = []
-    if args.scene_leveling == "support-plane":
-        scene_operation_order.append(SUPPORT_PLANE_LEVELING_STAGE)
     if scene_alignment_stage is not None:
         scene_operation_order.append(scene_alignment_stage)
     scene_placement_report: dict[str, object] = {
         "schema_version": 2,
-        "method": (
-            "ordered optional support-plane leveling and bilateral "
-            "semantic-anchor XYZ scene placement"
-        ),
+        "method": "optional bilateral semantic-anchor XYZ scene placement",
         "operation_order": scene_operation_order,
-        "leveling_linear_world": (
-            scene_leveling_linear_world.tolist()
-        ),
-        "leveling_pivot_world_xyz_m": (
-            scene_leveling_pivot_world.tolist()
-        ),
         "anchor_translation_world_xyz_m": (
             scene_translation_world.tolist()
         ),
@@ -1451,21 +1287,6 @@ def render(args: argparse.Namespace) -> dict[str, object]:
         ),
         "application_count": len(scene_operation_order),
     }
-    if "support_height_after_m" in scene_leveling_report:
-        support_height_after_leveling = float(
-            scene_leveling_report["support_height_after_m"]
-        )
-        scene_placement_report.update(
-            {
-                "support_height_after_leveling_m": (
-                    support_height_after_leveling
-                ),
-                "support_height_after_anchor_m": (
-                    support_height_after_leveling
-                    + float(scene_translation_world[2])
-                ),
-            }
-        )
 
     (
         render_intrinsic,
@@ -1512,8 +1333,6 @@ def render(args: argparse.Namespace) -> dict[str, object]:
         camera_poses_cv_xyzw=mesh_camera_poses_cv_xyzw,
         absolute_threshold_m=args.depth_edge_absolute,
         relative_threshold=args.depth_edge_relative,
-        scene_leveling_linear_world=scene_leveling_linear_world,
-        scene_leveling_pivot_world_xyz_m=scene_leveling_pivot_world,
         scene_translation_world_xyz_m=scene_translation_world,
     )
     scene_eye, scene_target, eye_source, target_source = (
@@ -1542,7 +1361,7 @@ def render(args: argparse.Namespace) -> dict[str, object]:
     capture_camera_report: dict[str, object]
     if args.capture_view == "robot-camera":
         assert hand_projection_report is not None
-        capture_camera_report = _beingbeyond_capture_camera_report(
+        capture_camera_report = _capture_camera_report(
             content_intrinsic=render_intrinsic,
             output_intrinsic=output_intrinsic,
             content_size=render_size,
@@ -1892,11 +1711,6 @@ def render(args: argparse.Namespace) -> dict[str, object]:
                 mesh_camera_poses_cv_xyzw[frame_id],
             )
             valid = np.isfinite(points_world).all(axis=-1)
-            points_world[valid] = apply_world_affine_to_points(
-                points_world[valid],
-                linear_world=scene_leveling_linear_world,
-                pivot_world_xyz_m=scene_leveling_pivot_world,
-            )
             points_world[valid] += scene_translation_world
             points_world[~valid] = 0.0
             triangles = depth_grid_triangles(
@@ -2229,7 +2043,6 @@ def render(args: argparse.Namespace) -> dict[str, object]:
                 },
                 "capture_camera": capture_camera_report,
                 "articulation_commit": articulation_commit_report(),
-                "scene_leveling": scene_leveling_report,
                 "scene_alignment": scene_alignment_report,
                 "scene_placement": scene_placement_report,
                 "operation_order": scene_operation_order,
@@ -2354,12 +2167,6 @@ def render(args: argparse.Namespace) -> dict[str, object]:
             "mesh_pose_source": (
                 mesh_pose_source
                 + (
-                    " followed by one constant world-Z-only affine "
-                    "support-plane correction applied to world points"
-                    if args.scene_leveling == "support-plane"
-                    else ""
-                )
-                + (
                     " plus one constant world translation using the "
                     f"initial {scene_anchor_description}"
                     if scene_anchor_description is not None
@@ -2367,7 +2174,6 @@ def render(args: argparse.Namespace) -> dict[str, object]:
                 )
             ),
             "camera_axes": "mesh poses are OpenCV world-from-camera",
-            "scene_leveling": scene_leveling_report,
             "scene_alignment": scene_alignment_report,
             "scene_placement": scene_placement_report,
             "operation_order": scene_operation_order,
@@ -2383,12 +2189,6 @@ def render(args: argparse.Namespace) -> dict[str, object]:
                     scan.bounds_max - scene_translation_world
                 ).tolist(),
                 "before_hand_anchor_translation_note": None,
-                "before_support_leveling": (
-                    "not represented by an axis-aligned bound because the "
-                    "inverse affine correction does not preserve AABB extrema"
-                    if args.scene_leveling == "support-plane"
-                    else "same as before_hand_anchor_translation"
-                ),
             },
             "depth_unit": "uint16 millimeters",
             "depth_edge_thresholds": {
@@ -2456,7 +2256,6 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("robot-camera", "scene"),
         default="robot-camera",
         help=(
-            "Batch capture camera: exact per-frame BeingBeyond "
             "torso/head profile (default), or a fixed third-person "
             "diagnostic view. Output size is always the prepared "
             "source_size"
@@ -2483,35 +2282,13 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--scene-leveling",
-        choices=("support-plane", "none"),
-        default="support-plane",
-        help=(
-            "Estimate the dominant gravity-consistent support plane and "
-            "make it horizontal with one constant world-Z-only affine "
-            "height correction that preserves XY and source camera "
-            "orientation; applied before hand-anchor placement, or "
-            "disable it "
-            "(default: support-plane)"
-        ),
-    )
-    parser.add_argument(
-        "--scene-leveling-window-seconds",
-        type=float,
-        default=0.5,
-        help=(
-            "Initial source-time window used to estimate the stable support "
-            "plane; converted with the prepared source FPS (default: 0.5 s)"
-        ),
-    )
-    parser.add_argument(
         "--scene-alignment",
         choices=("initial-hands", "initial-palms", "none"),
         default="initial-palms",
         help=(
             "At replay start, place the complete scene with one "
-            "source/G1 bilateral semantic-anchor XYZ translation after "
-            "optional support-plane leveling: exact fingertip TCPs for "
+            "source/G1 bilateral semantic-anchor XYZ translation: "
+            "exact fingertip TCPs for "
             "initial-hands, tracked Hand palms for initial-palms, or disable it for "
             "legacy data (default: initial-palms)"
         ),

@@ -53,11 +53,6 @@ def parse_args() -> argparse.Namespace:
         help="Hide/show the Isaac window (default: visible).",
     )
     parser.add_argument(
-        "--hardware-encoding",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
-    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Delete this run's existing pipeline output before starting.",

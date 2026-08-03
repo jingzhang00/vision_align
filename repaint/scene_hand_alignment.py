@@ -41,9 +41,6 @@ PALM_ALIGNMENT_METHOD = (
 PALM_ALIGNMENT_STAGE = (
     "tracked-hand-palm-constant-xyz-translation"
 )
-MAXIMUM_SCENE_AFFINE_CONDITION_NUMBER = 10.0
-
-
 @dataclass(frozen=True)
 class SceneHandAlignment:
     """Scene camera poses plus any downstream constant world translation."""
@@ -65,63 +62,12 @@ def _norm_distribution(values: np.ndarray) -> dict[str, float]:
     }
 
 
-def _resolve_scene_affine(
-    *,
-    scene_world_linear: np.ndarray | None,
-    scene_world_pivot: np.ndarray | None,
-) -> tuple[np.ndarray, np.ndarray, float, float]:
-    if (scene_world_linear is None) != (scene_world_pivot is None):
-        raise ValueError(
-            "scene_world_linear and scene_world_pivot must be supplied "
-            "together"
-        )
-    if scene_world_linear is None:
-        linear = np.eye(3, dtype=np.float64)
-        pivot = np.zeros(3, dtype=np.float64)
-    else:
-        linear = np.asarray(scene_world_linear, dtype=np.float64)
-        pivot = np.asarray(scene_world_pivot, dtype=np.float64)
-    if (
-        linear.shape != (3, 3)
-        or pivot.shape != (3,)
-        or not np.isfinite(linear).all()
-        or not np.isfinite(pivot).all()
-    ):
-        raise ValueError("Scene affine and pivot must be finite 3-D values")
-    if (
-        not np.allclose(
-            linear[:2],
-            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
-            atol=1e-10,
-        )
-        or not np.isclose(linear[2, 2], 1.0, atol=1e-10)
-    ):
-        raise ValueError(
-            "scene_world_linear must be a world-Z-only affine correction"
-        )
-    determinant = float(np.linalg.det(linear))
-    condition_number = float(np.linalg.cond(linear))
-    if (
-        determinant <= 1e-8
-        or not np.isclose(determinant, 1.0, atol=1e-10)
-        or not np.isfinite(condition_number)
-        or condition_number > MAXIMUM_SCENE_AFFINE_CONDITION_NUMBER
-    ):
-        raise ValueError(
-            "scene_world_linear must be a well-conditioned, "
-            "orientation-preserving unit-determinant Z-only affine"
-        )
-    return linear, pivot, determinant, condition_number
-
-
 def _anchor_points_to_world(
     *,
     source_anchor_camera_cv: np.ndarray,
     robot_anchor_camera_cv: np.ndarray,
     camera_pose_cv_xyzw: np.ndarray,
     scene_scale: float,
-    scene_world_linear: np.ndarray,
-    scene_world_pivot: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     quaternion_norm = np.linalg.norm(
         camera_pose_cv_xyzw[:, 3:7],
@@ -132,21 +78,13 @@ def _anchor_points_to_world(
     camera_rotation = Rotation.from_quat(
         camera_pose_cv_xyzw[:, 3:7] / quaternion_norm[:, None]
     ).as_matrix()
-    source_world_raw = (
+    source_world = (
         camera_pose_cv_xyzw[:, None, :3]
         + np.einsum(
             "nij,nsj->nsi",
             camera_rotation,
             scene_scale * source_anchor_camera_cv,
         )
-    )
-    source_world = (
-        np.einsum(
-            "ij,nsj->nsi",
-            scene_world_linear,
-            source_world_raw - scene_world_pivot[None, None, :],
-        )
-        + scene_world_pivot[None, None, :]
     )
     robot_world = (
         camera_pose_cv_xyzw[:, None, :3]
@@ -169,8 +107,6 @@ def _estimate_initial_bilateral_midpoint_translation(
     anchor_name: str,
     require_positive_source_depth: bool,
     max_translation_m: float = 0.3,
-    scene_world_linear: np.ndarray | None = None,
-    scene_world_pivot: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict[str, object], np.ndarray]:
     """Fit one median XYZ translation from valid bilateral anchors."""
 
@@ -203,10 +139,6 @@ def _estimate_initial_bilateral_midpoint_translation(
         raise ValueError(
             f"{anchor_name} alignment transforms and thresholds are invalid"
         )
-    linear, pivot, determinant, condition_number = _resolve_scene_affine(
-        scene_world_linear=scene_world_linear,
-        scene_world_pivot=scene_world_pivot,
-    )
     paired_valid = (
         np.isfinite(source).all(axis=(1, 2))
         & np.isfinite(robot).all(axis=(1, 2))
@@ -230,8 +162,6 @@ def _estimate_initial_bilateral_midpoint_translation(
         robot_anchor_camera_cv=robot,
         camera_pose_cv_xyzw=camera_pose,
         scene_scale=scene_scale,
-        scene_world_linear=linear,
-        scene_world_pivot=pivot,
     )
     residual_world = (
         np.mean(robot_world, axis=1)
@@ -275,30 +205,10 @@ def _estimate_initial_bilateral_midpoint_translation(
         "individual_anchor_residual_after_m": _norm_distribution(
             individual_after
         ),
-        "scene_world_affine": {
-            "linear": linear.tolist(),
-            "pivot_world_xyz_m": pivot.tolist(),
-            "is_identity": bool(
-                np.allclose(linear, np.eye(3), atol=1e-12)
-            ),
-            "determinant": determinant,
-            "condition_number": condition_number,
-            "maximum_condition_number": (
-                MAXIMUM_SCENE_AFFINE_CONDITION_NUMBER
-            ),
-            "application_order": (
-                "source camera -> raw scene world -> scene affine -> "
-                f"{anchor_name} translation"
-            ),
-        },
         "fits_rotation": False,
         "fits_scale": False,
-        "fits_linear_leveling": False,
         "application_count": 1,
-        "applied_to": (
-            "one downstream scene-world translation after the supplied "
-            "scene affine"
-        ),
+        "applied_to": "one downstream scene-world translation",
     }
     return translation_world, report, paired_valid
 
@@ -312,10 +222,8 @@ def estimate_initial_hand_tcp_midpoint_translation(
     scene_scale: float,
     confidence_threshold: float = 0.5,
     max_translation_m: float = 0.3,
-    scene_world_linear: np.ndarray | None = None,
-    scene_world_pivot: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict[str, object]]:
-    """Fit one XYZ translation from the exact retarget TCP after leveling."""
+    """Fit one XYZ translation from the exact retarget TCP."""
 
     source = np.asarray(source_hand_tcp_camera_cv, dtype=np.float64)
     confidence = np.asarray(source_hand_tcp_confidence, dtype=np.float64)
@@ -339,8 +247,6 @@ def estimate_initial_hand_tcp_midpoint_translation(
             anchor_name="hand-TCP",
             require_positive_source_depth=True,
             max_translation_m=max_translation_m,
-            scene_world_linear=scene_world_linear,
-            scene_world_pivot=scene_world_pivot,
         )
     )
     valid_confidence = confidence[paired_valid]
@@ -353,7 +259,7 @@ def estimate_initial_hand_tcp_midpoint_translation(
             ),
             "formula": (
                 "delta_world = median(G1_TCP_midpoint_world - "
-                "affine(source_TCP_midpoint_scene_world))"
+                "source_TCP_midpoint_scene_world)"
             ),
             "anchor_semantics": {
                 "source_and_robot_tcp_position": (
@@ -371,8 +277,8 @@ def estimate_initial_hand_tcp_midpoint_translation(
                 "uses_ring_or_little_fingertips": False,
             },
             "height_policy": (
-                "world Z is estimated from the same 3-D TCP residual after "
-                "leveling; no fixed scene or table height is used"
+                "world Z is estimated from the same 3-D TCP residual; "
+                "no fixed scene or table height is used"
             ),
             "confidence_threshold": float(confidence_threshold),
             "bilateral_tcp_confidence": {
@@ -398,8 +304,6 @@ def estimate_initial_palm_midpoint_translation(
     scene_scale: float,
     source_hand_target_mode: str = RIGID_PALM_TARGET,
     max_translation_m: float = 0.3,
-    scene_world_linear: np.ndarray | None = None,
-    scene_world_pivot: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict[str, object]]:
     """Fit one XYZ translation between tracked-Hand and G1 palm anchors."""
 
@@ -436,8 +340,6 @@ def estimate_initial_palm_midpoint_translation(
             anchor_name="palm",
             require_positive_source_depth=True,
             max_translation_m=max_translation_m,
-            scene_world_linear=scene_world_linear,
-            scene_world_pivot=scene_world_pivot,
         )
     )
     report.update(
@@ -449,7 +351,7 @@ def estimate_initial_palm_midpoint_translation(
             ),
             "formula": (
                 "delta_world = median(G1_palm_midpoint_world - "
-                "affine(source_palm_midpoint_scene_world))"
+                "source_palm_midpoint_scene_world)"
             ),
             "anchor_semantics": {
                 "source_transform_origins": [
@@ -514,10 +416,8 @@ def align_scene_camera_poses_to_initial_hand_tcp(
     window_frames: int,
     confidence_threshold: float = 0.5,
     max_translation_m: float = 0.3,
-    scene_world_linear: np.ndarray | None = None,
-    scene_world_pivot: np.ndarray | None = None,
 ) -> SceneHandAlignment:
-    """Place a leveled scene from the exact bilateral retarget TCP midpoint."""
+    """Place a scene from the exact bilateral retarget TCP midpoint."""
 
     if window_frames <= 0:
         raise ValueError("window_frames must be positive")
@@ -547,8 +447,6 @@ def align_scene_camera_poses_to_initial_hand_tcp(
         scene_scale=scene_scale,
         confidence_threshold=confidence_threshold,
         max_translation_m=max_translation_m,
-        scene_world_linear=scene_world_linear,
-        scene_world_pivot=scene_world_pivot,
     )
 
     confidence_keys = tuple(
@@ -593,10 +491,7 @@ def align_scene_camera_poses_to_initial_hand_tcp(
                     "midpoint"
                 ),
             },
-            "camera_pose_output_semantics": (
-                "translation-only compatibility view; the supplied "
-                "scene_world_linear is not encoded in rigid poses"
-            ),
+            "camera_pose_output_semantics": "translation-only scene placement",
         }
     )
     aligned_pose = camera_pose.copy()
@@ -620,8 +515,6 @@ def align_scene_camera_poses_to_initial_palms(
     root_pose_xyzw: np.ndarray,
     window_frames: int,
     max_translation_m: float = 0.3,
-    scene_world_linear: np.ndarray | None = None,
-    scene_world_pivot: np.ndarray | None = None,
 ) -> SceneHandAlignment:
     """Place a scene from matching tracked-Hand/G1 palm anchors."""
 
@@ -668,8 +561,6 @@ def align_scene_camera_poses_to_initial_palms(
         scene_scale=scene_scale,
         source_hand_target_mode=target_mode,
         max_translation_m=max_translation_m,
-        scene_world_linear=scene_world_linear,
-        scene_world_pivot=scene_world_pivot,
     )
     report.update(
         {
@@ -692,10 +583,7 @@ def align_scene_camera_poses_to_initial_palms(
                     "equal bilateral tracked-palm midpoint"
                 ),
             },
-            "camera_pose_output_semantics": (
-                "translation-only compatibility view; the supplied "
-                "scene_world_linear is not encoded in rigid poses"
-            ),
+            "camera_pose_output_semantics": "translation-only scene placement",
         }
     )
     aligned_pose = camera_pose.copy()

@@ -56,7 +56,11 @@ from repaint.g1_hand import (  # noqa: E402
     build_pinocchio_g1,
     retarget_o6_hands,
 )
-from repaint.vda_pipeline_common import natural_key  # noqa: E402
+from repaint.vda_pipeline_common import (  # noqa: E402
+    natural_key,
+    remove_exact,
+    write_json_atomic,
+)
 
 
 VIDEO_KEY = "observation.images.ego"
@@ -1813,21 +1817,6 @@ def _flatten_episode_stats(
             row[f"stats/{feature}/{stat_name}"] = feature_stats[stat_name]
 
 
-def _write_json(path: Path, payload: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(payload, indent=4, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-
-
-def _remove_path(path: Path) -> None:
-    if path.is_symlink() or path.is_file():
-        path.unlink()
-    elif path.exists():
-        shutil.rmtree(path)
-
-
 def _commit_output(temporary_root: Path, output_root: Path) -> None:
     """Atomically replace output_root, restoring it if the swap fails."""
     backup_root: Path | None = None
@@ -1845,7 +1834,7 @@ def _commit_output(temporary_root: Path, output_root: Path) -> None:
         raise
     else:
         if backup_root is not None:
-            _remove_path(backup_root)
+            remove_exact(backup_root)
 
 
 def write_lerobot_v3(
@@ -1993,12 +1982,12 @@ def write_lerobot_v3(
             "video_path": VIDEO_PATH_TEMPLATE,
             "features": features,
         }
-        _write_json(temporary_root / "meta/info.json", info)
-        _write_json(
+        write_json_atomic(temporary_root / "meta/info.json", info)
+        write_json_atomic(
             temporary_root / "meta/stats.json",
             aggregate_stats(all_episode_stats),
         )
-        _write_json(
+        write_json_atomic(
             temporary_root / "meta/egodex.json",
             {
                 "schema_version": 6,

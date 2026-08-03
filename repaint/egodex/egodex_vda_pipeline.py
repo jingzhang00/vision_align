@@ -27,7 +27,6 @@ WORKSPACE_ROOT = SCRIPT_PATH.parents[2]
 if str(WORKSPACE_ROOT) not in sys.path:
     sys.path.insert(0, str(WORKSPACE_ROOT))
 
-from repaint.robot_camera import BEINGBEYOND_HEAD_CAMERA_PROFILE  # noqa: E402
 from repaint.lighting_profile import load_lighting_profile  # noqa: E402
 from repaint.scene_hand_alignment import (  # noqa: E402
     PALM_ALIGNMENT_METHOD,
@@ -55,8 +54,8 @@ DEFAULT_TASKS = (
 )
 VIDEO_KEY = "observation.images.ego"
 LEROBOT_CHUNKS_SIZE = 1000
-BEINGBEYOND_REFERENCE_SIZE = (640, 480)
-BEINGBEYOND_RESET_GUARD_X_M = 0.005
+REFERENCE_SIZE = (640, 480)
+RESET_GUARD_X_M = 0.005
 SCENE_GEOMETRY_OPERATION_ORDER = (
     PALM_ALIGNMENT_STAGE,
 )
@@ -292,8 +291,6 @@ def build_task_plan(task: str, config: PipelineConfig) -> TaskPlan:
             "robot-camera",
             "--scene-alignment",
             "initial-palms",
-            "--scene-leveling",
-            "none",
             "--headless" if config.headless else "--no-headless",
         ]
         stages.append(
@@ -607,9 +604,6 @@ def _validate_render(stage: Stage, plan: TaskPlan) -> None:
     if abs(float(report.get("fps", -1.0)) - source.video.fps) > 0.01:
         raise ValueError("Final Isaac report FPS differs from source")
 
-    # The active BeingBeyond camera is natively 4:3. Preserve that aspect
-    # ratio, then center-letterbox it into the source-sized output instead of
-    # independently scaling K along x/y.
     unit_count = min(output_size[0] // 4, output_size[1] // 3)
     if unit_count <= 0:
         raise ValueError("Source video is too small for a 4:3 camera capture")
@@ -639,12 +633,8 @@ def _validate_render(stage: Stage, plan: TaskPlan) -> None:
     capture_camera = report.get("capture_camera")
     if not isinstance(capture_camera, dict):
         raise ValueError("Final Isaac report has no capture_camera metadata")
-    if capture_camera.get("profile") != BEINGBEYOND_HEAD_CAMERA_PROFILE:
-        raise ValueError(
-            "Final Isaac report does not use the exact BeingBeyond profile"
-        )
     if tuple(capture_camera.get("reference_size", ())) != (
-        BEINGBEYOND_REFERENCE_SIZE
+        REFERENCE_SIZE
     ):
         raise ValueError("Final Isaac report has the wrong camera reference size")
     if tuple(capture_camera.get("content_size", ())) != content_size:
@@ -652,15 +642,15 @@ def _validate_render(stage: Stage, plan: TaskPlan) -> None:
     if tuple(capture_camera.get("output_size", ())) != output_size:
         raise ValueError("Final Isaac camera output_size differs from source")
     if not bool(capture_camera.get("reset_guard_applied")):
-        raise ValueError("BeingBeyond 5 mm reset guard was not applied")
+        raise ValueError("5 mm reset guard was not applied")
     if (
         abs(
             float(capture_camera.get("reset_guard_forward_x_m", -1.0))
-            - BEINGBEYOND_RESET_GUARD_X_M
+            - RESET_GUARD_X_M
         )
         > 1e-9
     ):
-        raise ValueError("BeingBeyond reset guard distance is incorrect")
+        raise ValueError("reset guard distance is incorrect")
     hand_projection = capture_camera.get("hand_projection")
     if not isinstance(hand_projection, dict):
         raise ValueError("Final Isaac report has no hand projection diagnostic")
@@ -700,9 +690,6 @@ def _validate_render(stage: Stage, plan: TaskPlan) -> None:
             "Isaac physics step did not advance before every rendered frame"
         )
 
-    scene_leveling = report.get("scene_leveling")
-    if not isinstance(scene_leveling, dict):
-        raise ValueError("Final Isaac report has no scene-leveling audit")
     if tuple(report.get("operation_order", ())) != (
         SCENE_GEOMETRY_OPERATION_ORDER
     ):
@@ -710,40 +697,6 @@ def _validate_render(stage: Stage, plan: TaskPlan) -> None:
             "Final Isaac scene operation_order must contain only "
             "tracked-Hand palm placement"
         )
-    if (
-        scene_leveling.get("method") != "disabled"
-        or scene_leveling.get("requested_mode") != "none"
-        or scene_leveling.get("status") != "disabled"
-        or int(scene_leveling.get("application_count", -1)) != 0
-    ):
-        raise ValueError("Final Isaac scene leveling must be disabled")
-
-    leveling_linear = scene_leveling.get("linear_world")
-    try:
-        linear = tuple(
-            tuple(float(value) for value in row)
-            for row in leveling_linear
-        )
-    except (TypeError, ValueError):
-        linear = ()
-    if (
-        len(linear) != 3
-        or any(len(row) != 3 for row in linear)
-        or not all(math.isfinite(value) for row in linear for value in row)
-    ):
-        raise ValueError("Scene-leveling linear_world is not a finite 3x3 matrix")
-    identity = (
-        (1.0, 0.0, 0.0),
-        (0.0, 1.0, 0.0),
-        (0.0, 0.0, 1.0),
-    )
-    if any(
-        abs(linear[row][column] - identity[row][column]) > 1e-9
-        for row in range(3)
-        for column in range(3)
-    ):
-        raise ValueError("Disabled scene leveling must use the identity affine")
-
     scene_alignment = report.get("scene_alignment")
     if not isinstance(scene_alignment, dict):
         raise ValueError("Final Isaac report has no scene-alignment audit")
@@ -760,7 +713,6 @@ def _validate_render(stage: Stage, plan: TaskPlan) -> None:
     if (
         scene_alignment.get("fits_rotation") is not False
         or scene_alignment.get("fits_scale") is not False
-        or scene_alignment.get("fits_linear_leveling") is not False
     ):
         raise ValueError(
             "Tracked-palm scene alignment must fit only a translation"
@@ -821,59 +773,6 @@ def _validate_render(stage: Stage, plan: TaskPlan) -> None:
         raise ValueError(
             "Scene alignment height policy must use the same 3-D palm "
             "residual with no fixed scene height"
-        )
-
-    alignment_affine = scene_alignment.get("scene_world_affine")
-    if not isinstance(alignment_affine, dict):
-        raise ValueError(
-            "Scene alignment does not record its preceding scene affine"
-        )
-    try:
-        alignment_linear = tuple(
-            tuple(float(value) for value in row)
-            for row in alignment_affine.get("linear", ())
-        )
-    except (TypeError, ValueError):
-        alignment_linear = ()
-    if (
-        len(alignment_linear) != 3
-        or any(len(row) != 3 for row in alignment_linear)
-        or any(
-            abs(alignment_linear[row][column] - linear[row][column]) > 1e-9
-            for row in range(3)
-            for column in range(3)
-        )
-    ):
-        raise ValueError(
-            "Scene alignment did not use the identity scene affine"
-        )
-    leveling_pivot = scene_leveling.get("pivot_world_xyz_m")
-    alignment_pivot = alignment_affine.get("pivot_world_xyz_m")
-    try:
-        leveling_pivot_xyz = tuple(float(value) for value in leveling_pivot)
-        alignment_pivot_xyz = tuple(float(value) for value in alignment_pivot)
-    except (TypeError, ValueError):
-        leveling_pivot_xyz = ()
-        alignment_pivot_xyz = ()
-    if (
-        len(leveling_pivot_xyz) != 3
-        or len(alignment_pivot_xyz) != 3
-        or not all(math.isfinite(value) for value in leveling_pivot_xyz)
-        or not all(math.isfinite(value) for value in alignment_pivot_xyz)
-        or any(
-            abs(alignment_pivot_xyz[axis] - leveling_pivot_xyz[axis]) > 1e-9
-            for axis in range(3)
-        )
-    ):
-        raise ValueError(
-            "Scene alignment did not use the disabled-leveling pivot"
-        )
-    if alignment_affine.get("application_order") != (
-        "source camera -> raw scene world -> scene affine -> "
-        "palm translation"
-    ):
-        raise ValueError(
-            "Scene alignment affine application order is not explicit"
         )
 
     scene_placement = report.get("scene_placement")
@@ -1077,7 +976,6 @@ def _new_report(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
             "frame_count": "inherited from source; never task-hardcoded",
             "source_resolution": "inherited from source MP4",
             "final_resolution": "prepared source_size, verified against source",
-            "robot_camera_profile": BEINGBEYOND_HEAD_CAMERA_PROFILE,
             "robot_camera_geometry": (
                 "fixed 640x480 4:3 intrinsic uniformly scaled and centered "
                 "letterboxed into the source-sized output"

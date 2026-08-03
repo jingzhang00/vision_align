@@ -110,7 +110,6 @@ class NymeriaHumanTrajectory:
     task: str
     participant_height_m: float
     video_fps: float
-    video_size: tuple[int, int]
     full_frame_count: int
     motion_fps: float
     motion_sample_count: int
@@ -192,7 +191,6 @@ def load_nymeria_human_trajectory(
         task=metadata.action_text,
         participant_height_m=load_participant_height_m(clip),
         video_fps=video.fps,
-        video_size=(video.width, video.height),
         full_frame_count=video.frame_count,
         motion_fps=metadata.fps,
         motion_sample_count=metadata.sample_count,

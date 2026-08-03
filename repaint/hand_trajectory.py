@@ -70,20 +70,8 @@ class ArticulatedHandTrajectory:
     confidence: np.ndarray
 
     @property
-    def points_reference_camera(self) -> np.ndarray:
-        return self.transforms_reference_camera[..., :3, 3]
-
-    @property
-    def rotations_reference_camera(self) -> np.ndarray:
-        return self.transforms_reference_camera[..., :3, :3]
-
-    @property
     def points_palm(self) -> np.ndarray:
         return self.transforms_palm[..., :3, 3]
-
-    @property
-    def rotations_palm(self) -> np.ndarray:
-        return self.transforms_palm[..., :3, :3]
 
     @property
     def frame_count(self) -> int:

@@ -54,9 +54,6 @@ with redirect_stdout(StringIO()):
         ROBOT_FORMAT,
         load_source_episode,
     )
-from repaint.robot_camera import (  # noqa: E402
-    BEINGBEYOND_HEAD_CAMERA_PROFILE,
-)
 from repaint.vda_depth import (  # noqa: E402
     DEFAULT_CHECKPOINT,
     DEFAULT_VDA_METRIC_SCALE,
@@ -135,7 +132,6 @@ class PipelineConfig:
     resume: bool
     overwrite: bool
     headless: bool
-    hardware_encoding: bool
     scene_scale: float | None
     vda_checkpoint: Path | None
     stop_after: str
@@ -659,8 +655,6 @@ def build_plan(
                         "--capture-view",
                         "robot-camera",
                         "--scene-alignment",
-                        "none",
-                        "--scene-leveling",
                         "none",
                         (
                             "--headless"
@@ -1335,10 +1329,8 @@ def _validate_render(
     ):
         raise ValueError("Final Isaac lighting profile was not applied")
     capture_camera = report.get("capture_camera")
-    if not isinstance(capture_camera, dict) or (
-        capture_camera.get("profile") != BEINGBEYOND_HEAD_CAMERA_PROFILE
-    ):
-        raise ValueError("Final render does not use the BeingBeyond camera")
+    if not isinstance(capture_camera, dict):
+        raise ValueError("Final render has no capture-camera audit")
     articulation = report.get("articulation_commit")
     if not isinstance(articulation, dict) or not bool(
         articulation.get("strict_validation_passed")
@@ -1399,14 +1391,6 @@ def _validate_render(
     operation_order = report.get("operation_order")
     if operation_order != []:
         raise ValueError("Nymeria scene-placement order is invalid")
-    leveling = report.get("scene_leveling")
-    if (
-        not isinstance(leveling, dict)
-        or leveling.get("status") != "disabled"
-        or leveling.get("requested_mode") != "none"
-        or int(leveling.get("application_count", -1)) != 0
-    ):
-        raise ValueError("Nymeria final render must disable scene leveling")
 
 
 def validate_stage(stage: Stage, plan: PipelinePlan) -> tuple[bool, str]:
@@ -1597,7 +1581,7 @@ def _new_report(plan: PipelinePlan) -> dict[str, Any]:
             "visuals are hidden"
         ),
         "scene_alignment_policy": (
-            "support-plane leveling and scene alignment disabled; each "
+            "scene alignment disabled; each "
             "RGB-D frame uses a virtual source camera rigidly following the "
             "exact G1 FK capture camera through one fixed initial extrinsic"
         ),
@@ -2598,11 +2582,6 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
-    parser.add_argument(
-        "--hardware-encoding",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
     return parser
 
 
@@ -2638,7 +2617,6 @@ def _config_from_args(args: argparse.Namespace) -> PipelineConfig:
         resume=True,
         overwrite=False,
         headless=bool(args.headless),
-        hardware_encoding=bool(args.hardware_encoding),
         scene_scale=None,
         vda_checkpoint=None,
         stop_after="render",

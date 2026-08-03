@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 import json
 import math
 import os
@@ -64,7 +63,6 @@ def load_lighting_profile(path: Path | None) -> dict[str, Any] | None:
         if not isinstance(profile.get(section), dict):
             raise ValueError(f"Lighting profile has no '{section}' section: {path}")
     return profile
-
 
 def _srgb_to_linear(rgb: np.ndarray) -> np.ndarray:
     return np.where(
@@ -578,39 +576,3 @@ def estimate_lighting_profile(
             raise RuntimeError("validated output_path unexpectedly missing")
         _write_profile(output_path, profile)
     return profile
-
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Estimate one fixed render-lighting profile from ProPainter video"
-    )
-    parser.add_argument("--inpaint-video", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument(
-        "--reliability-mask-root",
-        type=Path,
-        help="SAM arm masks to exclude ProPainter-generated pixels",
-    )
-    parser.add_argument("--sample-count", type=int, default=16)
-    parser.add_argument("--max-dimension", type=int, default=384)
-    return parser
-
-
-def main() -> None:
-    args = build_parser().parse_args()
-    profile = estimate_lighting_profile(
-        inpaint_video=args.inpaint_video.resolve(),
-        output_path=args.output.resolve(),
-        reliability_mask_root=(
-            args.reliability_mask_root.resolve()
-            if args.reliability_mask_root is not None
-            else None
-        ),
-        sample_count=args.sample_count,
-        max_dimension=args.max_dimension,
-    )
-    print(json.dumps(profile, indent=2))
-
-
-if __name__ == "__main__":
-    main()

@@ -56,7 +56,11 @@ from repaint.nymeria.nymeria_adapter import (  # noqa: E402
     resample_motion_to_video,
 )
 from repaint.robot_camera import (  # noqa: E402
-    beingbeyond_head_camera_poses_cv,
+    head_camera_poses_cv,
+)
+from repaint.vda_pipeline_common import (  # noqa: E402
+    remove_exact,
+    write_json_atomic,
 )
 
 
@@ -137,11 +141,8 @@ def _decode_hdf5_text(value: object) -> str:
 
 
 def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
     with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+        return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
 def _validate_transform_sequence(
@@ -681,7 +682,7 @@ def retarget_source_episode(
                 ]
             )
         )
-        robot_camera_pose = beingbeyond_head_camera_poses_cv(
+        robot_camera_pose = head_camera_poses_cv(
             urdf_path=G1_URDF,
             joint_names=tuple(joint_names),
             joint_positions=state,
@@ -733,21 +734,6 @@ def retarget_source_episode(
     )
 
 
-def _write_json(path: Path, payload: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-
-
-def _remove_path(path: Path) -> None:
-    if path.is_symlink() or path.is_file():
-        path.unlink()
-    elif path.exists():
-        shutil.rmtree(path)
-
-
 def _commit_output(temporary: Path, output: Path) -> None:
     backup: Path | None = None
     if output.exists() or output.is_symlink():
@@ -763,7 +749,7 @@ def _commit_output(temporary: Path, output: Path) -> None:
         raise
     else:
         if backup is not None:
-            _remove_path(backup)
+            remove_exact(backup)
 
 
 def write_robot_trajectories(
@@ -875,7 +861,7 @@ def write_robot_trajectories(
                 }
             )
 
-        _write_json(
+        write_json_atomic(
             temporary / "manifest.json",
             {
                 "schema_version": 1,

@@ -1,5 +1,3 @@
-"""Exact BeingBeyond G1 head-camera and source/G1 hand-anchor helpers."""
-
 from __future__ import annotations
 
 from pathlib import Path
@@ -9,10 +7,7 @@ import numpy as np
 import pinocchio as pin
 from scipy.spatial.transform import Rotation
 
-from repaint.g1_hand import (
-    HAND_TIP_LOCAL_OFFSETS,
-    build_pinocchio_g1,
-)
+from repaint.g1_hand import build_pinocchio_g1
 
 
 # ROS camera links use X forward, Y left, Z up. OpenCV optical frames use
@@ -27,60 +22,24 @@ CAMERA_LINK_FROM_CV_OPTICAL = np.asarray(
     dtype=np.float64,
 )
 
-# Exact active head-camera profile in BeingBeyond's
-# ``G1_with_hand_head_CylinderEnv.py``.  The CameraCfg is parented to
-# ``torso_link`` because the fixed d435 link is merged during URDF import.
-# Its zero-noise reset still triggers the occlusion reject guard, which moves
-# the camera forward by exactly 5 mm before ``set_world_poses(...,
-# convention="world")`` is called.
-BEINGBEYOND_HEAD_CAMERA_PROFILE = (
-    "beingbeyond_torso_head_camera_exact_v1"
-)
-BEINGBEYOND_HEAD_CAMERA_PARENT_FRAME = "torso_link"
-BEINGBEYOND_HEAD_CAM_OFFSET_POS_BASE = np.asarray(
+HEAD_CAMERA_PARENT_FRAME = "torso_link"
+HEAD_CAM_OFFSET_POS_BASE = np.asarray(
     [0.0576235, 0.01753, 0.42987],
     dtype=np.float64,
 )
-BEINGBEYOND_HEAD_CAM_OFFSET_ROT_WXYZ = np.asarray(
+HEAD_CAM_OFFSET_ROT_WXYZ = np.asarray(
     [0.91495966, 0.0, 0.4035453, 0.0],
     dtype=np.float64,
 )
-BEINGBEYOND_HEAD_CAM_RESET_GUARD_X_M = 0.005
-BEINGBEYOND_HEAD_CAM_OFFSET_POS_ACTIVE = (
-    BEINGBEYOND_HEAD_CAM_OFFSET_POS_BASE
+HEAD_CAM_RESET_GUARD_X_M = 0.005
+HEAD_CAM_OFFSET_POS_ACTIVE = (
+    HEAD_CAM_OFFSET_POS_BASE
     + np.asarray(
-        [BEINGBEYOND_HEAD_CAM_RESET_GUARD_X_M, 0.0, 0.0],
+        [HEAD_CAM_RESET_GUARD_X_M, 0.0, 0.0],
         dtype=np.float64,
     )
 )
 
-# Exact semantic TCP used by the canonical EgoDex-to-G1 retargeter:
-# 0.5*thumb + 0.35*index + 0.15*middle.  Source confidence uses the same
-# contribution weights, so a low-confidence middle tip does not veto a TCP
-# whose position is dominated by reliable thumb/index observations.
-HAND_TCP_DIGITS = ("thumb", "index", "middle")
-HAND_TCP_POSITION_WEIGHTS = np.asarray(
-    [0.5, 0.35, 0.15],
-    dtype=np.float64,
-)
-SOURCE_HAND_TCP_TRANSFORMS = tuple(
-    f"{side}{source_digit}Tip"
-    for side in ("left", "right")
-    for source_digit in ("Thumb", "IndexFinger", "MiddleFinger")
-)
-ROBOT_HAND_TCP_FRAMES = tuple(
-    f"{side}_{digit}_distal"
-    for side in ("left", "right")
-    for digit in HAND_TCP_DIGITS
-)
-ROBOT_HAND_TCP_OFFSETS_LOCAL_M = np.asarray(
-    [
-        HAND_TIP_LOCAL_OFFSETS[digit]
-        for _side in ("left", "right")
-        for digit in HAND_TCP_DIGITS
-    ],
-    dtype=np.float64,
-)
 SOURCE_PALM_TRANSFORMS = ("leftHand", "rightHand")
 ROBOT_WRIST_FRAMES = ("left_wrist_yaw_link", "right_wrist_yaw_link")
 ROBOT_PALM_FRAMES = ("left_palm", "right_palm")
@@ -114,15 +73,14 @@ def _continuous_xyzw(quaternions: np.ndarray) -> np.ndarray:
     return continuous
 
 
-def beingbeyond_head_camera_poses_world(
+def head_camera_poses_world(
     *,
     urdf_path: Path,
     joint_names: tuple[str, ...],
     joint_positions: np.ndarray,
     root_pose_xyzw: np.ndarray,
 ) -> np.ndarray:
-    """Return exact BeingBeyond head-camera poses in Isaac world axes.
-
+    """
     The returned XYZ + XYZW pose describes the camera's ``world`` convention:
     local +X points forward and local +Z points up.  It is therefore suitable
     for ``Camera.set_world_pose(..., camera_axes="world")`` without another
@@ -159,19 +117,19 @@ def beingbeyond_head_camera_poses_world(
             f"{joint_positions.shape[1]}"
         )
     parent_frame_id = model.getFrameId(
-        BEINGBEYOND_HEAD_CAMERA_PARENT_FRAME
+        HEAD_CAMERA_PARENT_FRAME
     )
     if parent_frame_id >= model.nframes:
         raise KeyError(
             "G1 URDF has no frame named "
-            f"{BEINGBEYOND_HEAD_CAMERA_PARENT_FRAME!r}"
+            f"{HEAD_CAMERA_PARENT_FRAME!r}"
         )
 
     root_rotations = Rotation.from_quat(
         root_pose_xyzw[:, 3:7] / quaternion_norm[:, None]
     ).as_matrix()
     camera_from_parent_rotation = Rotation.from_quat(
-        BEINGBEYOND_HEAD_CAM_OFFSET_ROT_WXYZ[[1, 2, 3, 0]]
+        HEAD_CAM_OFFSET_ROT_WXYZ[[1, 2, 3, 0]]
     ).as_matrix()
     poses = np.empty((frame_count, 7), dtype=np.float64)
     data = model.createData()
@@ -194,7 +152,7 @@ def beingbeyond_head_camera_poses_world(
         poses[frame_id, :3] = (
             world_from_parent_translation
             + world_from_parent_rotation
-            @ BEINGBEYOND_HEAD_CAM_OFFSET_POS_ACTIVE
+            @ HEAD_CAM_OFFSET_POS_ACTIVE
         )
         poses[frame_id, 3:7] = Rotation.from_matrix(
             world_from_camera_rotation
@@ -203,7 +161,7 @@ def beingbeyond_head_camera_poses_world(
     return poses
 
 
-def beingbeyond_head_camera_poses_cv(
+def head_camera_poses_cv(
     *,
     urdf_path: Path,
     joint_names: tuple[str, ...],
@@ -216,7 +174,7 @@ def beingbeyond_head_camera_poses_cv(
     diagnostics only.  Isaac rendering uses the world-axis poses directly.
     """
 
-    world_poses = beingbeyond_head_camera_poses_world(
+    world_poses = head_camera_poses_world(
         urdf_path=urdf_path,
         joint_names=joint_names,
         joint_positions=joint_positions,

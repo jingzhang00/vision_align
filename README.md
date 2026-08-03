@@ -83,7 +83,6 @@ To inspect a prepared episode in isaacsim:
   --interactive \
   --loop \
   --no-headless \
-  --scene-leveling none \
   --scene-alignment none
 ```
 
