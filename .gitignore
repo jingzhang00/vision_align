@@ -18,5 +18,7 @@ nymeria_scripts
 tests/
 /nymeria/vda/
 /egodex_single_task/
-debug/
-/nymeria/david_*
+/debug/
+/egodex/
+/egodex_debug/
+/nymeria/

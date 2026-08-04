@@ -79,25 +79,13 @@ def _one_episode_row(
     return matching[0]
 
 
-def _one_source_episode(
+def _one_egodex_source_episode(
     dataset_root: Path,
     episode_index: int,
-) -> tuple[str, dict[str, Any]]:
-    candidates = (
-        ("egodex", dataset_root / "meta/egodex.json"),
-        ("nymeria", dataset_root / "meta/nymeria.json"),
-    )
-    available = [
-        (dataset_kind, path)
-        for dataset_kind, path in candidates
-        if path.is_file()
-    ]
-    if len(available) != 1:
-        raise ValueError(
-            "Expected exactly one source manifest (meta/egodex.json or "
-            f"meta/nymeria.json), found {[str(path) for _, path in available]}"
-        )
-    dataset_kind, manifest_path = available[0]
+) -> dict[str, Any]:
+    manifest_path = dataset_root / "meta/egodex.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(manifest_path)
     metadata = _read_json(manifest_path)
     matching = [
         episode
@@ -106,16 +94,9 @@ def _one_source_episode(
     ]
     if len(matching) != 1:
         raise ValueError(
-            f"{dataset_kind} episode {episode_index} was found "
-            f"{len(matching)} times"
+            f"EgoDex episode {episode_index} was found {len(matching)} times"
         )
-    if dataset_kind == "nymeria":
-        gate = metadata.get("camera_alignment_quality_gate", {})
-        if not isinstance(gate, dict) or gate.get("status") != "passed":
-            raise ValueError(
-                "Nymeria camera alignment quality gate has not passed"
-            )
-    return dataset_kind, matching[0]
+    return matching[0]
 
 
 def _video_metadata(path: Path) -> tuple[int, int, int, float]:
@@ -259,6 +240,9 @@ def _load_nymeria_robot_episode(
     recorded_scene_scale = float(
         alignment["source_to_robot_camera_translation_scale"]
     )
+    mapping_mode = str(alignment.get("mapping_mode", ""))
+    if mapping_mode != "shared_global_similarity_with_hip_root_anchor":
+        raise ValueError(f"Unsupported Nymeria camera mapping: {mapping_mode}")
     resolved_scene_scale = _resolve_scene_scale(
         recorded_scene_scale=recorded_scene_scale,
         override=scene_scale,
@@ -274,6 +258,13 @@ def _load_nymeria_robot_episode(
         or source_to_robot_translation.shape != (3,)
     ):
         raise ValueError("Nymeria source-to-robot transform is invalid")
+    if scene_scale is not None and not np.isclose(
+        resolved_scene_scale, recorded_scene_scale
+    ):
+        raise ValueError(
+            "Nymeria shared-global scale cannot be overridden without "
+            "reretargeting the G1 root"
+        )
 
     trajectory_path = (dataset_root / str(episode["trajectory_path"])).resolve()
     if (
@@ -331,13 +322,6 @@ def _load_nymeria_robot_episode(
         or not np.allclose(source_intrinsic, intrinsic, atol=1e-5)
     ):
         raise ValueError("Nymeria camera adapter and trajectory disagree")
-    if scene_scale is not None:
-        source_to_robot_translation = (
-            recorded_camera_pose[0, :3]
-            - resolved_scene_scale
-            * source_to_robot_rotation
-            @ source_camera_to_world[0, :3, 3]
-        )
     mapped_camera_pose = _mapped_nymeria_camera_poses(
         source_camera_to_world=source_camera_to_world,
         source_to_robot_rotation=source_to_robot_rotation,
@@ -428,42 +412,17 @@ def load_rgbd_episode(
         raise ValueError(f"{field!r} has no joint names")
 
     episode_row = _one_episode_row(dataset_root, episode_index)
-    dataset_kind, source_episode = _one_source_episode(
+    source_episode = _one_egodex_source_episode(
         dataset_root,
         episode_index,
     )
-    if dataset_kind == "egodex":
-        recorded_scene_scale = float(
-            source_episode["source_to_robot_camera_translation_scale"]
-        )
-        source_to_robot_rotation = np.asarray(
-            source_episode["source_to_robot_rotation"],
-            dtype=np.float64,
-        )
-        source_to_robot_translation = None
-    else:
-        camera_alignment = source_episode.get("camera_alignment")
-        if not isinstance(camera_alignment, dict):
-            raise ValueError(
-                f"Nymeria episode {episode_index} lacks camera_alignment"
-            )
-        if camera_alignment.get("status") != "validated":
-            raise ValueError(
-                f"Nymeria episode {episode_index} camera alignment is invalid"
-            )
-        recorded_scene_scale = float(
-            camera_alignment[
-                "source_to_robot_camera_translation_scale"
-            ]
-        )
-        source_to_robot_rotation = np.asarray(
-            camera_alignment["source_to_robot_rotation"],
-            dtype=np.float64,
-        )
-        source_to_robot_translation = np.asarray(
-            camera_alignment["source_to_robot_translation"],
-            dtype=np.float64,
-        )
+    recorded_scene_scale = float(
+        source_episode["source_to_robot_camera_translation_scale"]
+    )
+    source_to_robot_rotation = np.asarray(
+        source_episode["source_to_robot_rotation"],
+        dtype=np.float64,
+    )
     resolved_scene_scale = _resolve_scene_scale(
         recorded_scene_scale=recorded_scene_scale,
         override=scene_scale,
@@ -526,18 +485,8 @@ def load_rgbd_episode(
         raise ValueError("Per-frame camera intrinsics are not constant")
 
     source_stem = str(source_episode["source_stem"])
-    if dataset_kind == "egodex":
-        source_video = source_root / f"{source_stem}.mp4"
-        source_hdf5 = source_root / f"{source_stem}.hdf5"
-    else:
-        source_video = _manifest_path(
-            source_episode["source_video"],
-            source_root=source_root,
-        )
-        source_hdf5 = _manifest_path(
-            source_episode["camera_alignment"]["adapter_hdf5"],
-            source_root=source_root,
-        )
+    source_video = source_root / f"{source_stem}.mp4"
+    source_hdf5 = source_root / f"{source_stem}.hdf5"
     video_path_template = str(info["video_path"])
     video_relative_path = Path(video_path_template.format(
         video_key=VIDEO_FEATURE,
@@ -576,59 +525,30 @@ def load_rgbd_episode(
             handle["transforms/camera"],
             dtype=np.float64,
         )
-        source_hip_to_world = (
-            np.asarray(handle["transforms/hip"], dtype=np.float64)
-            if dataset_kind == "egodex"
-            else None
+        source_hip_to_world = np.asarray(
+            handle["transforms/hip"], dtype=np.float64
         )
-    if dataset_kind == "egodex":
-        assert source_hip_to_world is not None
-        source_hip_to_world = source_hip_to_world.copy()
-        source_hip_to_world[:, :3, 3] = _smooth_points(
-            source_hip_to_world[:, :3, 3]
-        )
+    source_hip_to_world = source_hip_to_world.copy()
+    source_hip_to_world[:, :3, 3] = _smooth_points(
+        source_hip_to_world[:, :3, 3]
+    )
     if not np.allclose(source_intrinsic, intrinsics[0], atol=1e-5):
         raise ValueError("Source and stored camera intrinsics disagree")
     expected_transform_shape = (length, 4, 4)
     if source_camera_to_world.shape != expected_transform_shape:
         raise ValueError("Source camera transform shape is invalid")
-    if dataset_kind == "egodex" and (
-        source_hip_to_world is None
-        or source_hip_to_world.shape != expected_transform_shape
-    ):
+    if source_hip_to_world.shape != expected_transform_shape:
         raise ValueError("Source hip transform shape is invalid")
 
     if source_to_robot_rotation.shape != (3, 3):
         raise ValueError("source_to_robot_rotation must be 3x3")
-    if dataset_kind == "egodex":
-        assert source_hip_to_world is not None
-        mapped_camera_pose = _mapped_camera_poses(
-            root_positions=root_pose[:, :3],
-            source_camera_to_world=source_camera_to_world,
-            source_hip_to_world=source_hip_to_world,
-            source_to_robot_rotation=source_to_robot_rotation,
-            scene_scale=resolved_scene_scale,
-        )
-    else:
-        if (
-            source_to_robot_translation is None
-            or source_to_robot_translation.shape != (3,)
-            or not np.isfinite(source_to_robot_translation).all()
-        ):
-            raise ValueError("source_to_robot_translation must be finite 3D")
-        if scene_scale is not None:
-            source_to_robot_translation = (
-                recorded_camera_pose[0, :3]
-                - resolved_scene_scale
-                * source_to_robot_rotation
-                @ source_camera_to_world[0, :3, 3]
-            )
-        mapped_camera_pose = _mapped_nymeria_camera_poses(
-            source_camera_to_world=source_camera_to_world,
-            source_to_robot_rotation=source_to_robot_rotation,
-            source_to_robot_translation=source_to_robot_translation,
-            scene_scale=resolved_scene_scale,
-        )
+    mapped_camera_pose = _mapped_camera_poses(
+        root_positions=root_pose[:, :3],
+        source_camera_to_world=source_camera_to_world,
+        source_hip_to_world=source_hip_to_world,
+        source_to_robot_rotation=source_to_robot_rotation,
+        scene_scale=resolved_scene_scale,
+    )
     rotation_error = (
         Rotation.from_quat(mapped_camera_pose[:, 3:7]).inv()
         * Rotation.from_quat(recorded_camera_pose[:, 3:7])
@@ -662,7 +582,7 @@ def load_rgbd_episode(
     selection = slice(start_frame, stop)
     return RgbdEpisode(
         dataset_root=dataset_root,
-        source_dataset_kind=dataset_kind,
+        source_dataset_kind="egodex",
         episode_index=episode_index,
         source_stem=source_stem,
         source_video=source_video,

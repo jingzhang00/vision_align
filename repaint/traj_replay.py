@@ -52,7 +52,7 @@ def pinocchio_link_positions(
     model = pin.buildModelFromUrdf(str(urdf_path.resolve()))
     if tuple(model.names[1:]) != trajectory.joint_names:
         raise ValueError(
-            "LeRobot joint order does not match the Pinocchio G1 URDF"
+            "Trajectory joint order does not match the Pinocchio G1 URDF"
         )
     frame_ids = [
         frame_id
@@ -254,8 +254,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Create a fast Pinocchio-FK overview and 3D MP4 for a G1 "
-            "LeRobot v3 trajectory. FPS and MP4 size come from the "
-            "episode source video."
+            "trajectory. FPS and MP4 size come from the episode source video."
         )
     )
     parser.add_argument(
@@ -263,8 +262,8 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=DEFAULT_DATASET,
         help=(
-            "LeRobot root or folder recursively containing LeRobot datasets "
-            "(default: canonical "
+            "Native Nymeria episode/dataset, LeRobot root, or folder "
+            "recursively containing either format (default: canonical "
             "egodex/basic_pick_place/lerobot)."
         ),
     )
@@ -321,6 +320,12 @@ def main() -> None:
     input_root = args.dataset.expanduser().resolve()
     output_root = args.output_dir
     dataset_roots = find_dataset_roots(input_root)
+    if (
+        args.episode is None
+        and (input_root / "trajectory.npz").is_file()
+        and input_root.name.startswith("episode_")
+    ):
+        args.episode = int(input_root.name.removeprefix("episode_"))
     for dataset_root in dataset_roots:
         args.dataset = dataset_root
         if output_root is not None and len(dataset_roots) > 1:

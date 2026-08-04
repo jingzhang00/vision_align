@@ -18,12 +18,11 @@ pretrained_models/
 ├── big-lama/               # LaMa, default image removal      (auto)
 │   ├── config.yaml
 │   └── models/best.ckpt
-└── propainter/             # ProPainter, default video inpainting (auto)
-    ├── ProPainter.pth
-    ├── recurrent_flow_completion.pth
-    └── raft-things.pth
-pytracking/pretrain/
-└── vitb_384_mae_ce_32x4_ep300.pth   # legacy --tracker ostrack only  (manual)
+├── propainter/             # ProPainter, default video inpainting (auto)
+│   ├── ProPainter.pth
+│   ├── recurrent_flow_completion.pth
+│   └── raft-things.pth
+├── FLUX.1-Fill-dev/        # optional, ~24GB   (`--only flux`)
 weights/
 └── mobile_sam.pt           # MobileSAM, ships with the repo
 ```

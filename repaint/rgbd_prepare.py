@@ -544,7 +544,10 @@ def prepare(args: argparse.Namespace) -> dict[str, object]:
         "depth": depth_report,
         "camera": {
             "source": (
-                "source HDF5 extrinsic recomputed in robot world using "
+                "raw Aria global camera trajectory transformed by the shared "
+                "source-to-robot Sim(3)"
+                if episode.source_dataset_kind == "nymeria"
+                else "source HDF5 extrinsic recomputed in robot world using "
                 "scene_scale"
             ),
             "scene_scale": episode.scene_scale,
@@ -560,9 +563,14 @@ def prepare(args: argparse.Namespace) -> dict[str, object]:
             "max_position_delta_from_recorded_m": float(
                 camera_position_delta.max()
             ),
-            "prepared_alignment": "source extrinsic only",
+            "prepared_alignment": (
+                "one global Sim(3) shared by the Aria camera and human hip; "
+                "G1 root anchored from the mapped hip"
+                if episode.source_dataset_kind == "nymeria"
+                else "source extrinsic only"
+            ),
             "replay_alignment": (
-                "one initial bilateral rigid-palm midpoint translation"
+                "disabled"
                 if episode.source_dataset_kind == "nymeria"
                 else "one initial bilateral-hand midpoint translation"
             ),

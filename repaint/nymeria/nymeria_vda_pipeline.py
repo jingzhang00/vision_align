@@ -10,9 +10,9 @@ native inputs:
       -> metric Video Depth Anything RGB-D preparation
       -> source-sized Isaac robot-camera replay
 
-The initial calibrated Aria-to-G1 extrinsic places each RGB-D frame through a
-virtual projection camera that rigidly follows the exact G1 FK camera.  Scene
-leveling and scene alignment remain disabled.
+Each RGB-D frame follows the raw Aria global camera through one constant Sim(3).
+The same Sim(3) maps the aligned human hip, which anchors the G1 root through a
+fixed hip-to-root transform; the G1 capture camera remains its own FK camera.
 """
 
 from __future__ import annotations
@@ -825,6 +825,11 @@ def _validate_retarget(
         alignment = episode.get("camera_alignment")
         if not isinstance(alignment, dict) or alignment.get("status") != "validated":
             raise ValueError(f"{clip.stem} camera alignment is not validated")
+        if (
+            alignment.get("mapping_mode")
+            != "shared_global_similarity_with_hip_root_anchor"
+        ):
+            raise ValueError(f"{clip.stem} does not use shared-global mapping")
         adapter = Path(str(alignment.get("adapter_hdf5", ""))).resolve()
         expected_adapter = (
             plan.config.alignment_root / clip.session / f"{clip.stem}.hdf5"
@@ -851,13 +856,25 @@ def _validate_retarget(
         translation = np.asarray(
             alignment.get("source_to_robot_translation"), dtype=np.float64
         )
+        hip_root_rotation = np.asarray(
+            alignment.get("mapped_hip_to_robot_root_rotation"),
+            dtype=np.float64,
+        )
+        hip_root_translation = np.asarray(
+            alignment.get("mapped_hip_to_robot_root_translation"),
+            dtype=np.float64,
+        )
         if (
             not math.isfinite(scale)
             or scale <= 0.0
             or rotation.shape != (3, 3)
             or translation.shape != (3,)
+            or hip_root_rotation.shape != (3, 3)
+            or hip_root_translation.shape != (3,)
             or not np.isfinite(rotation).all()
             or not np.isfinite(translation).all()
+            or not np.isfinite(hip_root_rotation).all()
+            or not np.isfinite(hip_root_translation).all()
         ):
             raise ValueError(f"{clip.stem} has an invalid camera transform")
 
@@ -1314,9 +1331,9 @@ def _validate_render(
     if report.get("capture_view") != "robot-camera":
         raise ValueError("Final video is not a robot-camera capture")
     if not str(report.get("mesh_pose_source", "")).startswith(
-        "prepared virtual source-camera pose backprojection rigidly following"
+        "prepared virtual source-camera pose backprojection independent"
     ):
-        raise ValueError("Final virtual camera did not follow fixed extrinsics")
+        raise ValueError("Final RGB-D camera was coupled to the G1 camera")
     if int(report.get("frame_count", -1)) != clip.video.frame_count:
         raise ValueError("Final report frame count differs from source")
     lighting = report.get("lighting")
@@ -1567,8 +1584,8 @@ def _new_report(plan: PipelinePlan) -> dict[str, Any]:
             else "generated_by_this_pipeline"
         ),
         "camera_mapping": (
-            "raw Aria camera mapped to the exact G1 head camera by one "
-            "fixed first-five-frame similarity; GMR wrist scale applied once"
+            "one global Sim(3) shared by raw Aria camera and aligned human "
+            "hip; G1 root uses one fixed mapped-hip-to-root transform"
         ),
         "hand_policy": (
             "51-DoF G1 with 29 retargeted body joints and 22 fixed-open hand "
@@ -1581,9 +1598,8 @@ def _new_report(plan: PipelinePlan) -> dict[str, Any]:
             "visuals are hidden"
         ),
         "scene_alignment_policy": (
-            "scene alignment disabled; each "
-            "RGB-D frame uses a virtual source camera rigidly following the "
-            "exact G1 FK capture camera through one fixed initial extrinsic"
+            "scene alignment disabled; RGB-D follows the independent mapped "
+            "Aria reconstruction camera while G1 capture follows exact FK"
         ),
         "video_metadata_policy": (
             "ffprobe decoded/displayed frame count, source FPS and source "

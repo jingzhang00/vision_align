@@ -548,12 +548,7 @@ def _articulated_source_features(
     }
     for frame_id in range(track.frame_count):
         basis_points = points[frame_id, basis_indices]
-        basis_confidence = confidence[frame_id, basis_indices]
-        if (
-            not np.isfinite(basis_points).all()
-            or not np.isfinite(basis_confidence).all()
-            or np.any(basis_confidence <= 0.0)
-        ):
+        if not np.isfinite(basis_points).all():
             continue
         basis = _hand_anatomical_basis(*basis_points)
         if basis is None:
@@ -561,12 +556,7 @@ def _articulated_source_features(
         for digit, names in ARTICULATED_DIGIT_CHAINS.items():
             indices = [landmark_index[name] for name in names]
             chain = points[frame_id, indices]
-            chain_confidence = confidence[frame_id, indices]
-            if (
-                not np.isfinite(chain).all()
-                or not np.isfinite(chain_confidence).all()
-                or np.any(chain_confidence <= 0.0)
-            ):
+            if not np.isfinite(chain).all():
                 continue
             segment_lengths = np.linalg.norm(
                 np.diff(chain, axis=0),

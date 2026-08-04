@@ -1,4 +1,4 @@
-"""Minimal LeRobot v3 trajectory loading for the fast FK replay."""
+"""Minimal trajectory loading for the fast FK replay."""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ DEFAULT_G1_URDF = (
 )
 VIDEO_FEATURE = "observation.images.ego"
 SUPPORTED_FIELDS = ("observation.state", "action")
+NYMERIA_FORMAT = "nymeria-g1-trajectory-v1"
 
 
 @dataclass(frozen=True)
@@ -56,17 +57,30 @@ def _episode_metadata_rows(dataset_root: Path) -> list[dict[str, Any]]:
 
 
 def find_dataset_roots(folder: Path) -> tuple[Path, ...]:
-    """Find LeRobot dataset roots recursively under a folder."""
+    """Find supported trajectory dataset roots recursively under a folder."""
 
     folder = folder.expanduser().resolve()
     if not folder.is_dir():
         raise NotADirectoryError(folder)
-    roots = tuple(
-        sorted(info.parent.parent for info in folder.rglob("meta/info.json"))
+    if (folder / "trajectory.npz").is_file():
+        candidate = folder.parent.parent
+        manifest = candidate / "manifest.json"
+        if (
+            manifest.is_file()
+            and _read_json(manifest).get("format") == NYMERIA_FORMAT
+        ):
+            return (candidate,)
+    roots = {
+        info.parent.parent for info in folder.rglob("meta/info.json")
+    }
+    roots.update(
+        manifest.parent
+        for manifest in folder.rglob("manifest.json")
+        if _read_json(manifest).get("format") == NYMERIA_FORMAT
     )
     if not roots:
-        raise FileNotFoundError(f"No LeRobot datasets under {folder}")
-    return roots
+        raise FileNotFoundError(f"No supported trajectory datasets under {folder}")
+    return tuple(sorted(roots))
 
 
 def _episode_metadata_row(
@@ -127,17 +141,112 @@ def _episode_source_video(
 
 
 def list_episode_indices(dataset_root: Path) -> tuple[int, ...]:
-    """Return every episode index declared by a LeRobot dataset."""
+    """Return every episode index declared by a trajectory dataset."""
 
-    indices = sorted(
-        int(row["episode_index"])
-        for row in _episode_metadata_rows(dataset_root.resolve())
-    )
+    dataset_root = dataset_root.resolve()
+    manifest_path = dataset_root / "manifest.json"
+    if manifest_path.is_file():
+        manifest = _read_json(manifest_path)
+        if manifest.get("format") != NYMERIA_FORMAT:
+            raise ValueError(f"Unsupported trajectory format under {dataset_root}")
+        indices = sorted(
+            int(row["episode_index"])
+            for row in manifest.get("episodes", ())
+        )
+    else:
+        indices = sorted(
+            int(row["episode_index"])
+            for row in _episode_metadata_rows(dataset_root)
+        )
     if len(indices) != len(set(indices)):
         raise ValueError(
             f"Duplicate episode metadata under {dataset_root.resolve()}"
         )
     return tuple(indices)
+
+
+def _load_nymeria_trajectory(
+    dataset_root: Path,
+    episode_index: int,
+    field: str,
+    start_frame: int,
+    end_frame: int | None,
+) -> Trajectory:
+    if field != "observation.state":
+        raise ValueError("Native Nymeria trajectories contain state, not action")
+    manifest = _read_json(dataset_root / "manifest.json")
+    if manifest.get("format") != NYMERIA_FORMAT:
+        raise ValueError(f"Unsupported trajectory format under {dataset_root}")
+    matching = [
+        row
+        for row in manifest.get("episodes", ())
+        if int(row.get("episode_index", -1)) == episode_index
+    ]
+    if len(matching) != 1:
+        raise ValueError(
+            f"Nymeria episode {episode_index} was found {len(matching)} times"
+        )
+    episode = matching[0]
+    joint_names = tuple(str(name) for name in manifest.get("joint_names", ()))
+    length = int(episode["frame_count"])
+    trajectory_path = (dataset_root / str(episode["trajectory_path"])).resolve()
+    source_video = (dataset_root / str(episode["video_path"])).resolve()
+    for path in (trajectory_path, source_video):
+        if not path.is_relative_to(dataset_root) or not path.is_file():
+            raise FileNotFoundError(path)
+    width, height, source_frame_count, source_fps = _source_video_metadata(
+        source_video
+    )
+    if source_frame_count != length:
+        raise ValueError(
+            "Source video and trajectory lengths disagree: "
+            f"{source_frame_count} != {length}"
+        )
+    with np.load(trajectory_path) as trajectory:
+        frame_indices = np.asarray(trajectory["frame_indices"], dtype=np.int64)
+        timestamps = np.asarray(trajectory["timestamps"], dtype=np.float64)
+        root_pose = np.asarray(trajectory["root_pose_xyzw"], dtype=np.float64)
+        joint_positions = np.asarray(
+            trajectory["joint_positions"], dtype=np.float64
+        )
+    if (
+        not joint_names
+        or frame_indices.shape != (length,)
+        or timestamps.shape != (length,)
+        or root_pose.shape != (length, 7)
+        or joint_positions.shape != (length, len(joint_names))
+        or not np.array_equal(frame_indices, np.arange(length))
+        or not np.isfinite(timestamps).all()
+        or not np.isfinite(root_pose).all()
+        or not np.isfinite(joint_positions).all()
+    ):
+        raise ValueError(f"Nymeria episode {episode_index} trajectory is invalid")
+    if not np.allclose(
+        np.linalg.norm(root_pose[:, 3:7], axis=1), 1.0, atol=2e-4
+    ):
+        raise ValueError(
+            f"Episode {episode_index} has non-unit root quaternions"
+        )
+    stop = length if end_frame is None else end_frame
+    if not 0 <= start_frame < stop <= length:
+        raise ValueError(
+            f"Expected 0 <= start-frame < end-frame <= {length}, "
+            f"got {start_frame} and {stop}"
+        )
+    selection = slice(start_frame, stop)
+    return Trajectory(
+        dataset_root=dataset_root,
+        episode_index=episode_index,
+        fps=source_fps,
+        source_video=source_video,
+        source_size=(width, height),
+        field=field,
+        joint_names=joint_names,
+        frame_indices=frame_indices[selection],
+        timestamps=timestamps[selection],
+        root_pose_xyzw=root_pose[selection],
+        joint_positions=joint_positions[selection],
+    )
 
 
 def load_trajectory(
@@ -150,6 +259,14 @@ def load_trajectory(
     """Load one trajectory and derive playback metadata from its source MP4."""
 
     dataset_root = dataset_root.resolve()
+    if (dataset_root / "manifest.json").is_file():
+        return _load_nymeria_trajectory(
+            dataset_root,
+            episode_index,
+            field,
+            start_frame,
+            end_frame,
+        )
     info = _read_json(dataset_root / "meta/info.json")
     if info.get("codebase_version") != "v3.0":
         raise ValueError(f"{dataset_root} is not a LeRobot v3.0 dataset")

@@ -240,11 +240,7 @@ def align_hand_action(
     virtual_finger = 0.7 * index + 0.3 * middle
     jaw = thumb - virtual_finger
     width = np.linalg.norm(jaw, axis=1)
-    usable_keypoints = (
-        np.isfinite(points).all(axis=2)
-        & np.isfinite(confidence)
-        & (confidence > 0.0)
-    )
+    usable_keypoints = np.isfinite(points).all(axis=2)
     finger_valid = usable_keypoints[:, 1:].all(axis=1)
     width_valid = (
         finger_valid
@@ -393,20 +389,11 @@ def _hdf5_hand_usable(handle: h5py.File, *, side: str) -> bool:
         if transform.shape != (frame_count, 4, 4):
             return False
         valid &= np.isfinite(transform[:, :3, 3]).all(axis=1)
-        confidence_key = f"confidences/{side}{name}"
-        if confidence_key in handle:
-            confidence = handle[confidence_key]
-            if confidence.shape != (frame_count,):
-                return False
-            confidence_values = np.asarray(confidence, dtype=np.float64)
-            valid &= np.isfinite(confidence_values)
-            valid &= confidence_values > 0.0
     return int(valid.sum()) >= 2
 
 
 def _hdf5_rigid_palm_usable(handle: h5py.File, *, side: str) -> bool:
     transform_key = f"transforms/{side}Hand"
-    confidence_key = f"confidences/{side}Hand"
     if (
         "transforms/camera" not in handle
         or transform_key not in handle
@@ -418,13 +405,6 @@ def _hdf5_rigid_palm_usable(handle: h5py.File, *, side: str) -> bool:
         return False
     transform_values = np.asarray(transform, dtype=np.float64)
     valid = np.isfinite(transform_values[:, :3, :]).all(axis=(1, 2))
-    if confidence_key in handle:
-        confidence = handle[confidence_key]
-        if confidence.shape != (frame_count,):
-            return False
-        confidence_values = np.asarray(confidence, dtype=np.float64)
-        valid &= np.isfinite(confidence_values)
-        valid &= confidence_values > 0.0
     return int(valid.sum()) >= 2
 
 
@@ -587,12 +567,8 @@ def load_hand_trajectory(
         axis=0,
     )
     for side in ("left", "right"):
-        transforms, confidence = rigid_body_tracks[side]
-        position_valid = (
-            np.isfinite(transforms[:, :3, 3]).all(axis=1)
-            & np.isfinite(confidence)
-            & (confidence > 0.2)
-        )
+        transforms, _confidence = rigid_body_tracks[side]
+        position_valid = np.isfinite(transforms[:, :3, 3]).all(axis=1)
         reference_position = _smooth_values(
             _transform_points(
                 repeated_reference_transform,
@@ -602,11 +578,9 @@ def load_hand_trajectory(
             smooth_window,
             polynomial_order,
         )
-        rotation_valid = (
-            np.isfinite(confidence)
-            & (confidence > 0.2)
-            & np.isfinite(transforms[:, :3, :3]).all(axis=(1, 2))
-        )
+        rotation_valid = np.isfinite(
+            transforms[:, :3, :3]
+        ).all(axis=(1, 2))
         world_rotation = _smooth_rigid_body_rotations(
             transforms[:, :3, :3],
             rotation_valid,

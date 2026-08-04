@@ -581,9 +581,9 @@ def _validate_render(stage: Stage, plan: TaskPlan) -> None:
     if str(report.get("capture_view")) != "robot-camera":
         raise ValueError("Final Isaac report is not a robot-camera capture")
     if not str(report.get("mesh_pose_source", "")).startswith(
-        "prepared virtual source-camera pose backprojection rigidly following"
+        "prepared virtual source-camera pose backprojection independent"
     ):
-        raise ValueError("Final virtual camera did not follow fixed extrinsics")
+        raise ValueError("Final RGB-D camera was coupled to the G1 camera")
     if int(report.get("frame_count", -1)) != source.video.frame_count:
         raise ValueError("Final Isaac report frame_count differs from source")
     lighting = report.get("lighting")
@@ -1286,7 +1286,7 @@ def execute_task(
             try:
                 if stage.name in {"prepare", "render"}:
                     _clear_stage_output(stage, plan)
-                else:
+                elif stage.name == "repaint":
                     _clear_episode_intermediates(plan, episode_index)
             except Exception as exc:
                 skipped.setdefault("cleanup_errors", []).append(
@@ -1404,6 +1404,30 @@ def execute_task(
                     if stage.name == "render":
                         _write_completion(plan, stage.episode_index)
                         cleanup_completed_episode(stage)
+                    continue
+                if (
+                    stage.episode_index is None
+                    and all(
+                        source.episode_index in retained_render_indices
+                        or source.episode_index in skipped_by_episode
+                        for source in plan.episodes
+                    )
+                ):
+                    now = _utc_now()
+                    stage_entry.update(
+                        status="skipped",
+                        started_at=now,
+                        finished_at=now,
+                        elapsed_seconds=0.0,
+                        last_successful_command=None,
+                        validation="all affected episodes already skipped",
+                    )
+                    progress.update(1)
+                    report["updated_at"] = now
+                    report["elapsed_seconds"] = (
+                        time.perf_counter() - task_started
+                    )
+                    persist_report()
                     continue
                 if (
                     stage.episode_index is not None
@@ -1573,16 +1597,28 @@ def execute_task(
                         persist_report()
                         progress.update(1)
                         continue
+                    write_global_failure(stage)
+                    # ponytail: shared stages are task-atomic; batch.sh gives
+                    # each task one episode, so record it and keep the queue
+                    # moving. Split shared stages if task roots become multi-episode.
+                    for source in plan.episodes:
+                        if (
+                            source.episode_index in retained_render_indices
+                            or source.episode_index in skipped_by_episode
+                        ):
+                            continue
+                        record_skipped_episode(
+                            source.episode_index,
+                            stage,
+                            error,
+                        )
                     report.update(
-                        status="failed",
-                        failed_stage=stage.stage_id,
-                        error=error,
                         updated_at=_utc_now(),
                         elapsed_seconds=time.perf_counter() - task_started,
                     )
                     persist_report()
-                    write_global_failure(stage)
-                    raise
+                    progress.update(1)
+                    continue
 
                 repaint_failures = (
                     _repaint_manifest_failures(plan)
@@ -1704,8 +1740,18 @@ def execute_task(
 def run_pipeline(tasks: Iterable[str], config: PipelineConfig) -> list[dict[str, Any]]:
     """Run tasks sequentially because Isaac and GPU models are process-global."""
 
-    plans = [build_task_plan(task, config) for task in tasks]
+    plans: list[TaskPlan] = []
     reports: list[dict[str, Any]] = []
+    for task in tasks:
+        try:
+            plans.append(build_task_plan(task, config))
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            reports.append({"task": task, "status": "failed", "error": error})
+            _write_notice(
+                f"[SKIPPED] task={task} stage=plan; "
+                f"remaining_tasks=continuing reason={error}"
+            )
     with tqdm(
         total=sum(len(plan.stages) for plan in plans),
         desc="EgoDex VDA",
@@ -1715,7 +1761,23 @@ def run_pipeline(tasks: Iterable[str], config: PipelineConfig) -> list[dict[str,
         bar_format=total_progress_bar_format(),
     ) as progress:
         for plan in plans:
-            reports.append(execute_task(plan, config, progress=progress))
+            progress_before = progress.n
+            try:
+                reports.append(execute_task(plan, config, progress=progress))
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                try:
+                    reports.append(_read_json_object(plan.paths.report))
+                except Exception:
+                    reports.append(
+                        {"task": plan.task, "status": "failed", "error": error}
+                    )
+                completed = progress.n - progress_before
+                progress.update(max(0, len(plan.stages) - completed))
+                _write_notice(
+                    f"[SKIPPED] task={plan.task}; "
+                    f"remaining_tasks=continuing reason={error}"
+                )
         progress.bar_format = total_progress_bar_format(0.0)
         progress.refresh()
     return reports
