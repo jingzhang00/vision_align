@@ -393,7 +393,6 @@ def _motion_hip_rotations_z_up(motion: ResampledMotion) -> np.ndarray:
 
 def _derive_aligned_spine3(
     *,
-    camera_to_world: np.ndarray,
     aligned_head_to_world: np.ndarray,
     motion: ResampledMotion,
 ) -> np.ndarray:
@@ -408,7 +407,6 @@ def _derive_aligned_spine3(
         SOURCE_SPINE3_JOINT_INDEX,
     )
     aligned_spine3 = frame0_anchored_spine3(
-        camera_to_world=camera_to_world,
         aligned_head_to_world=aligned_head_to_world,
         motion_head_to_world=motion_head,
         motion_spine3_to_world=motion_spine3,
@@ -471,7 +469,6 @@ def load_source_episode(
         alignment = replace(
             alignment,
             spine3_to_world=_derive_aligned_spine3(
-                camera_to_world=alignment.camera_to_world,
                 aligned_head_to_world=alignment.head_to_world,
                 motion=resampled,
             ),
@@ -534,7 +531,7 @@ def load_camera_alignment_reports(
             or adapter_contract.get("spine3_transform")
             != (
                 "frame-0 MPS-to-208-D rotation anchor with per-frame "
-                "head-relative camera position"
+                "MPS head position and 208-D spine3-to-head offset"
             )
         ):
             raise ValueError(f"{path} schema {schema_version} requires spine3")

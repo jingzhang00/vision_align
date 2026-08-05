@@ -8,6 +8,7 @@ from unittest.mock import patch
 import numpy as np
 from scipy.spatial.transform import Rotation
 
+from repaint.nymeria.nymeria_adapter import frame0_anchored_spine3
 from repaint.robot_camera import (
     TORSO_ANCHORED_CAMERA_MAPPING,
     source_camera_poses_in_spine3_cv,
@@ -19,6 +20,51 @@ from repaint.vda_scene_isaac import (
     _validate_torso_anchored_camera_chain,
     build_parser as build_render_parser,
 )
+
+
+def test_nymeria_spine_anchor_uses_every_frame_spine_pose() -> None:
+    frame_count = 3
+    aligned_head = np.repeat(np.eye(4)[None], frame_count, axis=0)
+    aligned_head[:, :3, :3] = Rotation.from_euler(
+        "z", [30.0, 45.0, 60.0], degrees=True
+    ).as_matrix()
+    aligned_head[:, :3, 3] = [
+        [4.0, 5.0, 6.0],
+        [5.0, 5.0, 6.0],
+        [6.0, 5.0, 6.0],
+    ]
+    motion_head = np.repeat(np.eye(4)[None], frame_count, axis=0)
+    motion_head[:, :3, 3] = [
+        [0.0, 0.8, 0.0],
+        [1.0, 0.8, 0.0],
+        [2.0, 0.8, 0.0],
+    ]
+    motion_spine = np.repeat(np.eye(4)[None], frame_count, axis=0)
+    motion_spine[:, :3, :3] = Rotation.from_euler(
+        "y", [0.0, 20.0, 40.0], degrees=True
+    ).as_matrix()
+    motion_spine[:, :3, 3] = motion_head[:, :3, 3] + [0.0, -0.4, 0.0]
+
+    anchored = frame0_anchored_spine3(
+        aligned_head_to_world=aligned_head,
+        motion_head_to_world=motion_head,
+        motion_spine3_to_world=motion_spine,
+    )
+
+    world_from_motion = aligned_head[0, :3, :3]
+    assert np.allclose(
+        anchored[:, :3, :3],
+        np.einsum("ij,njk->nik", world_from_motion, motion_spine[:, :3, :3]),
+    )
+    assert np.allclose(
+        anchored[:, :3, 3],
+        aligned_head[:, :3, 3]
+        + np.einsum(
+            "ij,nj->ni",
+            world_from_motion,
+            motion_spine[:, :3, 3] - motion_head[:, :3, 3],
+        ),
+    )
 
 
 def _source_camera_poses_in_spine3(frame_count: int) -> np.ndarray:

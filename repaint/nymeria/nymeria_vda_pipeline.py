@@ -745,7 +745,7 @@ def _validate_alignment(stage: Stage, plan: PipelinePlan) -> None:
         or adapter_contract.get("spine3_transform")
         != (
             "frame-0 MPS-to-208-D rotation anchor with per-frame "
-            "head-relative camera position"
+            "MPS head position and 208-D spine3-to-head offset"
         )
     ):
         raise ValueError("Nymeria alignment report does not require spine3")

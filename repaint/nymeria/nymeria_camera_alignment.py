@@ -1012,7 +1012,6 @@ def prepare_clip(
         name for name, _ in MOTION_BODY_JOINTS
     ).index("spine3")
     aligned_parts[:, spine3_index] = frame0_anchored_spine3(
-        camera_to_world=camera_to_world,
         aligned_head_to_world=aligned_parts[:, HEAD_BODY_INDEX],
         motion_head_to_world=clip_motion.body_transforms[:, HEAD_BODY_INDEX],
         motion_spine3_to_world=clip_motion.body_transforms[:, spine3_index],
@@ -1309,7 +1308,7 @@ def run(args: argparse.Namespace) -> int:
             ],
             "spine3_transform": (
                 "frame-0 MPS-to-208-D rotation anchor with per-frame "
-                "head-relative camera position"
+                "MPS head position and 208-D spine3-to-head offset"
             ),
             "hand_targets": (
                 "rigid leftHand/rightHand wrist poses; no synthesized "
