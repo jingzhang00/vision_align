@@ -41,6 +41,7 @@ from repaint.nymeria.nymeria_adapter import (  # noqa: E402
     NymeriaClip,
     ResampledMotion,
     discover_nymeria_clips,
+    frame0_anchored_spine3,
     load_motion_metadata,
     load_participant_height_m,
     load_scaled_intrinsic,
@@ -78,8 +79,9 @@ MOTION_BODY_JOINTS = (
     ("rightForearm", 19),
     ("leftHand", 20),
     ("rightHand", 21),
+    ("spine3", 9),
 )
-HEAD_BODY_INDEX = 1
+HEAD_BODY_INDEX = tuple(name for name, _ in MOTION_BODY_JOINTS).index("neck4")
 
 
 @dataclass(frozen=True)
@@ -529,7 +531,7 @@ def solve_hand_eye(
 
 
 def motion_body_transforms(resampled: ResampledMotion) -> np.ndarray:
-    """Build pelvis/head/arm rigid transforms directly from 208-D motion."""
+    """Build pelvis/spine3/head/arm transforms directly from 208-D motion."""
 
     frame_count = resampled.frame_count
     root_rotation = resampled.root_rotation
@@ -937,8 +939,8 @@ def write_adapter_hdf5(
             metadata.attrs["source_arm_lengths_m"] = source_arm_lengths
             metadata.attrs["arm_length_to_height_ratio"] = arm_to_height
             metadata.attrs["body_alignment"] = (
-                "208-D pelvis, head, shoulder, elbow, and wrist transforms "
-                "registered into the Aria MPS world"
+                "208-D pelvis, spine3, head, shoulder, elbow, and wrist "
+                "transforms registered into the Aria MPS world"
             )
             metadata.attrs["csv_start_time"] = (
                 clip_motion.metadata.csv_start_time
@@ -1005,6 +1007,15 @@ def prepare_clip(
         camera=clip_camera,
         hand_eye=hand_eye,
         head_index=HEAD_BODY_INDEX,
+    )
+    spine3_index = tuple(
+        name for name, _ in MOTION_BODY_JOINTS
+    ).index("spine3")
+    aligned_parts[:, spine3_index] = frame0_anchored_spine3(
+        camera_to_world=camera_to_world,
+        aligned_head_to_world=aligned_parts[:, HEAD_BODY_INDEX],
+        motion_head_to_world=clip_motion.body_transforms[:, HEAD_BODY_INDEX],
+        motion_spine3_to_world=clip_motion.body_transforms[:, spine3_index],
     )
     aligned_by_name = {
         name: aligned_parts[:, index]
@@ -1221,7 +1232,7 @@ def run(args: argparse.Namespace) -> int:
         )
 
     report = {
-        "schema_version": 7,
+        "schema_version": 8,
         "status": "prepared_only",
         "episode": episode_root.name,
         "participant": {
@@ -1290,8 +1301,15 @@ def run(args: argparse.Namespace) -> int:
                 "transforms/camera = T_SourceWorld_CameraOpenCV"
             ),
             "body_transforms": (
-                "208-D pelvis/head/arms/wrists registered into the raw "
-                "Aria world by session hand-eye calibration"
+                "208-D body registered by session hand-eye calibration; "
+                "spine3 rotation uses one frame-0 MPS-to-motion anchor"
+            ),
+            "body_transform_datasets": [
+                f"transforms/{name}" for name, _ in MOTION_BODY_JOINTS
+            ],
+            "spine3_transform": (
+                "frame-0 MPS-to-208-D rotation anchor with per-frame "
+                "head-relative camera position"
             ),
             "hand_targets": (
                 "rigid leftHand/rightHand wrist poses; no synthesized "

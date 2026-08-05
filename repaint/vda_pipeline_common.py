@@ -200,6 +200,8 @@ def load_previous_stages(path: Path) -> dict[str, dict[str, Any]]:
 
 
 def remove_exact(path: Path, *, owner_root: Path | None = None) -> None:
+    """Permanently delete one exact path; never use the desktop Trash."""
+
     if owner_root is not None:
         if owner_root.is_symlink():
             raise ValueError(

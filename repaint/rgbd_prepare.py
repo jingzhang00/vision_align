@@ -19,11 +19,11 @@ if str(WORKSPACE_ROOT) not in sys.path:
 
 from repaint.rgbd_episode import (  # noqa: E402
     RgbdEpisode,
-    SUPPORTED_FIELDS,
     load_rgbd_episode,
 )
 from repaint.rgbd_geometry import scale_intrinsic  # noqa: E402
 from repaint.lighting_profile import estimate_lighting_profile  # noqa: E402
+from repaint.robot_camera import TORSO_ANCHORED_CAMERA_MAPPING  # noqa: E402
 from repaint.vda_depth import (  # noqa: E402
     DEFAULT_CHECKPOINT,
     DEFAULT_VDA_METRIC_SCALE,
@@ -235,14 +235,12 @@ def prepare(args: argparse.Namespace) -> dict[str, object]:
         source_root=args.source_root,
         removed_root=args.removed_root,
         episode_index=args.episode,
-        field=args.field,
         start_frame=args.start_frame,
         end_frame=args.end_frame,
-        scene_scale=args.scene_scale,
     )
-    # The retargeted trajectory is authoritative. Scene placement is handled
-    # exactly once at replay start by scene_hand_alignment, never by changing
-    # robot joints or the prepared camera trajectory here.
+    camera_mapping_mode = TORSO_ANCHORED_CAMERA_MAPPING
+    # The recorded torso-anchored trajectory is authoritative; replay does not
+    # add another scene-placement transform.
     joint_positions = episode.joint_positions
     camera_pose = episode.camera_pose_cv_xyzw
     if episode.source_dataset_kind == "nymeria":
@@ -251,10 +249,8 @@ def prepare(args: argparse.Namespace) -> dict[str, object]:
             removed_video=episode.removed_video,
             frame_indices=episode.frame_indices,
         )
-        robot_arm_render = human_arm_visible.copy()
     else:
         human_arm_visible = np.ones(episode.frame_count, dtype=bool)
-        robot_arm_render = np.ones(episode.frame_count, dtype=bool)
     source_width, source_height = episode.source_size
     mesh_width = args.mesh_width
     mesh_height = int(round(source_height * mesh_width / source_width))
@@ -359,11 +355,7 @@ def prepare(args: argparse.Namespace) -> dict[str, object]:
         "vda_scale_calibration": scale_calibration,
         "vda_metric_scale_application_count": 1,
         "scene_scale": episode.scene_scale,
-        "scene_scale_source": (
-            "retarget metadata"
-            if args.scene_scale is None
-            else "explicit CLI override"
-        ),
+        "scene_scale_source": "gmr_spine3_scale",
         "scene_scale_application_count": 1,
         "effective_raw_depth_to_robot_scale": (
             resolved_vda_metric_scale * episode.scene_scale
@@ -386,10 +378,6 @@ def prepare(args: argparse.Namespace) -> dict[str, object]:
         episode.removed_video,
         int(episode.frame_indices[0]),
     )
-    source_capture = _open_at(
-        episode.source_video,
-        int(episode.frame_indices[0]),
-    )
     completed = 0
     positive_depth_samples: list[np.ndarray] = []
     try:
@@ -403,18 +391,12 @@ def prepare(args: argparse.Namespace) -> dict[str, object]:
                 raise ValueError(
                     "Selected source frame indices must be contiguous"
                 )
-            removed_ok, removed_frame = removed_capture.read()
-            source_ok, source_frame = source_capture.read()
-            if not removed_ok or not source_ok:
+            removed_ok, rgb_frame = removed_capture.read()
+            if not removed_ok:
                 raise RuntimeError(
                     f"Video decode failed at source frame "
                     f"{expected_source_index}"
                 )
-            rgb_frame = (
-                removed_frame
-                if robot_arm_render[completed]
-                else source_frame
-            )
             frame_path = frame_root / f"{completed:05d}.png"
             if not cv2.imwrite(str(frame_path), rgb_frame):
                 raise RuntimeError(f"Failed to write {frame_path}")
@@ -433,42 +415,31 @@ def prepare(args: argparse.Namespace) -> dict[str, object]:
             )
     finally:
         removed_capture.release()
-        source_capture.release()
 
     episode_data_path = output_root / "episode_data.npz"
     np.savez_compressed(
         episode_data_path,
         episode_index=np.asarray(episode.episode_index, dtype=np.int64),
         source_dataset_kind=np.asarray(episode.source_dataset_kind),
+        camera_mapping_mode=np.asarray(camera_mapping_mode),
         fps=np.asarray(episode.fps, dtype=np.float64),
         source_size=np.asarray(episode.source_size, dtype=np.int64),
         mesh_size=np.asarray(mesh_size, dtype=np.int64),
         frame_indices=episode.frame_indices,
         human_arm_visible=human_arm_visible,
-        robot_arm_render=robot_arm_render,
         joint_names=np.asarray(episode.joint_names),
         joint_positions=joint_positions.astype(np.float32),
         root_pose_xyzw=episode.root_pose_xyzw.astype(np.float32),
         camera_pose_cv_xyzw=camera_pose.astype(np.float32),
-        source_camera_pose_cv_xyzw=(
-            episode.source_camera_pose_cv_xyzw.astype(np.float32)
-        ),
-        recorded_camera_pose_cv_xyzw=(
-            episode.recorded_camera_pose_cv_xyzw.astype(np.float32)
+        source_camera_pose_in_spine3_xyzw=(
+            episode.source_camera_pose_in_spine3_xyzw.astype(np.float32)
         ),
         intrinsic=episode.intrinsic.astype(np.float64),
         mesh_intrinsic=mesh_intrinsic.astype(np.float64),
         scene_scale=np.asarray(episode.scene_scale, dtype=np.float64),
-        recorded_scene_scale=np.asarray(
-            episode.recorded_scene_scale,
-            dtype=np.float64,
+        source_spine3_to_robot_torso_rotation=(
+            episode.source_spine3_to_robot_torso_rotation.astype(np.float64)
         ),
-        source_to_robot_rotation=(
-            episode.source_to_robot_rotation.astype(np.float64)
-        ),
-        source_video=np.asarray(str(episode.source_video)),
-        removed_video=np.asarray(str(episode.removed_video)),
-        source_hdf5=np.asarray(str(episode.source_hdf5)),
         g1_urdf=np.asarray(str(args.urdf.resolve())),
         vda_metric_scale=np.asarray(
             resolved_vda_metric_scale,
@@ -501,38 +472,28 @@ def prepare(args: argparse.Namespace) -> dict[str, object]:
             "p99": percentiles[2],
         },
     }
-    camera_position_delta = np.linalg.norm(
-        camera_pose[:, :3]
-        - episode.recorded_camera_pose_cv_xyzw[:, :3],
-        axis=1,
-    )
     report: dict[str, object] = {
-        "schema_version": 1,
-        "method": "visibility_routed_rgb_plus_metric_vda_rgbd_mesh",
+        "schema_version": 2,
+        "method": "handless_rgb_plus_metric_vda_rgbd_mesh",
         "source_dataset_kind": episode.source_dataset_kind,
         "episode_index": episode.episode_index,
         "source_stem": episode.source_stem,
         "source_video": str(episode.source_video),
         "removed_video_for_vda": str(episode.removed_video),
         "rgb_texture": {
-            "source": (
-                "processed handless video only on robot-arm replacement "
-                "frames; original source video otherwise"
-            ),
+            "source": "processed handless video on every frame",
             "original_video": str(episode.source_video),
             "handless_video": str(episode.removed_video),
         },
         "arm_replacement": {
             "method": (
-                "SAM 3 native per-frame target presence directly selects "
-                "human-arm replacement and G1 visual visibility"
+                "human-arm visibility metadata is retained for removal audit "
+                "only; G1 rendering is independent"
             ),
             "manual_review": False,
             "per_dataset_threshold_tuning": False,
             "frame_count": episode.frame_count,
             "human_arm_visible_frames": int(human_arm_visible.sum()),
-            "robot_arm_render_frames": int(robot_arm_render.sum()),
-            "view_only_frames": int((~robot_arm_render).sum()),
         },
         "frame_indices": episode.frame_indices.tolist(),
         "frame_count": episode.frame_count,
@@ -543,37 +504,9 @@ def prepare(args: argparse.Namespace) -> dict[str, object]:
         "mesh_intrinsic": mesh_intrinsic.tolist(),
         "depth": depth_report,
         "camera": {
-            "source": (
-                "raw Aria global camera trajectory transformed by the shared "
-                "source-to-robot Sim(3)"
-                if episode.source_dataset_kind == "nymeria"
-                else "source HDF5 extrinsic recomputed in robot world using "
-                "scene_scale"
-            ),
+            "mapping_mode": camera_mapping_mode,
             "scene_scale": episode.scene_scale,
-            "scene_scale_source": (
-                "retarget metadata"
-                if args.scene_scale is None
-                else "explicit CLI override"
-            ),
-            "recorded_scene_scale": episode.recorded_scene_scale,
-            "mean_position_delta_from_recorded_m": float(
-                camera_position_delta.mean()
-            ),
-            "max_position_delta_from_recorded_m": float(
-                camera_position_delta.max()
-            ),
-            "prepared_alignment": (
-                "one global Sim(3) shared by the Aria camera and human hip; "
-                "G1 root anchored from the mapped hip"
-                if episode.source_dataset_kind == "nymeria"
-                else "source extrinsic only"
-            ),
-            "replay_alignment": (
-                "disabled"
-                if episode.source_dataset_kind == "nymeria"
-                else "one initial bilateral-hand midpoint translation"
-            ),
+            "scene_scale_source": "gmr_spine3_scale",
         },
         "lighting": {
             "profile": str(lighting_profile_path),
@@ -615,23 +548,9 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--episode", type=int, default=0)
-    parser.add_argument(
-        "--field",
-        choices=SUPPORTED_FIELDS,
-        default="observation.state",
-    )
     parser.add_argument("--urdf", type=Path, default=DEFAULT_G1_URDF)
     parser.add_argument("--start-frame", type=int, default=0)
     parser.add_argument("--end-frame", type=int)
-    parser.add_argument(
-        "--scene-scale",
-        type=float,
-        help=(
-            "Explicit source-to-robot override. By default this is read from "
-            "the episode retarget metadata and applied once to camera "
-            "translation and calibrated metric depth."
-        ),
-    )
     parser.add_argument(
         "--mesh-width",
         type=int,

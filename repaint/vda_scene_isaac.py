@@ -45,20 +45,18 @@ from repaint.rgbd_geometry import (  # noqa: E402
     grid_uvs,
 )
 from repaint.robot_camera import (  # noqa: E402
+    CAMERA_LINK_FROM_CV_OPTICAL,
     HEAD_CAMERA_PARENT_FRAME,
     HEAD_CAM_OFFSET_POS_ACTIVE,
     HEAD_CAM_OFFSET_POS_BASE,
     HEAD_CAM_OFFSET_ROT_WXYZ,
     HEAD_CAM_RESET_GUARD_X_M,
-    head_camera_poses_cv,
+    TORSO_ANCHORED_CAMERA_MAPPING,
     head_camera_poses_world,
+    robot_frame_poses_world,
     robot_frame_points_in_camera_cv,
+    torso_anchored_camera_poses_cv,
 )
-from repaint.scene_hand_alignment import (  # noqa: E402
-    PALM_ALIGNMENT_STAGE,
-    align_scene_camera_poses_to_initial_palms,
-)
-
 D435_REFERENCE_SIZE = (640, 480)
 D435_INTRINSIC = np.asarray(
     [
@@ -74,7 +72,6 @@ HAND_CAPTURE_WARNING_THRESHOLD = 0.8
 JOINT_COMMIT_ATOL_RAD = 1.0e-4
 ROOT_POSITION_COMMIT_ATOL_M = 1.0e-4
 ROOT_ORIENTATION_COMMIT_ATOL_RAD = 1.0e-4
-INITIAL_PALM_ALIGNMENT_FRAME_COUNT = 5
 
 
 @dataclass(frozen=True)
@@ -83,6 +80,7 @@ class PreparedScene:
 
     root: Path
     source_dataset_kind: str
+    camera_mapping_mode: str
     rgb_paths: tuple[Path, ...]
     depth_paths: tuple[Path, ...]
     frame_indices: np.ndarray
@@ -92,13 +90,10 @@ class PreparedScene:
     intrinsic: np.ndarray
     mesh_intrinsic: np.ndarray
     camera_poses_cv_xyzw: np.ndarray
-    robot_arm_render: np.ndarray
     joint_names: tuple[str, ...]
     joint_positions: np.ndarray
     root_poses_xyzw: np.ndarray
     g1_urdf: Path
-    source_hdf5: Path | None
-    scene_scale: float | None
 
     @property
     def frame_count(self) -> int:
@@ -162,51 +157,66 @@ def _validated_size(value: np.ndarray, *, name: str) -> tuple[int, int]:
     return size
 
 
-def _validate_nymeria_global_camera_chain(
+def _validate_torso_anchored_camera_chain(
     *,
     camera_poses_cv_xyzw: np.ndarray,
-    source_camera_poses_cv_xyzw: np.ndarray,
-    source_to_robot_rotation: np.ndarray,
+    source_camera_pose_in_spine3_xyzw: np.ndarray,
+    source_spine3_to_robot_torso_rotation: np.ndarray,
     scene_scale: float,
+    g1_urdf: Path,
+    joint_names: tuple[str, ...],
+    joint_positions: np.ndarray,
+    root_poses_xyzw: np.ndarray,
 ) -> None:
-    """Reject removed G1-following or torso-relative scene-camera chains."""
+    """Recompute the exact torso-local source-camera contract."""
 
     camera = np.asarray(camera_poses_cv_xyzw, dtype=np.float64)
-    source = np.asarray(source_camera_poses_cv_xyzw, dtype=np.float64)
-    rotation = np.asarray(source_to_robot_rotation, dtype=np.float64)
+    source = np.asarray(
+        source_camera_pose_in_spine3_xyzw,
+        dtype=np.float64,
+    )
+    frame_count = len(camera)
     if (
-        source.shape != camera.shape
-        or rotation.shape != (3, 3)
+        camera.shape != (frame_count, 7)
+        or source.shape != (frame_count, 7)
+        or not np.isfinite(camera).all()
         or not np.isfinite(source).all()
-        or not np.isfinite(rotation).all()
-        or not np.isfinite(scene_scale)
-        or scene_scale <= 0.0
+        or np.any(np.linalg.norm(camera[:, 3:7], axis=1) <= 1e-8)
         or np.any(np.linalg.norm(source[:, 3:7], axis=1) <= 1e-8)
     ):
-        raise ValueError("Prepared Nymeria global camera metadata is invalid")
-    translation = camera[:, :3] - scene_scale * (
-        rotation @ source[:, :3].T
-    ).T
-    translation_error = np.linalg.norm(
-        translation - np.median(translation, axis=0), axis=1
+        raise ValueError("Prepared torso-anchored camera metadata is invalid")
+    robot_torso = robot_frame_poses_world(
+        urdf_path=g1_urdf,
+        joint_names=joint_names,
+        joint_positions=joint_positions,
+        root_pose_xyzw=root_poses_xyzw,
+        frame_name=HEAD_CAMERA_PARENT_FRAME,
     )
-    expected_rotation = Rotation.from_matrix(
-        np.einsum(
-            "ij,njk->nik",
-            rotation,
-            Rotation.from_quat(source[:, 3:7]).as_matrix(),
-        )
+    expected = torso_anchored_camera_poses_cv(
+        source_camera_pose_in_spine3_xyzw=source,
+        robot_torso_pose_world_xyzw=robot_torso,
+        source_spine3_to_robot_torso_rotation=(
+            source_spine3_to_robot_torso_rotation
+        ),
+        scene_scale=scene_scale,
+    )
+    position_error = np.linalg.norm(
+        camera[:, :3] - expected[:, :3], axis=1
     )
     rotation_error = (
-        expected_rotation.inv() * Rotation.from_quat(camera[:, 3:7])
+        Rotation.from_quat(expected[:, 3:7]).inv()
+        * Rotation.from_quat(
+            camera[:, 3:7]
+            / np.linalg.norm(camera[:, 3:7], axis=1, keepdims=True)
+        )
     ).magnitude()
     if (
-        float(np.max(translation_error)) > 1e-5
+        float(np.max(position_error)) > 1e-5
         or float(np.max(rotation_error)) > 1e-5
     ):
         raise ValueError(
-            "Prepared Nymeria scene uses a removed legacy camera chain; "
-            "rerun prepare from a shared-global robot trajectory"
+            "Prepared scene camera violates the source-spine3-to-G1-torso "
+            "camera contract"
         )
 
 
@@ -222,6 +232,7 @@ def load_prepared_scene(prepared_root: Path) -> PreparedScene:
         required = {
             "fps",
             "source_dataset_kind",
+            "camera_mapping_mode",
             "source_size",
             "mesh_size",
             "frame_indices",
@@ -257,6 +268,14 @@ def load_prepared_scene(prepared_root: Path) -> PreparedScene:
             raise ValueError(
                 f"Unsupported prepared source dataset: {source_dataset_kind!r}"
             )
+        camera_mapping_mode_value = np.asarray(archive["camera_mapping_mode"])
+        if camera_mapping_mode_value.shape != ():
+            raise ValueError("camera_mapping_mode must be a scalar")
+        camera_mapping_mode = str(camera_mapping_mode_value.item())
+        if camera_mapping_mode != TORSO_ANCHORED_CAMERA_MAPPING:
+            raise ValueError(
+                f"Unsupported prepared camera mapping: {camera_mapping_mode!r}"
+            )
 
         source_size = _validated_size(archive["source_size"], name="source_size")
         mesh_size = _validated_size(archive["mesh_size"], name="mesh_size")
@@ -291,22 +310,6 @@ def load_prepared_scene(prepared_root: Path) -> PreparedScene:
         if np.any(quaternion_norms <= 1e-8):
             raise ValueError("camera_pose_cv_xyzw contains a zero quaternion")
         camera_poses[:, 3:7] /= quaternion_norms[:, None]
-
-        if "robot_arm_render" in archive:
-            robot_arm_render_raw = np.asarray(
-                archive["robot_arm_render"]
-            )
-            if (
-                robot_arm_render_raw.shape != (len(frame_indices),)
-                or robot_arm_render_raw.dtype.kind not in "biu"
-                or not np.isin(robot_arm_render_raw, (0, 1)).all()
-            ):
-                raise ValueError(
-                    "robot_arm_render must be a boolean [frame_count] vector"
-                )
-            robot_arm_render = robot_arm_render_raw.astype(bool)
-        else:
-            robot_arm_render = np.ones(len(frame_indices), dtype=bool)
 
         joint_names_array = np.asarray(archive["joint_names"])
         if joint_names_array.ndim != 1 or len(joint_names_array) == 0:
@@ -346,44 +349,36 @@ def load_prepared_scene(prepared_root: Path) -> PreparedScene:
         if not g1_urdf.is_file():
             raise FileNotFoundError(f"G1 URDF does not exist: {g1_urdf}")
 
-        source_hdf5: Path | None = None
-        if "source_hdf5" in archive:
-            source_hdf5_value = np.asarray(archive["source_hdf5"])
-            if source_hdf5_value.shape != ():
-                raise ValueError("source_hdf5 must be a scalar path")
-            source_hdf5 = Path(
-                str(source_hdf5_value.item())
-            ).expanduser().resolve()
+        if "scene_scale" not in archive:
+            raise ValueError("Prepared scene lacks scene_scale")
+        scene_scale = float(archive["scene_scale"])
+        if not np.isfinite(scene_scale) or scene_scale <= 0.0:
+            raise ValueError("Prepared scene_scale must be positive and finite")
 
-        scene_scale: float | None = None
-        if "scene_scale" in archive:
-            scene_scale = float(archive["scene_scale"])
-            if not np.isfinite(scene_scale) or scene_scale <= 0.0:
-                raise ValueError(
-                    "Prepared scene_scale must be positive and finite"
-                )
-
-        if source_dataset_kind == "nymeria":
-            camera_contract_keys = {
-                "source_camera_pose_cv_xyzw",
-                "source_to_robot_rotation",
-            }
-            missing_contract = sorted(camera_contract_keys - set(archive.files))
-            if scene_scale is None or missing_contract:
-                raise ValueError(
-                    "Prepared Nymeria scene lacks shared-global camera metadata: "
-                    f"{missing_contract}"
-                )
-            _validate_nymeria_global_camera_chain(
-                camera_poses_cv_xyzw=camera_poses,
-                source_camera_poses_cv_xyzw=archive[
-                    "source_camera_pose_cv_xyzw"
-                ],
-                source_to_robot_rotation=archive[
-                    "source_to_robot_rotation"
-                ],
-                scene_scale=scene_scale,
+        camera_contract_keys = {
+            "source_camera_pose_in_spine3_xyzw",
+            "source_spine3_to_robot_torso_rotation",
+        }
+        missing_contract = sorted(camera_contract_keys - set(archive.files))
+        if missing_contract:
+            raise ValueError(
+                "Prepared scene lacks camera mapping metadata: "
+                f"{missing_contract}"
             )
+        _validate_torso_anchored_camera_chain(
+            camera_poses_cv_xyzw=camera_poses,
+            source_camera_pose_in_spine3_xyzw=archive[
+                "source_camera_pose_in_spine3_xyzw"
+            ],
+            source_spine3_to_robot_torso_rotation=archive[
+                "source_spine3_to_robot_torso_rotation"
+            ],
+            scene_scale=scene_scale,
+            g1_urdf=g1_urdf,
+            joint_names=joint_names,
+            joint_positions=joint_positions,
+            root_poses_xyzw=root_poses,
+        )
 
     rgb_paths = _numbered_png_paths(root / "rgb")
     depth_paths = _numbered_png_paths(root / "depth_mm")
@@ -407,6 +402,7 @@ def load_prepared_scene(prepared_root: Path) -> PreparedScene:
     return PreparedScene(
         root=root,
         source_dataset_kind=source_dataset_kind,
+        camera_mapping_mode=camera_mapping_mode,
         rgb_paths=rgb_paths,
         depth_paths=depth_paths,
         frame_indices=frame_indices,
@@ -416,13 +412,10 @@ def load_prepared_scene(prepared_root: Path) -> PreparedScene:
         intrinsic=intrinsic,
         mesh_intrinsic=mesh_intrinsic,
         camera_poses_cv_xyzw=camera_poses,
-        robot_arm_render=robot_arm_render,
         joint_names=joint_names,
         joint_positions=joint_positions,
         root_poses_xyzw=root_poses,
         g1_urdf=g1_urdf,
-        source_hdf5=source_hdf5,
-        scene_scale=scene_scale,
     )
 
 
@@ -449,7 +442,6 @@ def scan_scene(
     camera_poses_cv_xyzw: np.ndarray,
     absolute_threshold_m: float,
     relative_threshold: float,
-    scene_translation_world_xyz_m: np.ndarray,
 ) -> SceneScan:
     """Validate all depth frames and collect bounds/topology diagnostics."""
 
@@ -472,7 +464,6 @@ def scan_scene(
             camera_poses_cv_xyzw[frame_id],
         )
         valid = np.isfinite(points_world).all(axis=-1)
-        points_world[valid] += scene_translation_world_xyz_m
         valid_points = points_world[valid]
         if len(valid_points) == 0:
             raise ValueError(f"Depth frame has no valid points: {depth_path}")
@@ -504,15 +495,18 @@ def _resolve_mesh_camera_poses(
     *,
     capture_view: str,
     prepared_camera_poses_cv_xyzw: np.ndarray,
+    camera_mapping_mode: str,
 ) -> tuple[np.ndarray, str]:
-    """Keep RGB-D reconstruction independent from the capture camera."""
+    """Use the prepared RGB-D camera contract unchanged."""
 
     if capture_view not in {"robot-camera", "scene"}:
         raise ValueError(f"Unsupported capture view: {capture_view!r}")
+    if camera_mapping_mode != TORSO_ANCHORED_CAMERA_MAPPING:
+        raise ValueError(f"Unsupported camera mapping: {camera_mapping_mode!r}")
     return (
         prepared_camera_poses_cv_xyzw,
-        "prepared virtual source-camera pose backprojection independent "
-        "of the G1 capture camera",
+        "prepared source spine3-to-camera local pose transferred onto G1 "
+        "torso FK; G1 capture-camera mount remains independent",
     )
 
 
@@ -810,7 +804,7 @@ def _capture_camera_report(
         "offset_position_active_xyz_m": (
             HEAD_CAM_OFFSET_POS_ACTIVE.tolist()
         ),
-        "offset_rotation_world_wxyz": (
+        "offset_rotation_parent_wxyz": (
             HEAD_CAM_OFFSET_ROT_WXYZ.tolist()
         ),
         "native_size": list(D435_REFERENCE_SIZE),
@@ -1213,11 +1207,6 @@ def render(args: argparse.Namespace) -> dict[str, object]:
         raise ValueError("--depth-edge-relative must be finite and non-negative")
     if args.rt_subframes <= 0:
         raise ValueError("--rt-subframes must be positive")
-    if (
-        scene.source_dataset_kind == "nymeria"
-        and args.scene_alignment != "none"
-    ):
-        raise ValueError("Nymeria requires --scene-alignment none")
     capture_camera_poses_world_xyzw: np.ndarray | None = None
     capture_camera_poses_cv_xyzw: np.ndarray | None = None
     if args.capture_view == "robot-camera":
@@ -1227,106 +1216,22 @@ def render(args: argparse.Namespace) -> dict[str, object]:
             joint_positions=scene.joint_positions,
             root_pose_xyzw=scene.root_poses_xyzw,
         )
-        capture_camera_poses_cv_xyzw = head_camera_poses_cv(
-            urdf_path=scene.g1_urdf,
-            joint_names=scene.joint_names,
-            joint_positions=scene.joint_positions,
-            root_pose_xyzw=scene.root_poses_xyzw,
+        capture_camera_poses_cv_xyzw = (
+            capture_camera_poses_world_xyzw.copy()
         )
+        capture_camera_poses_cv_xyzw[:, 3:7] = Rotation.from_matrix(
+            Rotation.from_quat(
+                capture_camera_poses_world_xyzw[:, 3:7]
+            ).as_matrix()
+            @ CAMERA_LINK_FROM_CV_OPTICAL
+        ).as_quat()
     mesh_camera_poses_cv_xyzw, mesh_pose_source = (
         _resolve_mesh_camera_poses(
             capture_view=args.capture_view,
             prepared_camera_poses_cv_xyzw=scene.camera_poses_cv_xyzw,
+            camera_mapping_mode=scene.camera_mapping_mode,
         )
     )
-    if (
-        args.scene_alignment != "none"
-        and (scene.source_hdf5 is None or scene.scene_scale is None)
-    ):
-        raise ValueError(
-            "--scene-alignment requires source_hdf5 and scene_scale in "
-            "prepared episode_data.npz; use "
-            "--scene-alignment none only for legacy prepared data"
-        )
-    scene_anchor_description = (
-        "bilateral tracked-Hand palm XYZ anchor"
-        if args.scene_alignment == "initial-palms"
-        else None
-    )
-    scene_alignment_stage = (
-        PALM_ALIGNMENT_STAGE
-        if args.scene_alignment == "initial-palms"
-        else None
-    )
-
-    if args.scene_alignment != "none":
-        assert scene.source_hdf5 is not None
-        assert scene.scene_scale is not None
-        assert scene_anchor_description is not None
-        assert scene_alignment_stage is not None
-        alignment_window_frames = min(
-            INITIAL_PALM_ALIGNMENT_FRAME_COUNT,
-            scene.frame_count,
-        )
-        alignment_kwargs = {
-            "source_hdf5": scene.source_hdf5,
-            "frame_indices": scene.frame_indices,
-            "scene_scale": scene.scene_scale,
-            "scene_camera_pose_cv_xyzw": mesh_camera_poses_cv_xyzw,
-            "urdf_path": scene.g1_urdf,
-            "joint_names": scene.joint_names,
-            "joint_positions": scene.joint_positions,
-            "root_pose_xyzw": scene.root_poses_xyzw,
-            "window_frames": alignment_window_frames,
-        }
-        alignment = align_scene_camera_poses_to_initial_palms(
-            **alignment_kwargs,
-        )
-        scene_alignment_report = alignment.report
-        scene_alignment_report.update(
-            {
-                "requested_mode": args.scene_alignment,
-                "pipeline_order": 1,
-                "window_seconds_requested": (
-                    INITIAL_PALM_ALIGNMENT_FRAME_COUNT / scene.fps
-                ),
-                "window_frames_resolved": alignment_window_frames,
-                "window_resolution_source": "fixed first five frames",
-                "window_source_fps": scene.fps,
-            }
-        )
-        scene_translation_world = alignment.translation_world_xyz_m
-        print(
-            f"Initial {scene_anchor_description} placement: "
-            f"delta_world={scene_translation_world.tolist()} m, "
-            f"frames={scene_alignment_report['paired_frame_count']}",
-            flush=True,
-        )
-    else:
-        scene_translation_world = np.zeros(3, dtype=np.float64)
-        scene_alignment_report = {
-            "schema_version": 1,
-            "method": "disabled",
-            "requested_mode": "none",
-            "world_translation_xyz_m": [0.0, 0.0, 0.0],
-            "application_count": 0,
-        }
-
-    scene_operation_order: list[str] = []
-    if scene_alignment_stage is not None:
-        scene_operation_order.append(scene_alignment_stage)
-    scene_placement_report: dict[str, object] = {
-        "schema_version": 2,
-        "method": "optional bilateral semantic-anchor XYZ scene placement",
-        "operation_order": scene_operation_order,
-        "anchor_translation_world_xyz_m": (
-            scene_translation_world.tolist()
-        ),
-        "anchor_application_count": int(
-            scene_alignment_report.get("application_count", 0)
-        ),
-        "application_count": len(scene_operation_order),
-    }
 
     (
         render_intrinsic,
@@ -1373,7 +1278,6 @@ def render(args: argparse.Namespace) -> dict[str, object]:
         camera_poses_cv_xyzw=mesh_camera_poses_cv_xyzw,
         absolute_threshold_m=args.depth_edge_absolute,
         relative_threshold=args.depth_edge_relative,
-        scene_translation_world_xyz_m=scene_translation_world,
     )
     scene_eye, scene_target, eye_source, target_source = (
         _resolve_scene_camera(
@@ -1474,15 +1378,6 @@ def render(args: argparse.Namespace) -> dict[str, object]:
         timeline = omni.timeline.get_timeline_interface()
 
         robot_path = import_g1(scene.g1_urdf)
-        robot_root_path = Sdf.Path(robot_path).GetParentPath()
-        robot_root = UsdGeom.Imageable(
-            stage.GetPrimAtPath(robot_root_path)
-        )
-        if not robot_root:
-            raise RuntimeError(
-                f"Imported G1 root is not Imageable: {robot_root_path}"
-            )
-        robot_visibility = robot_root.CreateVisibilityAttr()
         robot = world.scene.add(
             Articulation(
                 prim_paths_expr=robot_path,
@@ -1751,7 +1646,6 @@ def render(args: argparse.Namespace) -> dict[str, object]:
                 mesh_camera_poses_cv_xyzw[frame_id],
             )
             valid = np.isfinite(points_world).all(axis=-1)
-            points_world[valid] += scene_translation_world
             points_world[~valid] = 0.0
             triangles = depth_grid_triangles(
                 depth_m,
@@ -1785,11 +1679,6 @@ def render(args: argparse.Namespace) -> dict[str, object]:
             )
             texture_file_input.Set(
                 Sdf.AssetPath(str(rgb_path.resolve()))
-            )
-            robot_visibility.Set(
-                UsdGeom.Tokens.inherited
-                if scene.robot_arm_render[frame_id]
-                else UsdGeom.Tokens.invisible
             )
 
             root_pose = scene.root_poses_xyzw[frame_id]
@@ -2023,13 +1912,14 @@ def render(args: argparse.Namespace) -> dict[str, object]:
                 pass
 
             report: dict[str, object] = {
-                "schema_version": 2,
+                "schema_version": 3,
                 "method": (
                     "video-depth-anything-dynamic-rgbd-mesh"
                     "-plus-g1-articulation"
                 ),
                 "mode": "interactive",
                 "prepared_root": str(scene.root),
+                "camera_mapping_mode": scene.camera_mapping_mode,
                 "robot": {
                     "urdf": str(scene.g1_urdf),
                     "articulation_path": robot_path,
@@ -2037,14 +1927,13 @@ def render(args: argparse.Namespace) -> dict[str, object]:
                     "trajectory_source": (
                         "episode_data.npz joint_positions/root_pose_xyzw"
                     ),
-                    "visual_visibility": {
-                        "source": "episode_data.npz robot_arm_render",
-                        "visible_frames": int(
-                            scene.robot_arm_render.sum()
+                    "render_visibility": {
+                        "mode": "always_enabled",
+                        "decision_source": (
+                            "capture_camera_frustum_and_depth_test"
                         ),
-                        "hidden_frames": int(
-                            (~scene.robot_arm_render).sum()
-                        ),
+                        "enabled_frames": scene.frame_count,
+                        "disabled_frames": 0,
                     },
                     "articulation_commit": (
                         articulation_commit_report()
@@ -2083,9 +1972,6 @@ def render(args: argparse.Namespace) -> dict[str, object]:
                 },
                 "capture_camera": capture_camera_report,
                 "articulation_commit": articulation_commit_report(),
-                "scene_alignment": scene_alignment_report,
-                "scene_placement": scene_placement_report,
-                "operation_order": scene_operation_order,
                 "elapsed_seconds": time.perf_counter() - started,
             }
             print(json.dumps(report, indent=2), flush=True)
@@ -2160,13 +2046,14 @@ def render(args: argparse.Namespace) -> dict[str, object]:
             / float(scene.mesh_size[0] * scene.mesh_size[1])
         )
         report: dict[str, object] = {
-            "schema_version": 3,
+            "schema_version": 4,
             "method": (
                 "video-depth-anything-dynamic-rgbd-mesh"
                 "-plus-g1-articulation"
             ),
             "renderer": "Isaac Sim 5.1 RaytracedLighting",
             "prepared_root": str(scene.root),
+            "camera_mapping_mode": scene.camera_mapping_mode,
             "output_video": str(output_video),
             "robot": {
                 "urdf": str(scene.g1_urdf),
@@ -2175,10 +2062,13 @@ def render(args: argparse.Namespace) -> dict[str, object]:
                 "trajectory_source": (
                     "episode_data.npz joint_positions/root_pose_xyzw"
                 ),
-                "visual_visibility": {
-                    "source": "episode_data.npz robot_arm_render",
-                    "visible_frames": int(scene.robot_arm_render.sum()),
-                    "hidden_frames": int((~scene.robot_arm_render).sum()),
+                "render_visibility": {
+                    "mode": "always_enabled",
+                    "decision_source": (
+                        "capture_camera_frustum_and_depth_test"
+                    ),
+                    "enabled_frames": scene.frame_count,
+                    "disabled_frames": 0,
                 },
                 "articulation_commit": articulation_commit_report(),
             },
@@ -2204,31 +2094,13 @@ def render(args: argparse.Namespace) -> dict[str, object]:
             "render_intrinsic": render_intrinsic.tolist(),
             "render_intrinsic_source": render_intrinsic_source,
             "capture_distortion": D435_DISTORTION.tolist(),
-            "mesh_pose_source": (
-                mesh_pose_source
-                + (
-                    " plus one constant world translation using the "
-                    f"initial {scene_anchor_description}"
-                    if scene_anchor_description is not None
-                    else ""
-                )
-            ),
+            "mesh_pose_source": mesh_pose_source,
             "camera_axes": "mesh poses are OpenCV world-from-camera",
-            "scene_alignment": scene_alignment_report,
-            "scene_placement": scene_placement_report,
-            "operation_order": scene_operation_order,
             "capture_camera": capture_camera_report,
             "articulation_commit": articulation_commit_report(),
             "scene_bounds_xyz_m": {
                 "min": scan.bounds_min.tolist(),
                 "max": scan.bounds_max.tolist(),
-                "before_hand_anchor_translation_min": (
-                    scan.bounds_min - scene_translation_world
-                ).tolist(),
-                "before_hand_anchor_translation_max": (
-                    scan.bounds_max - scene_translation_world
-                ).tolist(),
-                "before_hand_anchor_translation_note": None,
             },
             "depth_unit": "uint16 millimeters",
             "depth_edge_thresholds": {
@@ -2319,17 +2191,6 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Fixed --capture-view scene or initial interactive target; "
             "default is bounds center"
-        ),
-    )
-    parser.add_argument(
-        "--scene-alignment",
-        choices=("initial-palms", "none"),
-        default="none",
-        help=(
-            "At replay start, place the complete scene with one "
-            "source/G1 bilateral semantic-anchor XYZ translation: "
-            "tracked Hand palms for initial-palms, or keep the prepared "
-            "global camera unchanged (default: none; Nymeria requires none)"
         ),
     )
     parser.add_argument(

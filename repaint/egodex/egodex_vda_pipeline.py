@@ -18,6 +18,7 @@ import sys
 import time
 from typing import Any, Iterable, Sequence
 
+import numpy as np
 from tqdm import tqdm
 
 _write_notice = tqdm.write
@@ -28,9 +29,8 @@ if str(WORKSPACE_ROOT) not in sys.path:
     sys.path.insert(0, str(WORKSPACE_ROOT))
 
 from repaint.lighting_profile import load_lighting_profile  # noqa: E402
-from repaint.scene_hand_alignment import (  # noqa: E402
-    PALM_ALIGNMENT_METHOD,
-    PALM_ALIGNMENT_STAGE,
+from repaint.robot_camera import (  # noqa: E402
+    TORSO_ANCHORED_CAMERA_MAPPING,
 )
 from repaint.vda_pipeline_common import (  # noqa: E402
     VideoMetadata,
@@ -45,6 +45,9 @@ from repaint.vda_pipeline_common import (  # noqa: E402
     utc_now as _utc_now,
     write_json_atomic as _write_json_atomic,
 )
+from repaint.vda_scene_isaac import (  # noqa: E402
+    _validate_torso_anchored_camera_chain,
+)
 
 DEFAULT_TASKS = (
     "basic_pick_place",
@@ -56,9 +59,6 @@ VIDEO_KEY = "observation.images.ego"
 LEROBOT_CHUNKS_SIZE = 1000
 REFERENCE_SIZE = (640, 480)
 RESET_GUARD_X_M = 0.005
-SCENE_GEOMETRY_OPERATION_ORDER = (
-    PALM_ALIGNMENT_STAGE,
-)
 
 
 @dataclass(frozen=True)
@@ -104,7 +104,6 @@ class PipelineConfig:
     overwrite: bool = False
     headless: bool = True
     retain_intermediates: bool = False
-    scene_scale: float | None = None
     vda_checkpoint: Path | None = None
     poll_seconds: float = 0.5
 
@@ -254,10 +253,6 @@ def build_task_plan(task: str, config: PipelineConfig) -> TaskPlan:
             "--output",
             prepared_root,
         ]
-        if config.scene_scale is not None:
-            prepare_arguments.extend(
-                ["--scene-scale", repr(float(config.scene_scale))]
-            )
         if config.vda_checkpoint is not None:
             prepare_arguments.extend(
                 ["--vda-checkpoint", config.vda_checkpoint]
@@ -289,8 +284,6 @@ def build_task_plan(task: str, config: PipelineConfig) -> TaskPlan:
             output_video,
             "--capture-view",
             "robot-camera",
-            "--scene-alignment",
-            "initial-palms",
             "--headless" if config.headless else "--no-headless",
         ]
         stages.append(
@@ -338,10 +331,10 @@ def _final_video_path(plan: TaskPlan, episode_index: int) -> Path:
 def _validate_retarget(plan: TaskPlan) -> None:
     info = _read_json_object(plan.paths.lerobot / "meta/info.json")
     manifest = _read_json_object(plan.paths.lerobot / "meta/egodex.json")
-    if int(manifest.get("schema_version", -1)) < 6:
+    if int(manifest.get("schema_version", -1)) != 9:
         raise ValueError(
-            "LeRobot EgoDex manifest predates complete-O6 GMR and must be "
-            "regenerated"
+            "LeRobot EgoDex manifest predates the torso-anchored camera "
+            "mapping and must be regenerated"
         )
     if manifest.get("hand_target_adapter") != (
         "tracked Hand pose -> fixed side-specific local-axis map -> "
@@ -396,6 +389,22 @@ def _validate_retarget(plan: TaskPlan) -> None:
     chunks_size = int(info.get("chunks_size", 1000))
     if chunks_size <= 0:
         raise ValueError("LeRobot chunks_size must be positive")
+    features = info.get("features")
+    camera_local_feature = (
+        features.get("observation.source_camera_pose_in_spine3_xyzw")
+        if isinstance(features, dict)
+        else None
+    )
+    if (
+        not isinstance(camera_local_feature, dict)
+        or camera_local_feature.get("dtype") != "float32"
+        or camera_local_feature.get("shape") != [7]
+        or camera_local_feature.get("names")
+        != ["x", "y", "z", "qx", "qy", "qz", "qw"]
+    ):
+        raise ValueError(
+            "LeRobot EgoDex schema lacks source camera-in-spine3 poses"
+        )
 
     for source, recorded in zip(plan.episodes, manifest_episodes, strict=True):
         if int(recorded.get("episode_index", -1)) != source.episode_index:
@@ -404,6 +413,41 @@ def _validate_retarget(plan: TaskPlan) -> None:
             raise ValueError("LeRobot source_stem differs from the source task")
         if int(recorded.get("frame_count", -1)) != source.video.frame_count:
             raise ValueError("LeRobot frame_count differs from source MP4")
+        if recorded.get("mapping_mode") != TORSO_ANCHORED_CAMERA_MAPPING:
+            raise ValueError("LeRobot EgoDex camera mapping is obsolete")
+        if (
+            recorded.get("local_basis_source")
+            != (
+                "frame0_source_spine3_axes_mapped_through_initial_"
+                "egodex_hip_world_basis_into_g1_torso_fk"
+            )
+            or int(
+                recorded.get(
+                    "local_basis_reference_frame",
+                    -1,
+                )
+            )
+            != 0
+        ):
+            raise ValueError("LeRobot EgoDex local-basis provenance is invalid")
+        rotation = np.asarray(
+            recorded.get("source_spine3_to_robot_torso_rotation"),
+            dtype=np.float64,
+        )
+        if (
+            rotation.shape != (3, 3)
+            or not np.isfinite(rotation).all()
+            or not np.allclose(rotation @ rotation.T, np.eye(3), atol=1e-5)
+            or np.linalg.det(rotation) < 0.999
+        ):
+            raise ValueError(
+                "LeRobot EgoDex spine3-to-torso basis is invalid"
+            )
+        scale = float(recorded.get("scene_scale", 0.0))
+        if not math.isfinite(scale) or scale <= 0.0:
+            raise ValueError("LeRobot EgoDex scene_scale is invalid")
+        if recorded.get("scene_scale_source") != "gmr_spine3_scale":
+            raise ValueError("LeRobot EgoDex scene_scale source is obsolete")
         chunk_index = source.episode_index // chunks_size
         file_index = source.episode_index % chunks_size
         copied_video = (
@@ -522,8 +566,6 @@ def _numbered_png_count(path: Path) -> int:
 
 
 def _validate_prepared(stage: Stage, plan: TaskPlan) -> None:
-    import numpy as np
-
     source = _episode_for_stage(stage, plan)
     root = plan.paths.prepared / f"episode_{source.episode_index:06d}"
     archive_path = root / "episode_data.npz"
@@ -546,6 +588,31 @@ def _validate_prepared(stage: Stage, plan: TaskPlan) -> None:
             int(value) for value in np.asarray(archive["source_size"]).tolist()
         )
         fps = float(archive["fps"])
+        mapping_mode = str(np.asarray(archive["camera_mapping_mode"]).item())
+        if mapping_mode != TORSO_ANCHORED_CAMERA_MAPPING:
+            raise ValueError("Prepared EgoDex camera mapping is obsolete")
+        _validate_torso_anchored_camera_chain(
+            camera_poses_cv_xyzw=archive["camera_pose_cv_xyzw"],
+            source_camera_pose_in_spine3_xyzw=archive[
+                "source_camera_pose_in_spine3_xyzw"
+            ],
+            source_spine3_to_robot_torso_rotation=archive[
+                "source_spine3_to_robot_torso_rotation"
+            ],
+            scene_scale=float(archive["scene_scale"]),
+            g1_urdf=Path(str(np.asarray(archive["g1_urdf"]).item())),
+            joint_names=tuple(
+                str(value) for value in archive["joint_names"].tolist()
+            ),
+            joint_positions=archive["joint_positions"],
+            root_poses_xyzw=archive["root_pose_xyzw"],
+        )
+    camera_report = prepare_report.get("camera")
+    if (
+        not isinstance(camera_report, dict)
+        or camera_report.get("mapping_mode") != mapping_mode
+    ):
+        raise ValueError("Prepared EgoDex camera report is obsolete")
     if len(frame_indices) != source.video.frame_count:
         raise ValueError("Prepared frame count differs from source MP4")
     if not np.array_equal(
@@ -580,8 +647,10 @@ def _validate_render(stage: Stage, plan: TaskPlan) -> None:
         )
     if str(report.get("capture_view")) != "robot-camera":
         raise ValueError("Final Isaac report is not a robot-camera capture")
+    if report.get("camera_mapping_mode") != TORSO_ANCHORED_CAMERA_MAPPING:
+        raise ValueError("Final EgoDex camera mapping is obsolete")
     if not str(report.get("mesh_pose_source", "")).startswith(
-        "prepared virtual source-camera pose backprojection independent"
+        "prepared source spine3-to-camera local pose transferred onto G1"
     ):
         raise ValueError("Final RGB-D camera was coupled to the G1 camera")
     if int(report.get("frame_count", -1)) != source.video.frame_count:
@@ -689,126 +758,6 @@ def _validate_render(stage: Stage, plan: TaskPlan) -> None:
         raise ValueError(
             "Isaac physics step did not advance before every rendered frame"
         )
-
-    if tuple(report.get("operation_order", ())) != (
-        SCENE_GEOMETRY_OPERATION_ORDER
-    ):
-        raise ValueError(
-            "Final Isaac scene operation_order must contain only "
-            "tracked-Hand palm placement"
-        )
-    scene_alignment = report.get("scene_alignment")
-    if not isinstance(scene_alignment, dict):
-        raise ValueError("Final Isaac report has no scene-alignment audit")
-    if int(scene_alignment.get("schema_version", -1)) < 2:
-        raise ValueError("Final Isaac scene-alignment audit schema is obsolete")
-    if scene_alignment.get("method") != PALM_ALIGNMENT_METHOD:
-        raise ValueError(
-            "Final Isaac scene did not use tracked-Hand palm alignment"
-        )
-    if int(scene_alignment.get("pipeline_order", -1)) != 1:
-        raise ValueError("Tracked-palm placement is not pipeline operation 1")
-    if int(scene_alignment.get("application_count", -1)) != 1:
-        raise ValueError("Scene alignment must apply one constant translation")
-    if (
-        scene_alignment.get("fits_rotation") is not False
-        or scene_alignment.get("fits_scale") is not False
-    ):
-        raise ValueError(
-            "Tracked-palm scene alignment must fit only a translation"
-        )
-    translation = scene_alignment.get("world_translation_xyz_m")
-    if (
-        not isinstance(translation, (list, tuple))
-        or len(translation) != 3
-    ):
-        raise ValueError("Scene alignment has no constant XYZ translation")
-    try:
-        translation_xyz = tuple(float(value) for value in translation)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(
-            "Scene alignment XYZ translation is not numeric"
-        ) from exc
-    if not all(math.isfinite(value) for value in translation_xyz):
-        raise ValueError("Scene alignment XYZ translation is not finite")
-    try:
-        reported_translation_z = float(
-            scene_alignment.get("world_translation_z_m", float("nan"))
-        )
-    except (TypeError, ValueError) as exc:
-        raise ValueError(
-            "Scene alignment world_translation_z_m is not numeric"
-        ) from exc
-    if (
-        not math.isfinite(reported_translation_z)
-        or abs(reported_translation_z - translation_xyz[2]) > 1e-9
-    ):
-        raise ValueError(
-            "Scene alignment world_translation_z_m disagrees with its "
-            "constant translation"
-        )
-    anchor_semantics = scene_alignment.get("anchor_semantics")
-    if not isinstance(anchor_semantics, dict):
-        raise ValueError("Scene alignment has no anchor-semantics audit")
-    if (
-        anchor_semantics.get("matches_retarget_tracked_hand_palm_targets")
-        is not True
-    ):
-        raise ValueError(
-            "Scene alignment does not use the retarget tracked-Hand palms"
-        )
-    if anchor_semantics.get("uses_hand_base_origins") is not False:
-        raise ValueError("Scene alignment must not use hand-base origins")
-    if anchor_semantics.get("uses_source_wrist_origins") is not True:
-        raise ValueError("Scene alignment must use tracked Hand wrist roots")
-    if anchor_semantics.get("uses_fingertips") is not False:
-        raise ValueError("Scene alignment must not use fingertip anchors")
-    height_policy = scene_alignment.get("height_policy")
-    if not isinstance(height_policy, str):
-        raise ValueError("Scene alignment has no explicit height policy")
-    normalized_height_policy = height_policy.lower()
-    if "same 3-d palm residual" not in normalized_height_policy or (
-        "no fixed" not in normalized_height_policy
-    ):
-        raise ValueError(
-            "Scene alignment height policy must use the same 3-D palm "
-            "residual with no fixed scene height"
-        )
-
-    scene_placement = report.get("scene_placement")
-    if not isinstance(scene_placement, dict):
-        raise ValueError("Final Isaac report has no scene-placement audit")
-    if tuple(scene_placement.get("operation_order", ())) != (
-        SCENE_GEOMETRY_OPERATION_ORDER
-    ):
-        raise ValueError(
-            "Scene-placement operation order differs from the top-level "
-            "anchor-only contract"
-        )
-    if int(scene_placement.get("application_count", -1)) != 1:
-        raise ValueError("Scene placement did not apply exactly one anchor")
-    try:
-        placement_translation = tuple(
-            float(value)
-            for value in scene_placement.get(
-                "anchor_translation_world_xyz_m",
-                (),
-            )
-        )
-    except (TypeError, ValueError) as exc:
-        raise ValueError("Scene-placement translation is not numeric") from exc
-    if (
-        len(placement_translation) != 3
-        or not all(math.isfinite(value) for value in placement_translation)
-        or any(
-            abs(placement_translation[axis] - translation_xyz[axis]) > 1e-9
-            for axis in range(3)
-        )
-    ):
-        raise ValueError(
-            "Scene-placement translation differs from scene alignment"
-        )
-
 
 def validate_stage_artifacts(stage: Stage, plan: TaskPlan) -> tuple[bool, str]:
     """Validate a stage's complete output, returning a resume-safe reason."""
@@ -945,6 +894,7 @@ def _new_report(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
             "egodex_to_robot -> remove_hands -> rgbd_prepare(VDA) "
             "-> vda_scene_isaac(robot-camera)"
         ),
+        "camera_mapping_mode": TORSO_ANCHORED_CAMERA_MAPPING,
         "task": plan.task,
         "status": "running",
         "source_root": str(plan.source_root),
@@ -965,9 +915,11 @@ def _new_report(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
             "LeRobot, handless, prepared, and final artifacts are retained"
             if config.retain_intermediates
             else (
-                "handless and prepared episode artifacts are removed after "
-                "render; only LeRobot, final outputs, and this report are "
-                "retained; failed prepare/render inputs are retained for retry"
+                "handless and prepared episode artifacts are permanently "
+                "deleted after each successful render directly from the "
+                "filesystem, never moved to desktop Trash; only LeRobot, "
+                "final outputs, and this report are retained; failed "
+                "prepare/render inputs are retained for retry"
             )
         ),
         "video_metadata_policy": {
@@ -981,8 +933,8 @@ def _new_report(plan: TaskPlan, config: PipelineConfig) -> dict[str, Any]:
                 "letterboxed into the source-sized output"
             ),
             "mesh_projection_camera": (
-                "prepared virtual source camera rigidly following the G1 "
-                "capture camera through one fixed initial extrinsic"
+                "source spine3-to-camera local pose transferred onto G1 "
+                "torso FK; no render-time alignment"
             ),
             "trajectory_commit_validation": (
                 "every G1 joint/root write is read back from Isaac"
@@ -1830,7 +1782,6 @@ def _config_from_args(args: argparse.Namespace) -> PipelineConfig:
         resume=True,
         overwrite=False,
         headless=bool(args.headless),
-        scene_scale=None,
         vda_checkpoint=None,
         poll_seconds=0.5,
     )

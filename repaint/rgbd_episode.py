@@ -9,15 +9,19 @@ from typing import Any
 import h5py
 import numpy as np
 import pyarrow.parquet as pq
-from scipy.signal import savgol_filter
 from scipy.spatial.transform import Rotation
 
+from repaint.robot_camera import (
+    HEAD_CAMERA_PARENT_FRAME,
+    TORSO_ANCHORED_CAMERA_MAPPING,
+    robot_frame_poses_world,
+    torso_anchored_camera_poses_cv,
+)
 from repaint.vda_pipeline_common import probe_video, read_json as _read_json
 
 
 VIDEO_FEATURE = "observation.images.ego"
-SUPPORTED_FIELDS = ("observation.state", "action")
-SMOOTH_WINDOW = 7
+TRAJECTORY_FIELD = "observation.state"
 
 
 @dataclass(frozen=True)
@@ -37,12 +41,10 @@ class RgbdEpisode:
     joint_positions: np.ndarray
     root_pose_xyzw: np.ndarray
     camera_pose_cv_xyzw: np.ndarray
-    source_camera_pose_cv_xyzw: np.ndarray
-    recorded_camera_pose_cv_xyzw: np.ndarray
+    source_camera_pose_in_spine3_xyzw: np.ndarray
     intrinsic: np.ndarray
     scene_scale: float
-    recorded_scene_scale: float
-    source_to_robot_rotation: np.ndarray
+    source_spine3_to_robot_torso_rotation: np.ndarray
 
     @property
     def frame_count(self) -> int:
@@ -87,6 +89,8 @@ def _one_egodex_source_episode(
     if not manifest_path.is_file():
         raise FileNotFoundError(manifest_path)
     metadata = _read_json(manifest_path)
+    if int(metadata.get("schema_version", -1)) != 9:
+        raise ValueError("EgoDex manifest predates torso-anchored cameras")
     matching = [
         episode
         for episode in metadata.get("episodes", [])
@@ -109,21 +113,6 @@ def _video_metadata(path: Path) -> tuple[int, int, int, float]:
     )
 
 
-def _smooth_points(points: np.ndarray) -> np.ndarray:
-    points = np.asarray(points, dtype=np.float64)
-    if not np.isfinite(points).all():
-        raise ValueError("Track positions must be finite")
-    if len(points) < SMOOTH_WINDOW:
-        return points
-    return savgol_filter(
-        points,
-        window_length=SMOOTH_WINDOW,
-        polyorder=2,
-        axis=0,
-        mode="interp",
-    )
-
-
 def _manifest_path(
     value: object,
     *,
@@ -135,93 +124,20 @@ def _manifest_path(
     return path.resolve()
 
 
-def _mapped_camera_poses(
-    *,
-    root_positions: np.ndarray,
-    source_camera_to_world: np.ndarray,
-    source_hip_to_world: np.ndarray,
-    source_to_robot_rotation: np.ndarray,
-    scene_scale: float,
-) -> np.ndarray:
-    relative = (
-        source_camera_to_world[:, :3, 3]
-        - source_hip_to_world[:, :3, 3]
-    )
-    mapped_position = (
-        root_positions
-        + scene_scale
-        * (source_to_robot_rotation @ relative.T).T
-    )
-    mapped_rotation = np.einsum(
-        "ij,njk->nik",
-        source_to_robot_rotation,
-        source_camera_to_world[:, :3, :3],
-    )
-    quaternions = Rotation.from_matrix(mapped_rotation).as_quat()
-    for index in range(1, len(quaternions)):
-        if np.dot(quaternions[index - 1], quaternions[index]) < 0.0:
-            quaternions[index] *= -1.0
-    return np.concatenate([mapped_position, quaternions], axis=1)
-
-
-def _mapped_nymeria_camera_poses(
-    *,
-    source_camera_to_world: np.ndarray,
-    source_to_robot_rotation: np.ndarray,
-    source_to_robot_translation: np.ndarray,
-    scene_scale: float,
-) -> np.ndarray:
-    mapped_position = (
-        scene_scale
-        * (
-            source_to_robot_rotation
-            @ source_camera_to_world[:, :3, 3].T
-        ).T
-        + source_to_robot_translation
-    )
-    mapped_rotation = np.einsum(
-        "ij,njk->nik",
-        source_to_robot_rotation,
-        source_camera_to_world[:, :3, :3],
-    )
-    return np.concatenate(
-        [mapped_position, Rotation.from_matrix(mapped_rotation).as_quat()],
-        axis=1,
-    )
-
-
-def _resolve_scene_scale(
-    *,
-    recorded_scene_scale: float,
-    override: float | None,
-) -> float:
-    """Use retarget metadata unless the caller explicitly overrides it."""
-
-    resolved = (
-        float(recorded_scene_scale)
-        if override is None
-        else float(override)
-    )
-    if not np.isfinite(resolved) or resolved <= 0.0:
-        raise ValueError("scene_scale must be positive and finite")
-    return resolved
-
-
 def _load_nymeria_robot_episode(
     *,
     dataset_root: Path,
     source_root: Path,
     removed_root: Path,
     episode_index: int,
-    field: str,
     start_frame: int,
     end_frame: int | None,
-    scene_scale: float | None,
 ) -> RgbdEpisode:
-    if field != "observation.state":
-        raise ValueError("Native Nymeria trajectories contain state, not action")
     manifest = _read_json(dataset_root / "manifest.json")
-    if manifest.get("format") != "nymeria-g1-trajectory-v1":
+    if (
+        manifest.get("format") != "nymeria-g1-trajectory-v1"
+        or int(manifest.get("schema_version", -1)) != 3
+    ):
         raise ValueError("Unsupported Nymeria robot trajectory format")
     matching = [
         item
@@ -237,35 +153,16 @@ def _load_nymeria_robot_episode(
     alignment = episode.get("camera_alignment")
     if not isinstance(alignment, dict) or alignment.get("status") != "validated":
         raise ValueError(f"Nymeria episode {episode_index} lacks camera alignment")
-    recorded_scene_scale = float(
-        alignment["source_to_robot_camera_translation_scale"]
-    )
+    scene_scale = float(alignment["scene_scale"])
     mapping_mode = str(alignment.get("mapping_mode", ""))
-    if mapping_mode != "shared_global_similarity_with_hip_root_anchor":
+    if mapping_mode != TORSO_ANCHORED_CAMERA_MAPPING:
         raise ValueError(f"Unsupported Nymeria camera mapping: {mapping_mode}")
-    resolved_scene_scale = _resolve_scene_scale(
-        recorded_scene_scale=recorded_scene_scale,
-        override=scene_scale,
+    source_spine3_to_robot_torso_rotation = np.asarray(
+        alignment["source_spine3_to_robot_torso_rotation"],
+        dtype=np.float64,
     )
-    source_to_robot_rotation = np.asarray(
-        alignment["source_to_robot_rotation"], dtype=np.float64
-    )
-    source_to_robot_translation = np.asarray(
-        alignment["source_to_robot_translation"], dtype=np.float64
-    )
-    if (
-        source_to_robot_rotation.shape != (3, 3)
-        or source_to_robot_translation.shape != (3,)
-    ):
-        raise ValueError("Nymeria source-to-robot transform is invalid")
-    if scene_scale is not None and not np.isclose(
-        resolved_scene_scale, recorded_scene_scale
-    ):
-        raise ValueError(
-            "Nymeria shared-global scale cannot be overridden without "
-            "reretargeting the G1 root"
-        )
-
+    if source_spine3_to_robot_torso_rotation.shape != (3, 3):
+        raise ValueError("Nymeria source-spine3-to-G1-torso basis is invalid")
     trajectory_path = (dataset_root / str(episode["trajectory_path"])).resolve()
     if (
         not trajectory_path.is_relative_to(dataset_root)
@@ -280,6 +177,10 @@ def _load_nymeria_robot_episode(
         recorded_camera_pose = np.asarray(
             trajectory["camera_pose_cv_xyzw"], dtype=np.float64
         )
+        source_camera_pose_in_spine3 = np.asarray(
+            trajectory["source_camera_pose_in_spine3_xyzw"],
+            dtype=np.float64,
+        )
         intrinsic = np.asarray(trajectory["camera_intrinsic"], dtype=np.float64)
         frame_indices = np.asarray(trajectory["frame_indices"], dtype=np.int64)
     joint_names = tuple(str(name) for name in manifest.get("joint_names", ()))
@@ -289,8 +190,19 @@ def _load_nymeria_robot_episode(
         or joint_positions.shape != (length, len(joint_names))
         or root_pose.shape != (length, 7)
         or recorded_camera_pose.shape != (length, 7)
+        or source_camera_pose_in_spine3.shape != (length, 7)
         or intrinsic.shape != (3, 3)
         or not np.array_equal(frame_indices, np.arange(length))
+        or not all(
+            np.isfinite(values).all()
+            for values in (
+                joint_positions,
+                root_pose,
+                recorded_camera_pose,
+                source_camera_pose_in_spine3,
+                intrinsic,
+            )
+        )
     ):
         raise ValueError(f"Nymeria episode {episode_index} trajectory is invalid")
     stop = length if end_frame is None else end_frame
@@ -314,39 +226,43 @@ def _load_nymeria_robot_episode(
 
     with h5py.File(source_hdf5, "r") as handle:
         source_intrinsic = np.asarray(handle["camera/intrinsic"], dtype=np.float64)
-        source_camera_to_world = np.asarray(
-            handle["transforms/camera"], dtype=np.float64
-        )
-    if (
-        source_camera_to_world.shape != (length, 4, 4)
-        or not np.allclose(source_intrinsic, intrinsic, atol=1e-5)
-    ):
+    if not np.allclose(source_intrinsic, intrinsic, atol=1e-5):
         raise ValueError("Nymeria camera adapter and trajectory disagree")
-    mapped_camera_pose = _mapped_nymeria_camera_poses(
-        source_camera_to_world=source_camera_to_world,
-        source_to_robot_rotation=source_to_robot_rotation,
-        source_to_robot_translation=source_to_robot_translation,
-        scene_scale=resolved_scene_scale,
+    robot_urdf = _manifest_path(
+        manifest["robot_urdf"],
+        source_root=dataset_root,
+    )
+    if not robot_urdf.is_file():
+        raise FileNotFoundError(robot_urdf)
+    robot_torso_poses = robot_frame_poses_world(
+        urdf_path=robot_urdf,
+        joint_names=joint_names,
+        joint_positions=joint_positions,
+        root_pose_xyzw=root_pose,
+        frame_name=HEAD_CAMERA_PARENT_FRAME,
+    )
+    mapped_camera_pose = torso_anchored_camera_poses_cv(
+        source_camera_pose_in_spine3_xyzw=(
+            source_camera_pose_in_spine3
+        ),
+        robot_torso_pose_world_xyzw=robot_torso_poses,
+        source_spine3_to_robot_torso_rotation=(
+            source_spine3_to_robot_torso_rotation
+        ),
+        scene_scale=scene_scale,
     )
     rotation_error = (
         Rotation.from_quat(mapped_camera_pose[:, 3:7]).inv()
         * Rotation.from_quat(recorded_camera_pose[:, 3:7])
     ).magnitude()
     if float(np.max(rotation_error)) > 1e-5:
-        raise ValueError("Mapped and recorded Nymeria camera rotations disagree")
+        raise ValueError("Torso-anchored and recorded Nymeria rotations disagree")
     position_error = np.linalg.norm(
         mapped_camera_pose[:, :3] - recorded_camera_pose[:, :3],
         axis=1,
     )
-    if scene_scale is None and float(np.max(position_error)) > 1e-5:
-        raise ValueError("Mapped and recorded Nymeria camera positions disagree")
-    source_camera_pose = np.concatenate(
-        [
-            source_camera_to_world[:, :3, 3],
-            Rotation.from_matrix(source_camera_to_world[:, :3, :3]).as_quat(),
-        ],
-        axis=1,
-    )
+    if float(np.max(position_error)) > 1e-5:
+        raise ValueError("Torso-anchored and recorded Nymeria positions disagree")
     selection = slice(start_frame, stop)
     return RgbdEpisode(
         dataset_root=dataset_root,
@@ -363,13 +279,15 @@ def _load_nymeria_robot_episode(
         joint_names=joint_names,
         joint_positions=joint_positions[selection],
         root_pose_xyzw=root_pose[selection],
-        camera_pose_cv_xyzw=mapped_camera_pose[selection],
-        source_camera_pose_cv_xyzw=source_camera_pose[selection],
-        recorded_camera_pose_cv_xyzw=recorded_camera_pose[selection],
+        camera_pose_cv_xyzw=recorded_camera_pose[selection],
+        source_camera_pose_in_spine3_xyzw=(
+            source_camera_pose_in_spine3[selection]
+        ),
         intrinsic=source_intrinsic,
-        scene_scale=resolved_scene_scale,
-        recorded_scene_scale=recorded_scene_scale,
-        source_to_robot_rotation=source_to_robot_rotation,
+        scene_scale=scene_scale,
+        source_spine3_to_robot_torso_rotation=(
+            source_spine3_to_robot_torso_rotation
+        ),
     )
 
 
@@ -379,10 +297,8 @@ def load_rgbd_episode(
     source_root: Path,
     removed_root: Path,
     episode_index: int,
-    field: str = "observation.state",
     start_frame: int = 0,
     end_frame: int | None = None,
-    scene_scale: float | None = None,
 ) -> RgbdEpisode:
     """Load aligned robot/camera data without invoking the legacy pipeline."""
 
@@ -395,37 +311,30 @@ def load_rgbd_episode(
             source_root=source_root,
             removed_root=removed_root,
             episode_index=episode_index,
-            field=field,
             start_frame=start_frame,
             end_frame=end_frame,
-            scene_scale=scene_scale,
         )
-    if field not in SUPPORTED_FIELDS:
-        raise ValueError(f"Unsupported trajectory field: {field}")
 
     info = _read_json(dataset_root / "meta/info.json")
-    feature = info.get("features", {}).get(field)
+    feature = info.get("features", {}).get(TRAJECTORY_FIELD)
     if not isinstance(feature, dict):
-        raise KeyError(f"Dataset has no {field!r} feature")
+        raise KeyError(f"Dataset has no {TRAJECTORY_FIELD!r} feature")
     joint_names = tuple(str(name) for name in feature.get("names", ()))
     if not joint_names:
-        raise ValueError(f"{field!r} has no joint names")
+        raise ValueError(f"{TRAJECTORY_FIELD!r} has no joint names")
 
     episode_row = _one_episode_row(dataset_root, episode_index)
     source_episode = _one_egodex_source_episode(
         dataset_root,
         episode_index,
     )
-    recorded_scene_scale = float(
-        source_episode["source_to_robot_camera_translation_scale"]
-    )
-    source_to_robot_rotation = np.asarray(
-        source_episode["source_to_robot_rotation"],
+    mapping_mode = str(source_episode.get("mapping_mode", ""))
+    if mapping_mode != TORSO_ANCHORED_CAMERA_MAPPING:
+        raise ValueError(f"Unsupported EgoDex camera mapping: {mapping_mode}")
+    scene_scale = float(source_episode["scene_scale"])
+    source_spine3_to_robot_torso_rotation = np.asarray(
+        source_episode["source_spine3_to_robot_torso_rotation"],
         dtype=np.float64,
-    )
-    resolved_scene_scale = _resolve_scene_scale(
-        recorded_scene_scale=recorded_scene_scale,
-        override=scene_scale,
     )
     length = int(episode_row["length"])
     stop = length if end_frame is None else end_frame
@@ -442,10 +351,11 @@ def load_rgbd_episode(
     table = pq.read_table(
         data_path,
         columns=[
-            field,
+            TRAJECTORY_FIELD,
             "observation.root_pose",
             "observation.camera_pose",
             "observation.camera_intrinsics",
+            "observation.source_camera_pose_in_spine3_xyzw",
             "episode_index",
             "frame_index",
         ],
@@ -466,7 +376,7 @@ def load_rgbd_episode(
         raise ValueError(f"Episode {episode_index} frames are not contiguous")
 
     joint_positions = np.asarray(
-        table[field].to_pylist(),
+        table[TRAJECTORY_FIELD].to_pylist(),
         dtype=np.float64,
     )[selected_rows]
     root_pose = np.asarray(
@@ -475,6 +385,10 @@ def load_rgbd_episode(
     )[selected_rows]
     recorded_camera_pose = np.asarray(
         table["observation.camera_pose"].to_pylist(),
+        dtype=np.float64,
+    )[selected_rows]
+    source_camera_pose_in_spine3 = np.asarray(
+        table["observation.source_camera_pose_in_spine3_xyzw"].to_pylist(),
         dtype=np.float64,
     )[selected_rows]
     intrinsics = np.asarray(
@@ -521,33 +435,38 @@ def load_rgbd_episode(
             handle["camera/intrinsic"],
             dtype=np.float64,
         )
-        source_camera_to_world = np.asarray(
-            handle["transforms/camera"],
-            dtype=np.float64,
-        )
-        source_hip_to_world = np.asarray(
-            handle["transforms/hip"], dtype=np.float64
-        )
-    source_hip_to_world = source_hip_to_world.copy()
-    source_hip_to_world[:, :3, 3] = _smooth_points(
-        source_hip_to_world[:, :3, 3]
-    )
     if not np.allclose(source_intrinsic, intrinsics[0], atol=1e-5):
         raise ValueError("Source and stored camera intrinsics disagree")
-    expected_transform_shape = (length, 4, 4)
-    if source_camera_to_world.shape != expected_transform_shape:
-        raise ValueError("Source camera transform shape is invalid")
-    if source_hip_to_world.shape != expected_transform_shape:
-        raise ValueError("Source hip transform shape is invalid")
-
-    if source_to_robot_rotation.shape != (3, 3):
-        raise ValueError("source_to_robot_rotation must be 3x3")
-    mapped_camera_pose = _mapped_camera_poses(
-        root_positions=root_pose[:, :3],
-        source_camera_to_world=source_camera_to_world,
-        source_hip_to_world=source_hip_to_world,
-        source_to_robot_rotation=source_to_robot_rotation,
-        scene_scale=resolved_scene_scale,
+    if source_spine3_to_robot_torso_rotation.shape != (3, 3):
+        raise ValueError("EgoDex source-spine3-to-G1-torso basis is invalid")
+    if source_camera_pose_in_spine3.shape != (length, 7) or not np.isfinite(
+        source_camera_pose_in_spine3
+    ).all():
+        raise ValueError("EgoDex source camera-in-spine3 poses are invalid")
+    egodex_manifest = _read_json(dataset_root / "meta/egodex.json")
+    gmr_model = egodex_manifest.get("gmr_robot_model")
+    if not isinstance(gmr_model, dict):
+        raise ValueError("EgoDex manifest has no G1 model provenance")
+    robot_urdf = _manifest_path(
+        gmr_model["source_urdf"],
+        source_root=dataset_root,
+    )
+    robot_torso_poses = robot_frame_poses_world(
+        urdf_path=robot_urdf,
+        joint_names=joint_names,
+        joint_positions=joint_positions,
+        root_pose_xyzw=root_pose,
+        frame_name=HEAD_CAMERA_PARENT_FRAME,
+    )
+    mapped_camera_pose = torso_anchored_camera_poses_cv(
+        source_camera_pose_in_spine3_xyzw=(
+            source_camera_pose_in_spine3
+        ),
+        robot_torso_pose_world_xyzw=robot_torso_poses,
+        source_spine3_to_robot_torso_rotation=(
+            source_spine3_to_robot_torso_rotation
+        ),
+        scene_scale=scene_scale,
     )
     rotation_error = (
         Rotation.from_quat(mapped_camera_pose[:, 3:7]).inv()
@@ -558,27 +477,15 @@ def load_rgbd_episode(
             "Recomputed and recorded camera rotations disagree: "
             f"max={float(np.max(rotation_error)):.6g} rad"
         )
-    if scene_scale is None:
-        position_error = np.linalg.norm(
-            mapped_camera_pose[:, :3] - recorded_camera_pose[:, :3],
-            axis=1,
-        )
-        if float(np.max(position_error)) > 1e-5:
-            raise ValueError(
-                "Recomputed and recorded camera positions disagree: "
-                f"max={float(np.max(position_error)):.6g} m"
-            )
-    source_camera_quaternion = Rotation.from_matrix(
-        source_camera_to_world[:, :3, :3]
-    ).as_quat()
-    source_camera_pose = np.concatenate(
-        [
-            source_camera_to_world[:, :3, 3],
-            source_camera_quaternion,
-        ],
+    position_error = np.linalg.norm(
+        mapped_camera_pose[:, :3] - recorded_camera_pose[:, :3],
         axis=1,
     )
-
+    if float(np.max(position_error)) > 1e-5:
+        raise ValueError(
+            "Recomputed and recorded camera positions disagree: "
+            f"max={float(np.max(position_error)):.6g} m"
+        )
     selection = slice(start_frame, stop)
     return RgbdEpisode(
         dataset_root=dataset_root,
@@ -595,11 +502,13 @@ def load_rgbd_episode(
         joint_names=joint_names,
         joint_positions=joint_positions[selection],
         root_pose_xyzw=root_pose[selection],
-        camera_pose_cv_xyzw=mapped_camera_pose[selection],
-        source_camera_pose_cv_xyzw=source_camera_pose[selection],
-        recorded_camera_pose_cv_xyzw=recorded_camera_pose[selection],
+        camera_pose_cv_xyzw=recorded_camera_pose[selection],
+        source_camera_pose_in_spine3_xyzw=(
+            source_camera_pose_in_spine3[selection]
+        ),
         intrinsic=source_intrinsic,
-        scene_scale=resolved_scene_scale,
-        recorded_scene_scale=recorded_scene_scale,
-        source_to_robot_rotation=source_to_robot_rotation,
+        scene_scale=scene_scale,
+        source_spine3_to_robot_torso_rotation=(
+            source_spine3_to_robot_torso_rotation
+        ),
     )

@@ -82,6 +82,60 @@ class ResampledMotion:
         return int(len(self.timestamps))
 
 
+def frame0_anchored_spine3(
+    *,
+    camera_to_world: np.ndarray,
+    aligned_head_to_world: np.ndarray,
+    motion_head_to_world: np.ndarray,
+    motion_spine3_to_world: np.ndarray,
+) -> np.ndarray:
+    """Keep body-local position while preserving raw Aria head rotation."""
+
+    camera = np.asarray(camera_to_world, dtype=np.float64)
+    aligned_head = np.asarray(aligned_head_to_world, dtype=np.float64)
+    motion_head = np.asarray(motion_head_to_world, dtype=np.float64)
+    motion_spine3 = np.asarray(motion_spine3_to_world, dtype=np.float64)
+    if (
+        camera.ndim != 3
+        or camera.shape[1:] != (4, 4)
+        or aligned_head.shape != camera.shape
+        or motion_head.shape != camera.shape
+        or motion_spine3.shape != camera.shape
+        or not all(
+            np.isfinite(value).all()
+            for value in (camera, aligned_head, motion_head, motion_spine3)
+        )
+    ):
+        raise ValueError("Nymeria camera/body transforms must align")
+
+    per_frame_spine3 = np.einsum(
+        "nij,njk,nkl->nil",
+        aligned_head,
+        np.linalg.inv(motion_head),
+        motion_spine3,
+    )
+    anchored_spine3 = per_frame_spine3.copy()
+    world_from_motion_rotation = (
+        aligned_head[0, :3, :3] @ motion_head[0, :3, :3].T
+    )
+    anchored_spine3[:, :3, :3] = np.einsum(
+        "ij,njk->nik",
+        world_from_motion_rotation,
+        motion_spine3[:, :3, :3],
+    )
+    camera_position_in_spine3 = np.einsum(
+        "nji,nj->ni",
+        per_frame_spine3[:, :3, :3],
+        camera[:, :3, 3] - per_frame_spine3[:, :3, 3],
+    )
+    anchored_spine3[:, :3, 3] = camera[:, :3, 3] - np.einsum(
+        "nij,nj->ni",
+        anchored_spine3[:, :3, :3],
+        camera_position_in_spine3,
+    )
+    return anchored_spine3
+
+
 def _parse_positive_rate(value: str, *, label: str) -> float:
     try:
         rate = float(Fraction(value))

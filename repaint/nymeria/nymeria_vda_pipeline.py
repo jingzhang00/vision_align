@@ -10,9 +10,9 @@ native inputs:
       -> metric Video Depth Anything RGB-D preparation
       -> source-sized Isaac robot-camera replay
 
-Each RGB-D frame follows the raw Aria global camera through one constant Sim(3).
-The same Sim(3) maps the aligned human hip, which anchors the G1 root through a
-fixed hip-to-root transform; the G1 capture camera remains its own FK camera.
+Each RGB-D frame removes the source spine3 pose from Aria, then applies that
+local camera delta to the retargeted G1 torso_link FK pose. The independent G1
+capture camera keeps its fixed physical mount.
 """
 
 from __future__ import annotations
@@ -49,6 +49,7 @@ from repaint.nymeria.nymeria_adapter import (  # noqa: E402
     natural_key,
 )
 from repaint.lighting_profile import load_lighting_profile  # noqa: E402
+from repaint.robot_camera import TORSO_ANCHORED_CAMERA_MAPPING  # noqa: E402
 with redirect_stdout(StringIO()):
     from repaint.nymeria.nymeria_to_robot import (  # noqa: E402
         ROBOT_FORMAT,
@@ -69,6 +70,9 @@ from repaint.vda_pipeline_common import (  # noqa: E402
     total_progress_bar_format,
     utc_now as _utc_now,
     write_json_atomic as _write_json_atomic,
+)
+from repaint.vda_scene_isaac import (  # noqa: E402
+    _validate_torso_anchored_camera_chain,
 )
 
 
@@ -132,7 +136,6 @@ class PipelineConfig:
     resume: bool
     overwrite: bool
     headless: bool
-    scene_scale: float | None
     vda_checkpoint: Path | None
     stop_after: str
     poll_seconds: float
@@ -615,10 +618,6 @@ def build_plan(
                 "--vda-scale-failure-policy",
                 "fixed",
             ]
-            if config.scene_scale is not None:
-                arguments.extend(
-                    ["--scene-scale", repr(config.scene_scale)]
-                )
             if config.vda_checkpoint is not None:
                 arguments.extend(
                     ["--vda-checkpoint", config.vda_checkpoint]
@@ -654,8 +653,6 @@ def build_plan(
                         output_video,
                         "--capture-view",
                         "robot-camera",
-                        "--scene-alignment",
-                        "none",
                         (
                             "--headless"
                             if config.headless
@@ -734,12 +731,24 @@ def _validate_alignment(stage: Stage, plan: PipelinePlan) -> None:
             f"Nymeria alignment report is not complete: "
             f"{report.get('status')!r}"
         )
-    if int(report.get("schema_version", -1)) < 7 or not isinstance(
-        report.get("hand_eye"), dict
-    ):
+    alignment_schema = int(report.get("schema_version", -1))
+    if alignment_schema < 7 or not isinstance(report.get("hand_eye"), dict):
         raise ValueError(
-            "Nymeria alignment predates registered 208-D palm trajectories"
+            "Nymeria alignment predates registered 208-D body trajectories"
         )
+    adapter_contract = report.get("adapter_contract")
+    if alignment_schema >= 8 and (
+        not isinstance(adapter_contract, dict)
+        or "transforms/spine3" not in adapter_contract.get(
+            "body_transform_datasets", ()
+        )
+        or adapter_contract.get("spine3_transform")
+        != (
+            "frame-0 MPS-to-208-D rotation anchor with per-frame "
+            "head-relative camera position"
+        )
+    ):
+        raise ValueError("Nymeria alignment report does not require spine3")
     trajectory = report.get("camera_trajectory")
     if (
         not isinstance(trajectory, dict)
@@ -768,10 +777,24 @@ def _validate_alignment(stage: Stage, plan: PipelinePlan) -> None:
         source = load_source_episode(
             clip.source,
             camera_alignment_root=plan.config.alignment_root,
+            camera_alignment_schema=alignment_schema,
         )
         if source.frame_count != clip.video.frame_count:
             raise ValueError(
                 f"{clip.stem} alignment frame count differs from source video"
+            )
+        expected_spine3_source = (
+            "alignment_hdf5"
+            if alignment_schema >= 8
+            else "derived_from_208d_with_frame0_mps_anchor"
+        )
+        if (
+            source.camera_alignment is None
+            or source.camera_alignment.spine3_source
+            != expected_spine3_source
+        ):
+            raise ValueError(
+                f"{clip.stem} spine3 source does not match alignment schema"
             )
 
 
@@ -782,7 +805,10 @@ def _validate_retarget(
 ) -> None:
     root = plan.config.paths.robot.resolve()
     manifest = _read_json(root / "manifest.json")
-    if manifest.get("format") != ROBOT_FORMAT:
+    if (
+        manifest.get("format") != ROBOT_FORMAT
+        or int(manifest.get("schema_version", -1)) != 3
+    ):
         raise ValueError("Nymeria retarget output is not a native robot trajectory")
     gate = manifest.get("camera_alignment_quality_gate")
     if not isinstance(gate, dict) or gate.get("status") != "passed":
@@ -825,11 +851,23 @@ def _validate_retarget(
         alignment = episode.get("camera_alignment")
         if not isinstance(alignment, dict) or alignment.get("status") != "validated":
             raise ValueError(f"{clip.stem} camera alignment is not validated")
+        if alignment.get("mapping_mode") != TORSO_ANCHORED_CAMERA_MAPPING:
+            raise ValueError(f"{clip.stem} does not use torso-anchored mapping")
         if (
-            alignment.get("mapping_mode")
-            != "shared_global_similarity_with_hip_root_anchor"
+            alignment.get("local_basis_source")
+            != (
+                "frame0_source_spine3_axes_mapped_through_initial_"
+                "human_hip_world_basis_into_g1_torso_fk"
+            )
+            or int(
+                alignment.get(
+                    "local_basis_reference_frame",
+                    -1,
+                )
+            )
+            != 0
         ):
-            raise ValueError(f"{clip.stem} does not use shared-global mapping")
+            raise ValueError(f"{clip.stem} local-basis provenance is invalid")
         adapter = Path(str(alignment.get("adapter_hdf5", ""))).resolve()
         expected_adapter = (
             plan.config.alignment_root / clip.session / f"{clip.stem}.hdf5"
@@ -845,36 +883,24 @@ def _validate_retarget(
                 raise ValueError(f"{clip.stem} camera adapter content changed")
         elif not allow_pruned_alignment:
             raise FileNotFoundError(adapter)
-        if alignment.get("camera_trajectory_report") != recorded_reports[
-            clip.session
-        ]:
-            raise ValueError(f"{clip.stem} camera provenance changed")
-        scale = float(alignment["source_to_robot_camera_translation_scale"])
+        scale = float(alignment["scene_scale"])
         rotation = np.asarray(
-            alignment.get("source_to_robot_rotation"), dtype=np.float64
-        )
-        translation = np.asarray(
-            alignment.get("source_to_robot_translation"), dtype=np.float64
-        )
-        hip_root_rotation = np.asarray(
-            alignment.get("mapped_hip_to_robot_root_rotation"),
-            dtype=np.float64,
-        )
-        hip_root_translation = np.asarray(
-            alignment.get("mapped_hip_to_robot_root_translation"),
+            alignment.get("source_spine3_to_robot_torso_rotation"),
             dtype=np.float64,
         )
         if (
             not math.isfinite(scale)
             or scale <= 0.0
+            or alignment.get("scene_scale_source") != "gmr_spine3_scale"
+            or alignment.get("spine3_source")
+            not in {
+                "alignment_hdf5",
+                "derived_from_208d_with_frame0_mps_anchor",
+            }
             or rotation.shape != (3, 3)
-            or translation.shape != (3,)
-            or hip_root_rotation.shape != (3, 3)
-            or hip_root_translation.shape != (3,)
             or not np.isfinite(rotation).all()
-            or not np.isfinite(translation).all()
-            or not np.isfinite(hip_root_rotation).all()
-            or not np.isfinite(hip_root_translation).all()
+            or not np.allclose(rotation @ rotation.T, np.eye(3), atol=1e-5)
+            or np.linalg.det(rotation) < 0.999
         ):
             raise ValueError(f"{clip.stem} has an invalid camera transform")
 
@@ -887,6 +913,7 @@ def _validate_retarget(
                 "joint_positions": (length, len(joint_names)),
                 "root_pose_xyzw": (length, 7),
                 "camera_pose_cv_xyzw": (length, 7),
+                "source_camera_pose_in_spine3_xyzw": (length, 7),
                 "camera_intrinsic": (3, 3),
                 "frame_indices": (length,),
                 "timestamps": (length,),
@@ -897,9 +924,15 @@ def _validate_retarget(
                     raise ValueError(f"{clip.stem} {name} is invalid")
             if not np.array_equal(trajectory["frame_indices"], np.arange(length)):
                 raise ValueError(f"{clip.stem} frame indices are not contiguous")
-            for name in ("root_pose_xyzw", "camera_pose_cv_xyzw"):
+            for name, quaternion_start in (
+                ("root_pose_xyzw", 3),
+                ("camera_pose_cv_xyzw", 3),
+                ("source_camera_pose_in_spine3_xyzw", 3),
+            ):
                 if not np.allclose(
-                    np.linalg.norm(trajectory[name][:, 3:], axis=1),
+                    np.linalg.norm(
+                        trajectory[name][:, quaternion_start:], axis=1
+                    ),
                     1.0,
                     atol=1e-4,
                 ):
@@ -1015,6 +1048,11 @@ def _validate_prepared(stage: Stage, plan: PipelinePlan) -> None:
     clip = _clip_by_index(plan, stage.episode_index)
     root = plan.config.paths.prepared / f"episode_{clip.episode_index:06d}"
     report = _read_json(root / "prepare_report.json")
+    if (
+        report.get("method") != "handless_rgb_plus_metric_vda_rgbd_mesh"
+        or int(report.get("schema_version", -1)) < 2
+    ):
+        raise ValueError("Prepared RGB report is obsolete")
     lighting_path = root / "lighting_profile.json"
     lighting_profile = load_lighting_profile(lighting_path)
     if lighting_profile is None:
@@ -1112,24 +1150,12 @@ def _validate_prepared(stage: Stage, plan: PipelinePlan) -> None:
         ):
             raise ValueError("Prepared fixed VDA fallback audit is invalid")
     camera = report.get("camera")
-    if not isinstance(camera, dict):
-        raise ValueError("Prepared report has no camera audit")
-    camera_delta = float(
-        camera.get("max_position_delta_from_recorded_m", math.inf)
-    )
-    if not math.isfinite(camera_delta) or camera_delta < 0.0:
-        raise ValueError("Prepared camera delta is invalid")
     if (
-        camera.get("scene_scale_source") == "retarget metadata"
-        and camera_delta > 1e-5
+        not isinstance(camera, dict)
+        or camera.get("mapping_mode") != TORSO_ANCHORED_CAMERA_MAPPING
     ):
-        raise ValueError("Prepared and recorded camera poses disagree")
-    expected_scale_source = (
-        "retarget metadata"
-        if plan.config.scene_scale is None
-        else "explicit CLI override"
-    )
-    if camera.get("scene_scale_source") != expected_scale_source:
+        raise ValueError("Prepared report has no camera audit")
+    if camera.get("scene_scale_source") != "gmr_spine3_scale":
         raise ValueError("Prepared scene scale source differs from config")
     prepared_scale = float(camera.get("scene_scale", math.nan))
     if not math.isfinite(prepared_scale) or prepared_scale <= 0.0:
@@ -1141,16 +1167,6 @@ def _validate_prepared(stage: Stage, plan: PipelinePlan) -> None:
         abs_tol=1e-9,
     ):
         raise ValueError("Prepared depth/camera scene scales disagree")
-    if (
-        plan.config.scene_scale is not None
-        and not math.isclose(
-            prepared_scale,
-            plan.config.scene_scale,
-            rel_tol=0.0,
-            abs_tol=1e-9,
-        )
-    ):
-        raise ValueError("Prepared scene scale override differs from config")
     if _numbered_png_count(root / "rgb") != clip.video.frame_count:
         raise ValueError("Prepared RGB frame count differs from source")
     if _numbered_png_count(root / "depth_mm") != clip.video.frame_count:
@@ -1171,8 +1187,8 @@ def _validate_prepared(stage: Stage, plan: PipelinePlan) -> None:
             "mesh_size",
             "frame_indices",
             "human_arm_visible",
-            "robot_arm_render",
             "source_dataset_kind",
+            "camera_mapping_mode",
             "joint_names",
             "joint_positions",
             "root_pose_xyzw",
@@ -1180,9 +1196,8 @@ def _validate_prepared(stage: Stage, plan: PipelinePlan) -> None:
             "intrinsic",
             "mesh_intrinsic",
             "g1_urdf",
-            "source_camera_pose_cv_xyzw",
-            "recorded_camera_pose_cv_xyzw",
-            "source_hdf5",
+            "source_camera_pose_in_spine3_xyzw",
+            "source_spine3_to_robot_torso_rotation",
             "scene_scale",
             "vda_metric_scale",
             "vda_scale_mode",
@@ -1194,6 +1209,12 @@ def _validate_prepared(stage: Stage, plan: PipelinePlan) -> None:
         frame_count = clip.video.frame_count
         if str(np.asarray(data["source_dataset_kind"]).item()) != "nymeria":
             raise ValueError("Prepared NPZ does not identify Nymeria")
+        mapping_mode = np.asarray(data["camera_mapping_mode"])
+        if (
+            mapping_mode.shape != ()
+            or str(mapping_mode.item()) != TORSO_ANCHORED_CAMERA_MAPPING
+        ):
+            raise ValueError("Prepared NPZ uses an obsolete camera mapping")
         fps = float(np.asarray(data["fps"]).item())
         if not math.isclose(fps, clip.video.fps, abs_tol=0.01):
             raise ValueError("Prepared FPS differs from source")
@@ -1208,38 +1229,19 @@ def _validate_prepared(stage: Stage, plan: PipelinePlan) -> None:
         frame_indices = np.asarray(data["frame_indices"], dtype=np.int64)
         if not np.array_equal(frame_indices, np.arange(frame_count)):
             raise ValueError("Prepared frame indices are not contiguous")
-        timelines = {}
-        for key in (
-            "human_arm_visible",
-            "robot_arm_render",
+        human_arm_visible = np.asarray(data["human_arm_visible"])
+        if (
+            human_arm_visible.shape != (frame_count,)
+            or human_arm_visible.dtype.kind not in "biu"
+            or not np.isin(human_arm_visible, (0, 1)).all()
         ):
-            raw = np.asarray(data[key])
-            if (
-                raw.shape != (frame_count,)
-                or raw.dtype.kind not in "biu"
-                or not np.isin(raw, (0, 1)).all()
-            ):
-                raise ValueError(f"Prepared {key} timeline is invalid")
-            timelines[key] = raw.astype(bool)
-        if not np.array_equal(
-            timelines["robot_arm_render"],
-            timelines["human_arm_visible"],
+            raise ValueError("Prepared human_arm_visible timeline is invalid")
+        if int(replacement.get("human_arm_visible_frames", -1)) != int(
+            human_arm_visible.sum()
         ):
-            raise ValueError("Prepared robot-arm render decision is invalid")
-        for key, report_key in (
-            ("human_arm_visible", "human_arm_visible_frames"),
-            ("robot_arm_render", "robot_arm_render_frames"),
-        ):
-            if int(replacement.get(report_key, -1)) != int(
-                timelines[key].sum()
-            ):
-                raise ValueError(
-                    f"Prepared {key} report count is inconsistent"
-                )
-        if int(replacement.get("view_only_frames", -1)) != int(
-            (~timelines["robot_arm_render"]).sum()
-        ):
-            raise ValueError("Prepared view-only frame count is inconsistent")
+            raise ValueError(
+                "Prepared human_arm_visible report count is inconsistent"
+            )
         joint_names = np.asarray(data["joint_names"])
         if (
             joint_names.ndim != 1
@@ -1260,14 +1262,48 @@ def _validate_prepared(stage: Stage, plan: PipelinePlan) -> None:
                 np.asarray(data["camera_pose_cv_xyzw"], dtype=np.float64),
                 (frame_count, 7),
             ),
+            "source_camera_pose_in_spine3_xyzw": (
+                np.asarray(
+                    data["source_camera_pose_in_spine3_xyzw"],
+                    dtype=np.float64,
+                ),
+                (frame_count, 7),
+            ),
         }
         for key, (values, expected_shape) in arrays.items():
             if values.shape != expected_shape or not np.isfinite(values).all():
                 raise ValueError(f"Prepared {key} is invalid")
-        for key in ("root_pose_xyzw", "camera_pose_cv_xyzw"):
-            quaternion_norm = np.linalg.norm(arrays[key][0][:, 3:], axis=1)
+        for key, quaternion_start in (
+            ("root_pose_xyzw", 3),
+            ("camera_pose_cv_xyzw", 3),
+            ("source_camera_pose_in_spine3_xyzw", 3),
+        ):
+            quaternion_norm = np.linalg.norm(
+                arrays[key][0][:, quaternion_start:], axis=1
+            )
             if not np.allclose(quaternion_norm, 1.0, atol=1e-4):
                 raise ValueError(f"Prepared {key} quaternion is invalid")
+        source_spine3_to_robot_torso_rotation = np.asarray(
+            data["source_spine3_to_robot_torso_rotation"],
+            dtype=np.float64,
+        )
+        if (
+            source_spine3_to_robot_torso_rotation.shape != (3, 3)
+            or not np.isfinite(
+                source_spine3_to_robot_torso_rotation
+            ).all()
+            or not np.allclose(
+                source_spine3_to_robot_torso_rotation
+                @ source_spine3_to_robot_torso_rotation.T,
+                np.eye(3),
+                atol=1e-5,
+            )
+            or np.linalg.det(
+                source_spine3_to_robot_torso_rotation
+            )
+            < 0.999
+        ):
+            raise ValueError("Prepared spine3-to-torso basis is invalid")
         for key in ("intrinsic", "mesh_intrinsic"):
             intrinsic = np.asarray(data[key], dtype=np.float64)
             if (
@@ -1278,9 +1314,10 @@ def _validate_prepared(stage: Stage, plan: PipelinePlan) -> None:
             ):
                 raise ValueError(f"Prepared {key} is invalid")
         urdf_value = np.asarray(data["g1_urdf"])
-        if urdf_value.shape != () or not Path(
-            str(urdf_value.item())
-        ).expanduser().resolve().is_file():
+        if urdf_value.shape != ():
+            raise ValueError("Prepared G1 URDF is invalid")
+        g1_urdf = Path(str(urdf_value.item())).expanduser().resolve()
+        if not g1_urdf.is_file():
             raise ValueError("Prepared G1 URDF is invalid")
         npz_scale = float(np.asarray(data["scene_scale"]).item())
         if not math.isclose(
@@ -1290,6 +1327,20 @@ def _validate_prepared(stage: Stage, plan: PipelinePlan) -> None:
             abs_tol=1e-9,
         ):
             raise ValueError("Prepared NPZ/report scene scales disagree")
+        _validate_torso_anchored_camera_chain(
+            camera_poses_cv_xyzw=arrays["camera_pose_cv_xyzw"][0],
+            source_camera_pose_in_spine3_xyzw=(
+                arrays["source_camera_pose_in_spine3_xyzw"][0]
+            ),
+            source_spine3_to_robot_torso_rotation=(
+                source_spine3_to_robot_torso_rotation
+            ),
+            scene_scale=npz_scale,
+            g1_urdf=g1_urdf,
+            joint_names=tuple(str(value) for value in joint_names.tolist()),
+            joint_positions=arrays["joint_positions"][0],
+            root_poses_xyzw=arrays["root_pose_xyzw"][0],
+        )
         npz_vda_scale = float(np.asarray(data["vda_metric_scale"]).item())
         if not math.isclose(
             npz_vda_scale,
@@ -1311,8 +1362,6 @@ def _validate_prepared(stage: Stage, plan: PipelinePlan) -> None:
 def _validate_render(
     stage: Stage,
     plan: PipelinePlan,
-    *,
-    allow_pruned_prepared: bool = False,
 ) -> None:
     assert stage.episode_index is not None
     clip = _clip_by_index(plan, stage.episode_index)
@@ -1328,12 +1377,14 @@ def _validate_render(
         raise ValueError(
             "Final Isaac report predates mesh/capture camera synchronization"
         )
+    if report.get("camera_mapping_mode") != TORSO_ANCHORED_CAMERA_MAPPING:
+        raise ValueError("Final video uses an obsolete camera mapping")
     if report.get("capture_view") != "robot-camera":
         raise ValueError("Final video is not a robot-camera capture")
     if not str(report.get("mesh_pose_source", "")).startswith(
-        "prepared virtual source-camera pose backprojection independent"
+        "prepared source spine3-to-camera local pose transferred onto G1"
     ):
-        raise ValueError("Final RGB-D camera was coupled to the G1 camera")
+        raise ValueError("Final RGB-D camera does not use the torso anchor")
     if int(report.get("frame_count", -1)) != clip.video.frame_count:
         raise ValueError("Final report frame count differs from source")
     lighting = report.get("lighting")
@@ -1362,52 +1413,20 @@ def _validate_render(
     if not isinstance(render_sync, dict) or not bool(render_sync.get("passed")):
         raise ValueError("Isaac render synchronization did not pass")
     robot = report.get("robot")
-    visual_visibility = (
-        robot.get("visual_visibility")
-        if isinstance(robot, dict)
-        else None
-    )
-    prepared_report_path = (
-        plan.config.paths.prepared
-        / f"episode_{clip.episode_index:06d}"
-        / "prepare_report.json"
-    )
-    if not isinstance(visual_visibility, dict):
-        raise ValueError("Final robot visual-visibility audit is inconsistent")
-    visible_frames = int(visual_visibility.get("visible_frames", -1))
-    hidden_frames = int(visual_visibility.get("hidden_frames", -1))
-    if prepared_report_path.is_file():
-        replacement = _read_json(prepared_report_path).get(
-            "arm_replacement",
-            {},
-        )
-        if (
-            visible_frames
-            != int(replacement.get("robot_arm_render_frames", -2))
-            or hidden_frames != int(replacement.get("view_only_frames", -2))
-        ):
-            raise ValueError(
-                "Final robot visual-visibility audit is inconsistent"
-            )
-    elif not allow_pruned_prepared:
-        raise FileNotFoundError(prepared_report_path)
-    elif (
-        visible_frames < 0
-        or hidden_frames < 0
-        or visible_frames + hidden_frames != clip.video.frame_count
-    ):
-        raise ValueError("Final robot visual-visibility totals are invalid")
-    alignment = report.get("scene_alignment")
+    if not isinstance(robot, dict):
+        raise ValueError("Final report has no robot audit")
+    render_visibility = robot.get("render_visibility")
     if (
-        not isinstance(alignment, dict)
-        or alignment.get("method") != "disabled"
-        or alignment.get("requested_mode") != "none"
-        or int(alignment.get("application_count", -1)) != 0
+        int(report.get("schema_version", -1)) < 4
+        or not isinstance(render_visibility, dict)
+        or render_visibility.get("mode") != "always_enabled"
+        or render_visibility.get("decision_source")
+        != "capture_camera_frustum_and_depth_test"
+        or int(render_visibility.get("enabled_frames", -1))
+        != clip.video.frame_count
+        or int(render_visibility.get("disabled_frames", -1)) != 0
     ):
-        raise ValueError("Nymeria final render must disable scene alignment")
-    operation_order = report.get("operation_order")
-    if operation_order != []:
-        raise ValueError("Nymeria scene-placement order is invalid")
+        raise ValueError("Final robot render-visibility audit is invalid")
 
 
 def validate_stage(stage: Stage, plan: PipelinePlan) -> tuple[bool, str]:
@@ -1470,6 +1489,7 @@ def _clear_episode_intermediates(
     targets = [
         plan.config.paths.prepared / f"episode_{episode_index:06d}",
     ]
+    handless_episode_dir: Path | None = None
     errors: list[str] = []
     try:
         _, handless_video = _repaint_episode_video_paths(
@@ -1477,6 +1497,7 @@ def _clear_episode_intermediates(
             episode_index,
         )
         targets.append(handless_video)
+        handless_episode_dir = handless_video.parent
     except Exception as exc:
         errors.append(f"handless path: {type(exc).__name__}: {exc}")
     if not plan.config.alignment_is_external:
@@ -1491,6 +1512,15 @@ def _clear_episode_intermediates(
             _remove_exact(target, owner_root=plan.config.paths.root)
         except Exception as exc:
             errors.append(f"{target}: {type(exc).__name__}: {exc}")
+    if handless_episode_dir is not None:
+        try:
+            handless_episode_dir.rmdir()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            errors.append(
+                f"{handless_episode_dir}: {type(exc).__name__}: {exc}"
+            )
     if errors:
         raise RuntimeError("; ".join(errors))
 
@@ -1584,22 +1614,18 @@ def _new_report(plan: PipelinePlan) -> dict[str, Any]:
             else "generated_by_this_pipeline"
         ),
         "camera_mapping": (
-            "one global Sim(3) shared by raw Aria camera and aligned human "
-            "hip; G1 root uses one fixed mapped-hip-to-root transform"
+            "the source spine3-to-Aria local pose is scaled once and applied "
+            "to G1 torso_link FK; the fixed G1 capture-camera extrinsic stays "
+            "independent"
         ),
         "hand_policy": (
             "51-DoF G1 with 29 retargeted body joints and 22 fixed-open hand "
             "joints; no synthetic Nymeria fingertips"
         ),
         "visibility_policy": (
-            "robot camera is active on every frame; SAM 3 native target "
-            "presence directly selects automatic arm replacement and G1 "
-            "visual visibility, otherwise the original RGB is kept and G1 "
-            "visuals are hidden"
-        ),
-        "scene_alignment_policy": (
-            "scene alignment disabled; RGB-D follows the independent mapped "
-            "Aria reconstruction camera while G1 capture follows exact FK"
+            "handless RGB is used on every frame; G1 visuals stay enabled, "
+            "and the capture camera frustum and depth test determine which "
+            "robot geometry is visible"
         ),
         "video_metadata_policy": (
             "ffprobe decoded/displayed frame count, source FPS and source "
@@ -1619,9 +1645,10 @@ def _new_report(plan: PipelinePlan) -> dict[str, Any]:
             if config.retain_intermediates
             else (
                 "handless, prepared, and pipeline-owned alignment artifacts "
-                "are removed after render; only robot trajectory, final outputs, and "
-                "this report are retained; failed prepare/render inputs are "
-                "retained for retry"
+                "are permanently deleted after each successful render with "
+                "filesystem deletion, never moved to desktop Trash; only robot "
+                "trajectory, final outputs, and this report are retained; "
+                "failed prepare/render inputs are retained for retry"
             )
         ),
         "failed_episodes_file": str(
@@ -1801,11 +1828,7 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
                         "retained_input_fingerprint"
                     ) != _retained_render_fingerprint(stage, plan):
                         continue
-                    _validate_render(
-                        stage,
-                        plan,
-                        allow_pruned_prepared=True,
-                    )
+                    _validate_render(stage, plan)
                 except Exception:
                     continue
                 retained_render_indices.add(stage.episode_index)
@@ -1823,7 +1846,7 @@ def execute(plan: PipelinePlan) -> dict[str, Any]:
             ):
                 continue
             try:
-                _validate_render(stage, plan, allow_pruned_prepared=True)
+                _validate_render(stage, plan)
             except Exception:
                 continue
             retained_render_indices.add(stage.episode_index)
@@ -2633,7 +2656,6 @@ def _config_from_args(args: argparse.Namespace) -> PipelineConfig:
         resume=True,
         overwrite=False,
         headless=bool(args.headless),
-        scene_scale=None,
         vda_checkpoint=None,
         stop_after="render",
         poll_seconds=0.5,

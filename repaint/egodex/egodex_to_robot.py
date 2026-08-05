@@ -56,6 +56,12 @@ from repaint.g1_hand import (  # noqa: E402
     build_pinocchio_g1,
     retarget_o6_hands,
 )
+from repaint.robot_camera import (  # noqa: E402
+    TORSO_ANCHORED_CAMERA_MAPPING,
+    robot_frame_poses_world,
+    source_camera_poses_in_spine3_cv,
+    torso_anchored_camera_poses_cv,
+)
 from repaint.vda_pipeline_common import (  # noqa: E402
     natural_key,
     remove_exact,
@@ -163,6 +169,7 @@ class EgoDexEpisode:
     task: str
     intrinsic: np.ndarray
     camera_to_world: np.ndarray
+    source_spine3_to_world: np.ndarray
     points: dict[str, np.ndarray]
     source_to_robot_rotation: np.ndarray
 
@@ -178,8 +185,10 @@ class RetargetedEpisode:
     action: np.ndarray
     root_pose: np.ndarray
     camera_pose: np.ndarray
+    source_camera_pose_in_spine3: np.ndarray
+    source_spine3_to_robot_torso_rotation: np.ndarray
     camera_intrinsics: np.ndarray
-    source_to_robot_scale: float
+    scene_scale: float
     metrics: dict[str, float | int]
     hand_diagnostics: dict[str, dict[str, object]]
 
@@ -651,10 +660,14 @@ def load_egodex_episode(
 ) -> EgoDexEpisode:
     video = probe_video(pair.video_path)
     with h5py.File(pair.hdf5_path, "r") as handle:
-        if "camera/intrinsic" not in handle or "transforms/camera" not in handle:
+        if (
+            "camera/intrinsic" not in handle
+            or "transforms/camera" not in handle
+            or "transforms/spine3" not in handle
+        ):
             raise KeyError(
-                f"{pair.hdf5_path} must contain camera/intrinsic and "
-                "transforms/camera"
+                f"{pair.hdf5_path} must contain camera/intrinsic, "
+                "transforms/camera, and transforms/spine3"
             )
         frame_count = int(handle["transforms/camera"].shape[0])
         if frame_count != video.frame_count:
@@ -678,6 +691,15 @@ def load_egodex_episode(
             camera_to_world,
             frame_count,
         )
+        source_spine3 = np.asarray(
+            handle["transforms/spine3"],
+            dtype=np.float64,
+        )
+        _validate_transforms(
+            "transforms/spine3",
+            source_spine3,
+            frame_count,
+        )
 
         points: dict[str, np.ndarray] = {}
         hip_rotation: np.ndarray | None = None
@@ -696,8 +718,9 @@ def load_egodex_episode(
 
     # EgoDex hip local axes are +X left, +Y up, +Z forward.  They are more
     # stable than reconstructing a frame from occlusion-prone shoulder points.
-    # Reorder those columns into the G1 convention (+X forward, +Y left,
-    # +Z up), average the episode frame on SO(3), then invert it.
+    # Reorder the initial columns into the G1 convention (+X forward, +Y
+    # left, +Z up), then invert that one source-world alignment. Later human
+    # turns must not change the fixed world basis.
     assert hip_rotation is not None
     canonical_to_source = np.stack(
         [
@@ -707,7 +730,7 @@ def load_egodex_episode(
         ],
         axis=2,
     )
-    u, _, vt = np.linalg.svd(np.mean(canonical_to_source, axis=0))
+    u, _, vt = np.linalg.svd(canonical_to_source[0])
     correction = np.eye(3)
     correction[2, 2] = np.linalg.det(u @ vt)
     source_to_robot = (u @ correction @ vt).T
@@ -724,6 +747,7 @@ def load_egodex_episode(
         task=task,
         intrinsic=intrinsic,
         camera_to_world=camera_to_world,
+        source_spine3_to_world=source_spine3,
         points=points,
         source_to_robot_rotation=source_to_robot,
     )
@@ -1010,7 +1034,7 @@ def _gmr_body_trajectory(
         verbose=False,
         robot_model=gmr_model,
     )
-    source_to_robot_scale = float(
+    hand_scale = float(
         np.mean(
             [
                 retarget.human_scale_table["left_wrist"],
@@ -1021,8 +1045,9 @@ def _gmr_body_trajectory(
     hand = retarget_o6_hands(
         model,
         episode.hdf5_path,
-        scale=source_to_robot_scale,
+        scale=hand_scale,
     )
+    scene_scale = float(retarget.human_scale_table["spine3"])
     mimic_diagnostics = _validate_o6_mimic_trajectory(model, hand)
     gmr_model_diagnostics = _configure_gmr_hand_constraints(
         retarget,
@@ -1102,7 +1127,7 @@ def _gmr_body_trajectory(
         position_errors,
         task_errors,
         hand,
-        source_to_robot_scale,
+        scene_scale,
         gmr_model_diagnostics,
     )
 
@@ -1351,41 +1376,6 @@ def _minimum_hand_distance(
     return minimum
 
 
-def _mapped_camera_poses(
-    episode: EgoDexEpisode,
-    robot_root_positions: np.ndarray,
-    source_to_robot_scale: float,
-) -> np.ndarray:
-    if source_to_robot_scale <= 0:
-        raise ValueError("Camera/source-to-robot scale must be positive")
-    basis = episode.source_to_robot_rotation
-    source_position = episode.camera_to_world[:, :3, 3]
-    relative = source_position - episode.points["hip"]
-    mapped_position = (
-        robot_root_positions
-        + source_to_robot_scale * (basis @ relative.T).T
-    )
-    mapped_rotation = np.einsum(
-        "ij,njk->nik",
-        basis,
-        episode.camera_to_world[:, :3, :3],
-    )
-    mapped_quaternion_xyzw = Rotation.from_matrix(mapped_rotation).as_quat()
-    for frame_index in range(1, len(mapped_quaternion_xyzw)):
-        if (
-            np.dot(
-                mapped_quaternion_xyzw[frame_index - 1],
-                mapped_quaternion_xyzw[frame_index],
-            )
-            < 0.0
-        ):
-            mapped_quaternion_xyzw[frame_index] *= -1.0
-    return np.concatenate(
-        [mapped_position, mapped_quaternion_xyzw],
-        axis=1,
-    ).astype(np.float32)
-
-
 def retarget_episode(
     episode: EgoDexEpisode,
     model: pin.Model,
@@ -1398,7 +1388,7 @@ def retarget_episode(
         position_errors,
         task_errors,
         hand,
-        source_to_robot_scale,
+        scene_scale,
         gmr_model_diagnostics,
     ) = (
         _gmr_body_trajectory(episode, model, gmr_model)
@@ -1425,17 +1415,40 @@ def retarget_episode(
     )
     action = state[action_indices].copy()
 
-    root_positions = body_qpos[:, :3]
     root_quaternion_xyzw = body_qpos[:, 3:7][:, [1, 2, 3, 0]]
     root_pose = np.concatenate(
-        (root_positions, root_quaternion_xyzw),
+        (body_qpos[:, :3], root_quaternion_xyzw),
         axis=1,
     ).astype(np.float32)
-    camera_pose = _mapped_camera_poses(
-        episode,
-        root_positions,
-        source_to_robot_scale=source_to_robot_scale,
+    robot_torso_poses_world = robot_frame_poses_world(
+        urdf_path=G1_URDF,
+        joint_names=tuple(joint_names),
+        joint_positions=state,
+        root_pose_xyzw=root_pose,
+        frame_name=GMR_BODY_LINKS["spine3"],
     )
+    source_camera_pose_in_spine3 = source_camera_poses_in_spine3_cv(
+        source_camera_to_world=episode.camera_to_world,
+        source_spine3_to_world=episode.source_spine3_to_world,
+    )
+    robot_torso_rotation = Rotation.from_quat(
+        robot_torso_poses_world[:, 3:7]
+    ).as_matrix()
+    source_spine3_to_robot_torso_rotation = Rotation.from_matrix(
+        robot_torso_rotation[0].T
+        @ episode.source_to_robot_rotation
+        @ episode.source_spine3_to_world[0, :3, :3]
+    ).as_matrix()
+    camera_pose = torso_anchored_camera_poses_cv(
+        source_camera_pose_in_spine3_xyzw=(
+            source_camera_pose_in_spine3
+        ),
+        robot_torso_pose_world_xyzw=robot_torso_poses_world,
+        source_spine3_to_robot_torso_rotation=(
+            source_spine3_to_robot_torso_rotation
+        ),
+        scene_scale=scene_scale,
+    ).astype(np.float32)
     intrinsic = np.repeat(
         episode.intrinsic.reshape(1, 9),
         episode.frame_count,
@@ -1483,8 +1496,14 @@ def retarget_episode(
             action=action,
             root_pose=root_pose,
             camera_pose=camera_pose,
+            source_camera_pose_in_spine3=(
+                source_camera_pose_in_spine3.astype(np.float32)
+            ),
+            source_spine3_to_robot_torso_rotation=(
+                source_spine3_to_robot_torso_rotation
+            ),
             camera_intrinsics=intrinsic,
-            source_to_robot_scale=float(source_to_robot_scale),
+            scene_scale=float(scene_scale),
             metrics=metrics,
             hand_diagnostics=hand_diagnostics,
         ),
@@ -1664,6 +1683,9 @@ def _episode_columns(
         "observation.root_pose": episode.root_pose,
         "observation.camera_pose": episode.camera_pose,
         "observation.camera_intrinsics": episode.camera_intrinsics,
+        "observation.source_camera_pose_in_spine3_xyzw": (
+            episode.source_camera_pose_in_spine3
+        ),
         "timestamp": (
             np.arange(length, dtype=np.float32)
             / np.float32(episode.source.video.fps)
@@ -1762,6 +1784,12 @@ def _feature_schema(
             "dtype": "float32",
             "shape": [9],
             "names": intrinsic_names,
+            "fps": int(round(video.fps)),
+        },
+        "observation.source_camera_pose_in_spine3_xyzw": {
+            "dtype": "float32",
+            "shape": [7],
+            "names": pose_names,
             "fps": int(round(video.fps)),
         },
         VIDEO_KEY: {
@@ -1935,12 +1963,17 @@ def write_lerobot_v3(
                     "source_video": str(source.video_path),
                     "task": source.task,
                     "frame_count": length,
-                    "source_to_robot_rotation": (
-                        source.source_to_robot_rotation.tolist()
+                    "mapping_mode": TORSO_ANCHORED_CAMERA_MAPPING,
+                    "scene_scale": episode.scene_scale,
+                    "scene_scale_source": "gmr_spine3_scale",
+                    "source_spine3_to_robot_torso_rotation": (
+                        episode.source_spine3_to_robot_torso_rotation.tolist()
                     ),
-                    "source_to_robot_camera_translation_scale": (
-                        episode.source_to_robot_scale
+                    "local_basis_source": (
+                        "frame0_source_spine3_axes_mapped_through_initial_"
+                        "egodex_hip_world_basis_into_g1_torso_fk"
                     ),
+                    "local_basis_reference_frame": 0,
                     "retarget_metrics": episode.metrics,
                     "hand_retarget": episode.hand_diagnostics,
                 }
@@ -1990,7 +2023,7 @@ def write_lerobot_v3(
         write_json_atomic(
             temporary_root / "meta/egodex.json",
             {
-                "schema_version": 6,
+                "schema_version": 9,
                 "source_format": "EgoDex annotated HDF5 + MP4",
                 "robot": "unitree_g1_with_hands",
                 "retargeter": "general_motion_retargeting",
@@ -2042,8 +2075,9 @@ def write_lerobot_v3(
                 "joint_order": joint_names,
                 "action_offset_frames": ACTION_OFFSET,
                 "camera": (
-                    "T_robot_world_from_camera_cv, xyzw; Isaac rotation is "
-                    "R_cv @ diag(1,-1,-1)"
+                    "source spine3-to-camera local motion is applied to G1 "
+                    "torso FK; G1 capture camera keeps its independent fixed "
+                    "physical offset"
                 ),
                 "episodes": manifest_episodes,
             },

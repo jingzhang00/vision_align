@@ -2,12 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import h5py
 import numpy as np
 import pinocchio as pin
 from scipy.spatial.transform import Rotation
-
-from repaint.g1_hand import build_pinocchio_g1
 
 
 # ROS camera links use X forward, Y left, Z up. OpenCV optical frames use
@@ -23,6 +20,9 @@ CAMERA_LINK_FROM_CV_OPTICAL = np.asarray(
 )
 
 HEAD_CAMERA_PARENT_FRAME = "torso_link"
+TORSO_ANCHORED_CAMERA_MAPPING = (
+    "g1_torso_pose_anchor_with_source_spine3_camera_delta"
+)
 HEAD_CAM_OFFSET_POS_BASE = np.asarray(
     [0.0576235, 0.01753, 0.42987],
     dtype=np.float64,
@@ -40,29 +40,6 @@ HEAD_CAM_OFFSET_POS_ACTIVE = (
     )
 )
 
-SOURCE_PALM_TRANSFORMS = ("leftHand", "rightHand")
-ROBOT_WRIST_FRAMES = ("left_wrist_yaw_link", "right_wrist_yaw_link")
-ROBOT_PALM_FRAMES = ("left_palm", "right_palm")
-
-
-def robot_palm_offsets_local_m(urdf_path: Path) -> np.ndarray:
-    """Read the canonical wrist-to-palm offsets from the G1 model."""
-
-    model = build_pinocchio_g1(urdf_path)
-    offsets = np.empty((2, 3), dtype=np.float64)
-    for index, (wrist_name, palm_name) in enumerate(
-        zip(ROBOT_WRIST_FRAMES, ROBOT_PALM_FRAMES, strict=True)
-    ):
-        wrist = model.frames[model.getFrameId(wrist_name)]
-        palm = model.frames[model.getFrameId(palm_name)]
-        if wrist.parent != palm.parent:
-            raise ValueError(f"{palm_name} is not fixed to {wrist_name}")
-        offsets[index] = (
-            wrist.placement.inverse() * palm.placement
-        ).translation
-    return offsets
-
-
 def _continuous_xyzw(quaternions: np.ndarray) -> np.ndarray:
     """Return an equivalent quaternion sequence without sign flips."""
 
@@ -71,6 +48,155 @@ def _continuous_xyzw(quaternions: np.ndarray) -> np.ndarray:
         if np.dot(continuous[frame_id - 1], continuous[frame_id]) < 0.0:
             continuous[frame_id] *= -1.0
     return continuous
+
+
+def robot_frame_poses_world(
+    *,
+    urdf_path: Path,
+    joint_names: tuple[str, ...],
+    joint_positions: np.ndarray,
+    root_pose_xyzw: np.ndarray,
+    frame_name: str,
+) -> np.ndarray:
+    """Return one URDF frame pose in robot world for every trajectory frame."""
+
+    urdf_path = urdf_path.resolve()
+    if not urdf_path.is_file():
+        raise FileNotFoundError(urdf_path)
+    joints = np.asarray(joint_positions, dtype=np.float64)
+    roots = np.asarray(root_pose_xyzw, dtype=np.float64)
+    if joints.ndim != 2:
+        raise ValueError("joint_positions must have shape [frames, joints]")
+    frame_count = len(joints)
+    if roots.shape != (frame_count, 7):
+        raise ValueError("root_pose_xyzw must have shape [frames, 7]")
+    if not np.isfinite(joints).all() or not np.isfinite(roots).all():
+        raise ValueError("joint_positions and root_pose_xyzw must be finite")
+    quaternion_norms = np.linalg.norm(roots[:, 3:7], axis=1)
+    if np.any(quaternion_norms <= 1e-8):
+        raise ValueError("root_pose_xyzw contains a zero quaternion")
+
+    model = pin.buildModelFromUrdf(str(urdf_path))
+    if tuple(model.names[1:]) != joint_names:
+        raise ValueError(
+            "Prepared joint names do not match the G1 URDF joint order"
+        )
+    if joints.shape[1] != model.nq:
+        raise ValueError(
+            f"Expected {model.nq} joint positions, got {joints.shape[1]}"
+        )
+    robot_frame_id = model.getFrameId(frame_name)
+    if robot_frame_id >= model.nframes:
+        raise KeyError(f"G1 URDF has no frame named {frame_name!r}")
+
+    root_rotations = Rotation.from_quat(
+        roots[:, 3:7] / quaternion_norms[:, None]
+    ).as_matrix()
+    poses = np.empty((frame_count, 7), dtype=np.float64)
+    data = model.createData()
+    for frame_id in range(frame_count):
+        pin.forwardKinematics(model, data, joints[frame_id])
+        pin.updateFramePlacements(model, data)
+        model_from_frame = data.oMf[robot_frame_id]
+        world_from_frame_rotation = (
+            root_rotations[frame_id]
+            @ np.asarray(model_from_frame.rotation, dtype=np.float64)
+        )
+        poses[frame_id, :3] = (
+            root_rotations[frame_id]
+            @ np.asarray(model_from_frame.translation, dtype=np.float64)
+            + roots[frame_id, :3]
+        )
+        poses[frame_id, 3:7] = Rotation.from_matrix(
+            world_from_frame_rotation
+        ).as_quat()
+    poses[:, 3:7] = _continuous_xyzw(poses[:, 3:7])
+    return poses
+
+
+def source_camera_poses_in_spine3_cv(
+    *,
+    source_camera_to_world: np.ndarray,
+    source_spine3_to_world: np.ndarray,
+) -> np.ndarray:
+    """Express each source CV camera pose in its source spine3 frame."""
+
+    camera = np.asarray(source_camera_to_world, dtype=np.float64)
+    spine3 = np.asarray(source_spine3_to_world, dtype=np.float64)
+    if (
+        camera.ndim != 3
+        or camera.shape[1:] != (4, 4)
+        or spine3.shape != camera.shape
+        or not np.isfinite(camera).all()
+        or not np.isfinite(spine3).all()
+        or not np.allclose(camera[:, 3], [0.0, 0.0, 0.0, 1.0], atol=1e-5)
+        or not np.allclose(spine3[:, 3], [0.0, 0.0, 0.0, 1.0], atol=1e-5)
+    ):
+        raise ValueError("Source camera and spine3 transforms are invalid")
+    relative = np.einsum("nij,njk->nik", np.linalg.inv(spine3), camera)
+    poses = np.concatenate(
+        [
+            relative[:, :3, 3],
+            Rotation.from_matrix(relative[:, :3, :3]).as_quat(),
+        ],
+        axis=1,
+    )
+    poses[:, 3:7] = _continuous_xyzw(poses[:, 3:7])
+    return poses
+
+
+def torso_anchored_camera_poses_cv(
+    *,
+    source_camera_pose_in_spine3_xyzw: np.ndarray,
+    robot_torso_pose_world_xyzw: np.ndarray,
+    source_spine3_to_robot_torso_rotation: np.ndarray,
+    scene_scale: float,
+) -> np.ndarray:
+    """Apply source spine3-to-camera motion to the retargeted G1 torso."""
+
+    camera = np.asarray(source_camera_pose_in_spine3_xyzw, dtype=np.float64)
+    torso = np.asarray(robot_torso_pose_world_xyzw, dtype=np.float64)
+    basis = np.asarray(
+        source_spine3_to_robot_torso_rotation,
+        dtype=np.float64,
+    )
+    frame_count = len(camera)
+    if (
+        camera.shape != (frame_count, 7)
+        or torso.shape != (frame_count, 7)
+        or basis.shape != (3, 3)
+        or not np.isfinite(camera).all()
+        or not np.isfinite(torso).all()
+        or not np.isfinite(basis).all()
+        or np.any(np.linalg.norm(camera[:, 3:7], axis=1) <= 1e-8)
+        or np.any(np.linalg.norm(torso[:, 3:7], axis=1) <= 1e-8)
+        or not np.isfinite(scene_scale)
+        or scene_scale <= 0.0
+        or not np.allclose(basis @ basis.T, np.eye(3), atol=1e-5)
+        or np.linalg.det(basis) < 0.999
+    ):
+        raise ValueError("Torso-anchored camera inputs are invalid")
+    camera_rotations = Rotation.from_quat(camera[:, 3:7]).as_matrix()
+    torso_rotations = Rotation.from_quat(torso[:, 3:7]).as_matrix()
+    torso_from_source_spine3 = np.einsum(
+        "nij,jk->nik",
+        torso_rotations,
+        basis,
+    )
+    positions = torso[:, :3] + scene_scale * np.einsum(
+        "nij,nj->ni",
+        torso_from_source_spine3,
+        camera[:, :3],
+    )
+    rotations = np.einsum(
+        "nij,njk->nik",
+        torso_from_source_spine3,
+        camera_rotations,
+    )
+    quaternions = _continuous_xyzw(
+        Rotation.from_matrix(rotations).as_quat()
+    )
+    return np.concatenate([positions, quaternions], axis=1)
 
 
 def head_camera_poses_world(
@@ -87,166 +213,32 @@ def head_camera_poses_world(
     camera-axis conversion.
     """
 
-    urdf_path = urdf_path.resolve()
-    if not urdf_path.is_file():
-        raise FileNotFoundError(urdf_path)
-    joint_positions = np.asarray(joint_positions, dtype=np.float64)
-    root_pose_xyzw = np.asarray(root_pose_xyzw, dtype=np.float64)
-    if joint_positions.ndim != 2:
-        raise ValueError("joint_positions must have shape [frames, joints]")
-    frame_count = joint_positions.shape[0]
-    if root_pose_xyzw.shape != (frame_count, 7):
-        raise ValueError("root_pose_xyzw must have shape [frames, 7]")
-    if (
-        not np.isfinite(joint_positions).all()
-        or not np.isfinite(root_pose_xyzw).all()
-    ):
-        raise ValueError("joint_positions and root_pose_xyzw must be finite")
-    quaternion_norm = np.linalg.norm(root_pose_xyzw[:, 3:7], axis=1)
-    if np.any(quaternion_norm <= 1e-8):
-        raise ValueError("root_pose_xyzw contains a zero quaternion")
-
-    model = pin.buildModelFromUrdf(str(urdf_path))
-    if tuple(model.names[1:]) != joint_names:
-        raise ValueError(
-            "Prepared joint names do not match the G1 URDF joint order"
-        )
-    if joint_positions.shape[1] != model.nq:
-        raise ValueError(
-            f"Expected {model.nq} joint positions, got "
-            f"{joint_positions.shape[1]}"
-        )
-    parent_frame_id = model.getFrameId(
-        HEAD_CAMERA_PARENT_FRAME
-    )
-    if parent_frame_id >= model.nframes:
-        raise KeyError(
-            "G1 URDF has no frame named "
-            f"{HEAD_CAMERA_PARENT_FRAME!r}"
-        )
-
-    root_rotations = Rotation.from_quat(
-        root_pose_xyzw[:, 3:7] / quaternion_norm[:, None]
-    ).as_matrix()
-    camera_from_parent_rotation = Rotation.from_quat(
-        HEAD_CAM_OFFSET_ROT_WXYZ[[1, 2, 3, 0]]
-    ).as_matrix()
-    poses = np.empty((frame_count, 7), dtype=np.float64)
-    data = model.createData()
-    for frame_id in range(frame_count):
-        pin.forwardKinematics(model, data, joint_positions[frame_id])
-        pin.updateFramePlacements(model, data)
-        model_from_parent = data.oMf[parent_frame_id]
-        world_from_parent_rotation = (
-            root_rotations[frame_id]
-            @ np.asarray(model_from_parent.rotation, dtype=np.float64)
-        )
-        world_from_parent_translation = (
-            root_rotations[frame_id]
-            @ np.asarray(model_from_parent.translation, dtype=np.float64)
-            + root_pose_xyzw[frame_id, :3]
-        )
-        world_from_camera_rotation = (
-            world_from_parent_rotation @ camera_from_parent_rotation
-        )
-        poses[frame_id, :3] = (
-            world_from_parent_translation
-            + world_from_parent_rotation
-            @ HEAD_CAM_OFFSET_POS_ACTIVE
-        )
-        poses[frame_id, 3:7] = Rotation.from_matrix(
-            world_from_camera_rotation
-        ).as_quat()
-    poses[:, 3:7] = _continuous_xyzw(poses[:, 3:7])
-    return poses
-
-
-def head_camera_poses_cv(
-    *,
-    urdf_path: Path,
-    joint_names: tuple[str, ...],
-    joint_positions: np.ndarray,
-    root_pose_xyzw: np.ndarray,
-) -> np.ndarray:
-    """Return the same exact camera poses with OpenCV optical axes.
-
-    This companion representation is for projection and hand-anchor
-    diagnostics only.  Isaac rendering uses the world-axis poses directly.
-    """
-
-    world_poses = head_camera_poses_world(
+    parent_poses = robot_frame_poses_world(
         urdf_path=urdf_path,
         joint_names=joint_names,
         joint_positions=joint_positions,
         root_pose_xyzw=root_pose_xyzw,
+        frame_name=HEAD_CAMERA_PARENT_FRAME,
     )
-    world_rotations = Rotation.from_quat(
-        world_poses[:, 3:7]
+    parent_rotations = Rotation.from_quat(
+        parent_poses[:, 3:7]
     ).as_matrix()
-    cv_poses = world_poses.copy()
-    cv_poses[:, 3:7] = Rotation.from_matrix(
-        world_rotations @ CAMERA_LINK_FROM_CV_OPTICAL
+    camera_from_parent_rotation = Rotation.from_quat(
+        HEAD_CAM_OFFSET_ROT_WXYZ[[1, 2, 3, 0]]
+    ).as_matrix()
+    poses = parent_poses.copy()
+    poses[:, :3] += np.einsum(
+        "nij,j->ni", parent_rotations, HEAD_CAM_OFFSET_POS_ACTIVE
+    )
+    poses[:, 3:7] = Rotation.from_matrix(
+        np.einsum(
+            "nij,jk->nik",
+            parent_rotations,
+            camera_from_parent_rotation,
+        )
     ).as_quat()
-    cv_poses[:, 3:7] = _continuous_xyzw(cv_poses[:, 3:7])
-    return cv_poses
-
-
-def load_source_palm_points_camera_cv(
-    source_hdf5: Path,
-    frame_indices: np.ndarray,
-    *,
-    wrist_to_palm_offsets_local_m: np.ndarray,
-) -> np.ndarray:
-    """Convert Nymeria ``leftHand/rightHand`` wrists to palm points."""
-
-    source_hdf5 = source_hdf5.resolve()
-    if not source_hdf5.is_file():
-        raise FileNotFoundError(source_hdf5)
-    frame_indices = np.asarray(frame_indices, dtype=np.int64)
-    if frame_indices.ndim != 1 or len(frame_indices) == 0:
-        raise ValueError("frame_indices must be a non-empty vector")
-    if np.any(frame_indices < 0):
-        raise ValueError("frame_indices must be non-negative")
-    palm_offsets = np.asarray(
-        wrist_to_palm_offsets_local_m,
-        dtype=np.float64,
-    )
-    if palm_offsets.shape != (2, 3) or not np.isfinite(palm_offsets).all():
-        raise ValueError("wrist-to-palm offsets must be finite [2,3]")
-
-    with h5py.File(source_hdf5, "r") as handle:
-        camera = np.asarray(handle["transforms/camera"], dtype=np.float64)
-        if camera.ndim != 3 or camera.shape[1:] != (4, 4):
-            raise ValueError(
-                "transforms/camera must have shape [frames,4,4]"
-            )
-        palm_values: list[np.ndarray] = []
-        for side_index, name in enumerate(SOURCE_PALM_TRANSFORMS):
-            key = f"transforms/{name}"
-            transforms = np.asarray(handle[key], dtype=np.float64)
-            if transforms.shape != camera.shape:
-                raise ValueError(
-                    f"{key} must have shape {camera.shape}, "
-                    f"got {transforms.shape}"
-                )
-            palm_values.append(
-                transforms[:, :3, 3]
-                + np.einsum(
-                    "nij,j->ni",
-                    transforms[:, :3, :3],
-                    palm_offsets[side_index],
-                )
-            )
-
-    if int(frame_indices.max()) >= len(camera):
-        raise IndexError("source palm frame index is out of range")
-    camera = camera[frame_indices]
-    palms_world = np.stack(palm_values, axis=1)[frame_indices]
-    return np.einsum(
-        "nji,nsj->nsi",
-        camera[:, :3, :3],
-        palms_world - camera[:, None, :3, 3],
-    )
+    poses[:, 3:7] = _continuous_xyzw(poses[:, 3:7])
+    return poses
 
 
 def robot_frame_points_in_camera_cv(
