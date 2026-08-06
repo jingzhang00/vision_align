@@ -8,10 +8,6 @@
 	path = Inpaint-Anything
 	url = https://github.com/geekyutao/Inpaint-Anything.git
 	branch = main_2026
-[submodule "stream"]
-	path = stream
-	url = git@gitee.com:wang414/stream.git
-	branch = gmr
 [submodule "Video-Depth-Anything"]
 	path = Video-Depth-Anything
 	url = https://github.com/DepthAnything/Video-Depth-Anything.git
