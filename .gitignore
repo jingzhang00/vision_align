@@ -10,4 +10,4 @@ dataset/
 .venv
 test_*.py
 tmp/
-stable-diffusion-2-inpainting/
+stable-diffusion-*/

@@ -122,13 +122,18 @@ def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
 
 
 def render_complete(video: Path) -> bool:
-    """A render is complete only after Isaac wrote its same-stem report."""
+    """A render is complete after Isaac wrote video, report, and hole masks."""
 
     try:
+        report = read_json(video.with_suffix(".json"))
+        mask = video.with_suffix(".mask.npz")
         return (
             video.is_file()
             and video.stat().st_size > 0
-            and int(read_json(video.with_suffix(".json"))["frame_count"]) > 0
+            and mask.is_file()
+            and mask.stat().st_size > 0
+            and int(report["schema_version"]) >= 8
+            and int(report["frame_count"]) > 0
         )
     except (OSError, ValueError, TypeError, KeyError):
         return False

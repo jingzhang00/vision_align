@@ -8,28 +8,24 @@ Download [Releases V0.1.0](https://github.com/sczhou/ProPainter/releases/tag/v0.
 ```bash
 uv sync
 pip install "isaacsim[all,extscache]==5.1.0" --extra-index-url https://pypi.nvidia.com
+hf download sd2-community/stable-diffusion-2-inpainting --local-dir stable-diffusion-2-inpainting
 ```
 
-- follow `Inpaint-Anything/README.md -> Download the weights` to put the weights
+- follow `Inpaint-Anything/README.md -> Download the weights` to put the weights in:
 ```
 pretrained_models/
 ├── sam3.pt                 # SAM 3, images + video tracking   (gated, see above)
 ├── config.json             # SAM 3 config, downloaded alongside sam3.pt
-├── big-lama/               # LaMa, default image removal      (auto)
-│   ├── config.yaml
-│   └── models/best.ckpt
 ├── propainter/             # ProPainter, default video inpainting (auto)
 │   ├── ProPainter.pth
 │   ├── recurrent_flow_completion.pth
 │   └── raft-things.pth
-├── FLUX.1-Fill-dev/        # optional, ~24GB   (`--only flux`)
 weights/
 └── mobile_sam.pt           # MobileSAM, ships with the repo
 ```
 - replace `sam3/sam3/model_builder.py` with `utils/model_builder.py` to bypass Hugginface check
 
 ## Run tasks
-To process episode 0 of every task under `dataset/egodex_test`:
 
 ```bash
 bash batch_egodex.sh
@@ -103,13 +99,26 @@ To inspect a prepared episode in isaacsim:
 # fill video
 ```bash
 .venv/bin/python -m repaint.fill_video \
-  --input_dir egodex_debug/arrange_topple_dominoes/final/episode_000000 \
-  --output_dir egodex_debug/arrange_topple_dominoes/final_fill
+  --input_dir tmp/replay_then_render/egodex/basic_pick_place/final \
+  --output_dir tmp/replay_then_render/egodex/basic_pick_place/final_fill \
+  --inpaint_model sd \
+  --model stable-diffusion-xl-1.0-inpainting-0.1 \
+  --steps 20 \
+  --guidance_scale 7.5 \
+  --seed 42 \
+  --prompt "" \
+  --negative_prompt "blurry, low quality, distorted" \
+  --overwrite
 
 .venv/bin/python -m repaint.fill_video \
-  --input_dir egodex_debug/arrange_topple_dominoes/final/episode_000000 \
-  --output_dir egodex_debug/arrange_topple_dominoes/final_fill_sdxl \
-  --inpaint_model flux \
-  --model Inpaint-Anything/pretrained_models/stable-diffusion-xl-1.0-inpainting-0.1
-
+  --input_dir tmp/replay_then_render/egodex/basic_pick_place/final \
+  --output_dir tmp/replay_then_render/egodex/basic_pick_place/final_fill \
+  --inpaint_model sd \
+  --model stable-diffusion-xl-1.0-inpainting-0.1 \
+  --steps 20 \
+  --guidance_scale 7.5 \
+  --seed 42 \
+  --prompt "seamless continuation of the existing indoor scene, matching the surrounding floor, furniture, geometry, perspective, materials, colors and warm lighting, photorealistic" \
+  --negative_prompt "new objects, extra furniture, extra robot parts, people, text, logo, repeating patterns, seams, borders, color shift, inconsistent lighting, blurry, distorted, low quality" \
+  --overwrite
 ```

@@ -90,7 +90,11 @@ def _run_batch(
                 print(f"[skip] completed: {task}/{stem}", flush=True)
                 outputs.append(output_video)
                 continue
-            for partial in (output_video, output_video.with_suffix(".json")):
+            for partial in (
+                output_video,
+                output_video.with_suffix(".json"),
+                output_video.with_suffix(".mask.npz"),
+            ):
                 remove_exact(partial, owner_root=root)
             work = root / ".batch_work" / label
             try:
@@ -147,7 +151,11 @@ def _run_batch(
                 print(f"[done] {task}/{stem}", flush=True)
             except Exception as exc:
                 print(f"[failed] {task}/{stem}: {exc}", file=sys.stderr, flush=True)
-                for partial in (output_video, output_video.with_suffix(".json")):
+                for partial in (
+                    output_video,
+                    output_video.with_suffix(".json"),
+                    output_video.with_suffix(".mask.npz"),
+                ):
                     remove_exact(partial, owner_root=root)
             finally:
                 remove_exact(work, owner_root=root)

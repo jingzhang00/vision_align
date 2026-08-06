@@ -69,7 +69,7 @@ HAND_CAPTURE_WARNING_THRESHOLD = 0.8
 JOINT_COMMIT_ATOL_RAD = 1.0e-4
 ROOT_POSITION_COMMIT_ATOL_M = 1.0e-4
 ROOT_ORIENTATION_COMMIT_ATOL_RAD = 1.0e-4
-BATCH_REPORT_SCHEMA_VERSION = 6
+BATCH_REPORT_SCHEMA_VERSION = 8
 
 
 @dataclass(frozen=True)
@@ -452,7 +452,7 @@ def _resolve_capture_calibration(
     source_size: tuple[int, int],
     source_intrinsic: np.ndarray,
 ) -> tuple[np.ndarray, tuple[int, int], str]:
-    """Resolve source-sized output and the selected camera's intrinsic."""
+    """Resolve the selected camera's intrinsic and native capture size."""
 
     if capture_view == "robot-camera":
         return _resolve_d435_calibration(source_size)
@@ -471,61 +471,6 @@ def _resolve_capture_calibration(
         tuple(int(value) for value in source_size),
         "prepared source intrinsic at prepared source_size",
     )
-
-
-def _centered_letterbox_offsets(
-    *,
-    output_size: tuple[int, int],
-    content_size: tuple[int, int],
-) -> tuple[int, int, int, int]:
-    """Return left, top, right, bottom padding for centered content."""
-
-    output_width, output_height = (int(value) for value in output_size)
-    content_width, content_height = (int(value) for value in content_size)
-    if min(
-        output_width,
-        output_height,
-        content_width,
-        content_height,
-    ) <= 0:
-        raise ValueError("output_size and content_size must be positive")
-    if (
-        content_width > output_width
-        or content_height > output_height
-    ):
-        raise ValueError("content_size must fit inside output_size")
-    horizontal = output_width - content_width
-    vertical = output_height - content_height
-    left = horizontal // 2
-    top = vertical // 2
-    return left, top, horizontal - left, vertical - top
-
-
-def _letterbox_rgb(
-    rgb: np.ndarray,
-    *,
-    output_size: tuple[int, int],
-    offsets: tuple[int, int, int, int],
-) -> np.ndarray:
-    """Place an RGB capture into a source-sized black output frame."""
-
-    rgb = np.asarray(rgb)
-    if rgb.ndim != 3 or rgb.shape[2] != 3:
-        raise ValueError("rgb must have shape [height, width, 3]")
-    output_width, output_height = (int(value) for value in output_size)
-    left, top, right, bottom = (int(value) for value in offsets)
-    if min(left, top, right, bottom) < 0:
-        raise ValueError("letterbox offsets must be non-negative")
-    if (
-        left + rgb.shape[1] + right != output_width
-        or top + rgb.shape[0] + bottom != output_height
-    ):
-        raise ValueError(
-            "letterbox offsets, content, and output_size do not agree"
-        )
-    output = np.zeros((output_height, output_width, 3), dtype=rgb.dtype)
-    output[top : top + rgb.shape[0], left : left + rgb.shape[1]] = rgb
-    return output
 
 
 def _camera_fov_degrees(
@@ -1045,7 +990,8 @@ def _resolve_run_options(
     if output_video.suffix.lower() != ".mp4":
         raise ValueError("--output must have an .mp4 suffix")
     report_path = output_video.with_suffix(".json")
-    for path in (output_video, report_path):
+    mask_path = output_video.with_suffix(".mask.npz")
+    for path in (output_video, report_path, mask_path):
         if path.exists():
             raise FileExistsError(f"Refusing to overwrite output: {path}")
     return RunOptions(
@@ -1130,20 +1076,13 @@ def render(args: argparse.Namespace) -> dict[str, object]:
         source_size=scene.source_size,
         source_intrinsic=scene.intrinsic,
     )
-    output_size = tuple(int(value) for value in scene.source_size)
-    letterbox_offsets = _centered_letterbox_offsets(
-        output_size=output_size,
-        content_size=render_size,
+    output_size = render_size
+    output_size_source = (
+        "native D435 4:3 capture"
+        if args.capture_view == "robot-camera"
+        else "prepared source_size"
     )
-    (
-        letterbox_left,
-        letterbox_top,
-        letterbox_right,
-        letterbox_bottom,
-    ) = letterbox_offsets
     output_intrinsic = render_intrinsic.copy()
-    output_intrinsic[0, 2] += letterbox_left
-    output_intrinsic[1, 2] += letterbox_top
     hand_projection_report: dict[str, object] | None = None
     if capture_camera_poses_cv_xyzw is not None:
         hand_points_camera = robot_frame_points_in_camera_cv(
@@ -1182,13 +1121,13 @@ def render(args: argparse.Namespace) -> dict[str, object]:
         "output_size": [output_width, output_height],
         "content_size": [render_width, render_height],
         "offsets_px": {
-            "left": letterbox_left,
-            "top": letterbox_top,
-            "right": letterbox_right,
-            "bottom": letterbox_bottom,
+            "left": 0,
+            "top": 0,
+            "right": 0,
+            "bottom": 0,
         },
-        "placement": "centered",
-        "fill_rgb": [0, 0, 0],
+        "placement": "none",
+        "fill_rgb": None,
     }
     capture_camera_report: dict[str, object]
     if args.capture_view == "robot-camera":
@@ -1416,6 +1355,8 @@ def render(args: argparse.Namespace) -> dict[str, object]:
         else:
             world.play()
         camera.initialize()
+        if not run_options.interactive:
+            camera.add_distance_to_image_plane_to_frame()
         scene_diagonal = float(
             np.linalg.norm(scan.bounds_max - scan.bounds_min)
         )
@@ -1843,7 +1784,7 @@ def render(args: argparse.Namespace) -> dict[str, object]:
                     else "prepared source_size"
                 ),
                 "output_size": list(output_size),
-                "output_size_source": "prepared source_size",
+                "output_size_source": output_size_source,
                 "letterbox": letterbox_report,
                 "capture_view": args.capture_view,
                 "capture_intrinsic": render_intrinsic.tolist(),
@@ -1881,6 +1822,7 @@ def render(args: argparse.Namespace) -> dict[str, object]:
         if not writer.isOpened():
             raise RuntimeError(f"Failed to open MP4 writer: {output_video}")
 
+        packed_hole_masks: list[np.ndarray] = []
         first_render = True
         print(
             f"Isaac VDA + G1 rendered 0/{scene.frame_count}",
@@ -1912,13 +1854,21 @@ def render(args: argparse.Namespace) -> dict[str, object]:
                 rgba,
                 (render_height, render_width, 3),
             )
-            output_rgb = _letterbox_rgb(
-                rgb,
-                output_size=output_size,
-                offsets=letterbox_offsets,
-            )
+            depth = camera.get_depth()
+            if depth is None:
+                raise RuntimeError(
+                    f"Isaac camera returned no depth at local frame {frame_id}"
+                )
+            depth = np.asarray(depth).squeeze()
+            if depth.shape != (render_height, render_width):
+                raise RuntimeError(
+                    f"Isaac depth shape {depth.shape} does not match "
+                    f"{render_height}x{render_width}"
+                )
+            hole_mask = (~np.isfinite(depth) | (depth <= 0.0))
+            packed_hole_masks.append(np.packbits(hole_mask.reshape(-1)))
             writer.write(
-                cv2.cvtColor(output_rgb, cv2.COLOR_RGB2BGR)
+                cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
             )
             print(
                 f"Isaac VDA + G1 rendered {frame_id + 1}/"
@@ -1928,6 +1878,15 @@ def render(args: argparse.Namespace) -> dict[str, object]:
 
         writer.release()
         writer = None
+        mask_path = output_video.with_suffix(".mask.npz")
+        np.savez_compressed(
+            mask_path,
+            masks=np.stack(packed_hole_masks),
+            shape=np.asarray(
+                [scene.frame_count, render_height, render_width],
+                dtype=np.int64,
+            ),
+        )
         median_depth_delta = np.abs(np.diff(scan.median_depths_m))
         triangle_delta = np.abs(np.diff(scan.triangle_counts))
         valid_ratio = (
@@ -1944,6 +1903,11 @@ def render(args: argparse.Namespace) -> dict[str, object]:
             "prepared_root": str(scene.root),
             "source_dataset_kind": scene.source_dataset_kind,
             "output_video": str(output_video),
+            "hole_masks": {
+                "path": str(mask_path),
+                "format": "numpy-packbits",
+                "semantics": "1=inpaint hole, 0=observed rendered geometry",
+            },
             "robot": {
                 "urdf": str(scene.g1_urdf),
                 "articulation_path": robot_path,
@@ -1975,7 +1939,7 @@ def render(args: argparse.Namespace) -> dict[str, object]:
                 else "prepared source_size"
             ),
             "output_size": list(output_size),
-            "output_size_source": "prepared source_size",
+            "output_size_source": output_size_source,
             "letterbox": letterbox_report,
             "capture_view": args.capture_view,
             "source_intrinsic": scene.intrinsic.tolist(),
@@ -2032,7 +1996,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Replay a prepared Video Depth Anything RGB-D scene and its "
-            "frame-aligned G1 trajectory, either to a source-sized G1 "
+            "frame-aligned G1 trajectory, either to a native 4:3 G1 "
             "head-camera MP4 or in an adjustable third-person viewport."
         )
     )
@@ -2058,8 +2022,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="robot-camera",
         help=(
             "torso/head profile (default), or a fixed third-person "
-            "diagnostic view. Output size is always the prepared "
-            "source_size"
+            "diagnostic view. Robot-camera output uses its native 4:3 "
+            "capture size"
         ),
     )
     parser.add_argument(

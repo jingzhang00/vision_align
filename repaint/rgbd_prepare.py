@@ -80,7 +80,7 @@ def _load_nymeria_human_arm_visibility(
     for entry in manifest.get("episodes", ()):
         output = Path(str(entry.get("output", ""))).expanduser()
         if not output.is_absolute():
-            output = removed_root / output
+            output = WORKSPACE_ROOT / output
         if output.resolve() == removed_video.resolve():
             matches.append(entry)
     if len(matches) != 1:
