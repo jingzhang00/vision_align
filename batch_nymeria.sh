@@ -7,4 +7,5 @@ PYTHON="$WORKSPACE/.venv/bin/python"
 "$PYTHON" -m repaint.nymeria.nymeria_vda_pipeline \
     --dataset-root "$WORKSPACE/dataset/nymeria" \
     --output-root "$WORKSPACE/nymeria/vda" \
+    --batch \
     --headless

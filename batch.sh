@@ -4,18 +4,15 @@ set -euo pipefail
 WORKSPACE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON="$WORKSPACE/.venv/bin/python"
 EGODEX_SOURCE="$WORKSPACE/dataset/egodex_test"
-EGODEX_FIRST="$WORKSPACE/dataset/.egodex_test_first"
 
 tasks=()
 for source in "$EGODEX_SOURCE"/*; do
     [[ -d "$source" ]] || continue
     task="${source##*/}"
     [[ -f "$source/0.hdf5" && -f "$source/0.mp4" ]] || {
-        echo "Missing episode 0 pair: $source" >&2
-        exit 1
+        echo "Skipping missing episode 0 pair: $source" >&2
+        continue
     }
-    mkdir -p "$EGODEX_FIRST/$task"
-    ln -f "$source/0.hdf5" "$source/0.mp4" "$EGODEX_FIRST/$task/"
     tasks+=("$task")
 done
 
@@ -26,11 +23,14 @@ done
 
 "$PYTHON" -m repaint.egodex.egodex_vda_pipeline \
     --tasks "${tasks[@]}" \
-    --dataset-root "$EGODEX_FIRST" \
+    --dataset-root "$EGODEX_SOURCE" \
     --output-root "$WORKSPACE/egodex" \
+    --stem 0 \
+    --batch \
     --headless
 
 "$PYTHON" -m repaint.nymeria.nymeria_vda_pipeline \
     --dataset-root "$WORKSPACE/dataset/nymeria" \
-    --output-root "$WORKSPACE/nymeria/" \
+    --output-root "$WORKSPACE/nymeria/vda" \
+    --batch \
     --headless

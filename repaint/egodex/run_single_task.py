@@ -13,10 +13,7 @@ WORKSPACE_ROOT = SCRIPT_PATH.parents[2]
 if str(WORKSPACE_ROOT) not in sys.path:
     sys.path.insert(0, str(WORKSPACE_ROOT))
 
-from repaint.egodex.egodex_vda_pipeline import (  # noqa: E402
-    PipelineConfig,
-    run_pipeline,
-)
+from repaint.egodex.egodex_vda_pipeline import run_pipeline  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -55,15 +52,11 @@ def main() -> None:
     args = parse_args()
     run_pipeline(
         (args.task,),
-        PipelineConfig(
-            dataset_root=args.dataset_root.expanduser().resolve(),
-            output_root=args.output_root.expanduser().resolve(),
-            python_executable=Path(sys.executable).absolute(),
-            resume=not args.overwrite,
-            overwrite=args.overwrite,
-            headless=args.headless,
-            retain_intermediates=True,
-        ),
+        dataset_root=args.dataset_root,
+        output_root=args.output_root,
+        python_executable=Path(sys.executable).absolute(),
+        headless=args.headless,
+        overwrite=args.overwrite,
     )
 
 

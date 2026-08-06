@@ -6,9 +6,8 @@ each episode this script:
 
 1. maps the tracked body and hand landmarks into a canonical Z-up frame,
 2. combines it with a static G1-derived standing target,
-3. builds GMR from the same complete G1+O6 URDF used by the output,
-4. solves the floating-base body trajectory with all 22 O6 hand joints while
-   auditing, but not constraining, cross-hand collisions, and
+3. solves the body with Nymeria's 29-DoF ``unitree_g1`` GMR path,
+4. inserts the independently retargeted 22 O6 hand joints, and
 5. writes 51-DoF references, camera calibration, and frame-aligned RGB.
 """
 
@@ -27,7 +26,6 @@ from typing import Any
 
 import cv2
 import h5py
-import mink
 import mujoco as mj
 import numpy as np
 import pandas as pd
@@ -50,17 +48,18 @@ from general_motion_retargeting import (  # noqa: E402
     GeneralMotionRetargeting as GMR,
 )
 from repaint.g1_hand import (  # noqa: E402
-    HAND_JOINTS,
     O6HandRetargetTrajectory,
     TRACKED_HAND_TO_G1_PALM_ROTATIONS,
     build_pinocchio_g1,
     retarget_o6_hands,
 )
+from repaint.nymeria.nymeria_to_robot import (  # noqa: E402
+    merge_body_with_open_hands,
+)
 from repaint.robot_camera import (  # noqa: E402
-    TORSO_ANCHORED_CAMERA_MAPPING,
+    HEAD_CAMERA_PARENT_FRAME,
+    retarget_scene_camera_poses_cv,
     robot_frame_poses_world,
-    source_camera_poses_in_spine3_cv,
-    torso_anchored_camera_poses_cv,
 )
 from repaint.vda_pipeline_common import (  # noqa: E402
     natural_key,
@@ -89,21 +88,6 @@ G1_URDF = (
 SMOOTH_WINDOW = 7
 ACTION_OFFSET = 1
 IMAGE_STAT_SAMPLES = 24
-CROSS_HAND_COLLISION_TOLERANCE_M = 1e-4
-CROSS_HAND_NEAR_CLEARANCE_M = 2e-3
-GMR_COLLISION_PHASE1_MAX_ITERATIONS = 3
-GMR_COLLISION_PHASE2_MAX_ITERATIONS = 5
-GMR_NEUTRAL_PELVIS_HEIGHT_M = 0.793
-GMR_TOE_FRAME_OFFSET_M = np.array([0.1, 0.0, -0.02], dtype=np.float64)
-GMR_MODEL_KIND = "main_with_hand_new.urdf:floating_o6"
-HAND_COLLISION_LINK_PARTS = (
-    "hand_base",
-    "index",
-    "middle",
-    "ring",
-    "pinky",
-    "thumb",
-)
 BODY_TRACK_KEYS = (
     "hip",
     "leftArm",
@@ -171,7 +155,7 @@ class EgoDexEpisode:
     camera_to_world: np.ndarray
     source_spine3_to_world: np.ndarray
     points: dict[str, np.ndarray]
-    source_to_robot_rotation: np.ndarray
+    source_to_robot_world_rotation: np.ndarray
 
     @property
     def frame_count(self) -> int:
@@ -186,344 +170,13 @@ class RetargetedEpisode:
     root_pose: np.ndarray
     camera_pose: np.ndarray
     source_camera_pose_in_spine3: np.ndarray
+    source_camera_rotation_world: np.ndarray
+    source_to_robot_world_rotation: np.ndarray
     source_spine3_to_robot_torso_rotation: np.ndarray
     camera_intrinsics: np.ndarray
     scene_scale: float
     metrics: dict[str, float | int]
     hand_diagnostics: dict[str, dict[str, object]]
-
-
-@dataclass(frozen=True)
-class CrossHandCollisionChecker:
-    geometry_model: pin.GeometryModel
-    pair_names: tuple[tuple[str, str], ...]
-    palm_pair_index: int
-
-
-def _is_o6_hand_body(body_name: str, side: str) -> bool:
-    return body_name == f"{side}_hand_base_link" or any(
-        body_name.startswith(f"{side}_{part}")
-        for part in ("thumb", "index", "middle", "ring", "pinky")
-    )
-
-
-def _name_o6_collision_geometries(spec: mj.MjSpec) -> None:
-    """Give the imported URDF hand geoms stable names for Mink constraints."""
-
-    counts = {"left": 0, "right": 0}
-    for body in spec.bodies:
-        for side in ("left", "right"):
-            if not _is_o6_hand_body(body.name, side):
-                continue
-            if len(body.geoms) != 1:
-                raise ValueError(
-                    f"Expected one collision geom on {body.name}, found "
-                    f"{len(body.geoms)}"
-                )
-            body.geoms[0].name = f"{body.name}_collision"
-            counts[side] += 1
-    if counts != {"left": 12, "right": 12}:
-        raise ValueError(
-            "Complete O6 URDF must provide 12 collision geoms per hand; "
-            f"found {counts}"
-        )
-
-
-def _restore_right_o6_meshes(spec: mj.MjSpec, urdf_path: Path) -> None:
-    """Undo MuJoCo URDF asset deduplication for same-named L/R hand STLs."""
-
-    right_mesh_root = (
-        urdf_path.parent.parent / "hand/right_hand/meshes"
-    ).resolve()
-    existing_meshes = {mesh.name: mesh for mesh in spec.meshes}
-    restored = 0
-    for body in spec.bodies:
-        if not _is_o6_hand_body(body.name, "right"):
-            continue
-        if len(body.geoms) != 1:
-            raise ValueError(
-                f"Expected one right-hand collision geom on {body.name}"
-            )
-        geom = body.geoms[0]
-        source_asset = existing_meshes.get(geom.meshname)
-        if source_asset is None:
-            raise ValueError(
-                f"Missing imported mesh asset {geom.meshname!r} for {body.name}"
-            )
-        right_mesh = right_mesh_root / Path(source_asset.file).name
-        if not right_mesh.is_file():
-            raise FileNotFoundError(
-                f"Missing right O6 collision mesh: {right_mesh}"
-            )
-        unique_name = f"{body.name}_collision_mesh"
-        spec.add_mesh(name=unique_name, file=str(right_mesh))
-        geom.meshname = unique_name
-        restored += 1
-    if restored != 12:
-        raise ValueError(
-            f"Expected to restore 12 right O6 meshes, restored {restored}"
-        )
-
-
-def _build_gmr_with_hand_model(urdf_path: Path) -> mj.MjModel:
-    """Compile the complete G1+O6 URDF into GMR's floating-base model."""
-
-    resolved = urdf_path.resolve()
-    if not resolved.is_file():
-        raise FileNotFoundError(f"G1+O6 URDF not found: {resolved}")
-
-    spec = mj.MjSpec.from_file(str(resolved))
-    # MuJoCo otherwise fuses fixed links such as hand_base_link into the wrist,
-    # which prevents the actual O6 frames and geometry from entering GMR.
-    spec.compiler.fusestatic = False
-    pelvis = spec.body("pelvis")
-    if pelvis is None:
-        raise ValueError(f"{resolved} has no pelvis root body")
-    if pelvis.joints:
-        raise ValueError("G1+O6 URDF pelvis must be fixed before adding free root")
-    pelvis.pos = [0.0, 0.0, GMR_NEUTRAL_PELVIS_HEIGHT_M]
-    pelvis.add_freejoint(name="pelvis")
-
-    # smplx_to_g1.json targets these operation frames. They are present in the
-    # upstream GMR MJCF but not represented as links in the complete URDF.
-    for side in ("left", "right"):
-        toe_name = f"{side}_toe_link"
-        if spec.body(toe_name) is not None:
-            raise ValueError(f"Unexpected duplicate GMR frame {toe_name}")
-        ankle = spec.body(f"{side}_ankle_roll_link")
-        if ankle is None:
-            raise ValueError(f"{resolved} has no {side} ankle-roll body")
-        ankle.add_body(name=toe_name, pos=GMR_TOE_FRAME_OFFSET_M)
-
-    _restore_right_o6_meshes(spec, resolved)
-    _name_o6_collision_geometries(spec)
-    model = spec.compile()
-
-    expected_dimensions = (58, 57, 52)
-    actual_dimensions = (model.nq, model.nv, model.njnt)
-    if actual_dimensions != expected_dimensions:
-        raise ValueError(
-            "Unexpected complete G1+O6 MuJoCo dimensions: "
-            f"expected nq/nv/njnt={expected_dimensions}, got "
-            f"{actual_dimensions}"
-        )
-    hand_mesh_ids: dict[str, set[int]] = {}
-    for side in ("left", "right"):
-        mesh_ids = {
-            int(model.geom_dataid[geom_id])
-            for geom_id in range(model.ngeom)
-            if (
-                (
-                    body_name := mj.mj_id2name(
-                        model,
-                        mj.mjtObj.mjOBJ_BODY,
-                        int(model.geom_bodyid[geom_id]),
-                    )
-                )
-                is not None
-                and _is_o6_hand_body(body_name, side)
-            )
-        }
-        if len(mesh_ids) != 12 or -1 in mesh_ids:
-            raise ValueError(
-                f"Complete G1+O6 model must retain 12 distinct {side} "
-                f"hand collision meshes, found {sorted(mesh_ids)}"
-            )
-        hand_mesh_ids[side] = mesh_ids
-    if hand_mesh_ids["left"] & hand_mesh_ids["right"]:
-        raise ValueError(
-            "Complete G1+O6 model reused collision mesh assets across hands"
-        )
-    root_joint = mj.mj_name2id(
-        model,
-        mj.mjtObj.mjOBJ_JOINT,
-        "pelvis",
-    )
-    if (
-        root_joint < 0
-        or model.jnt_type[root_joint] != mj.mjtJoint.mjJNT_FREE
-        or model.jnt_qposadr[root_joint] != 0
-        or not np.allclose(
-            model.qpos0[:7],
-            [0.0, 0.0, GMR_NEUTRAL_PELVIS_HEIGHT_M, 1.0, 0.0, 0.0, 0.0],
-            atol=1e-9,
-        )
-    ):
-        raise ValueError("Complete G1+O6 GMR model has an invalid floating root")
-
-    missing_bodies = [
-        body_name
-        for body_name in (
-            *GMR_BODY_LINKS.values(),
-            "left_hand_base_link",
-            "right_hand_base_link",
-        )
-        if mj.mj_name2id(
-            model,
-            mj.mjtObj.mjOBJ_BODY,
-            body_name,
-        )
-        < 0
-    ]
-    missing_joints = [
-        joint_name
-        for joint_name in HAND_JOINTS
-        if mj.mj_name2id(
-            model,
-            mj.mjtObj.mjOBJ_JOINT,
-            joint_name,
-        )
-        < 0
-    ]
-    if missing_bodies or missing_joints:
-        raise ValueError(
-            "Complete G1+O6 GMR model is incomplete: "
-            f"missing bodies={missing_bodies}, missing joints={missing_joints}"
-        )
-    return model
-
-
-def _configure_gmr_hand_constraints(
-    retarget: GMR,
-    hand_joint_names: tuple[str, ...],
-) -> dict[str, object]:
-    """Freeze the retargeted fingers without constraining the two hands."""
-
-    if tuple(hand_joint_names) != tuple(HAND_JOINTS):
-        raise ValueError("O6 hand joint order differs from the complete URDF")
-    retarget.ik_limits.append(
-        mink.VelocityLimit(
-            retarget.model,
-            {joint_name: 0.0 for joint_name in hand_joint_names},
-        )
-    )
-    diagnostics = {
-        "model_kind": GMR_MODEL_KIND,
-        "source_urdf": str(G1_URDF.resolve()),
-        "floating_root": True,
-        "fixed_link_fusion": False,
-        "hand_joint_count": len(hand_joint_names),
-        "cross_hand_geometry_pairs": 0,
-        "cross_hand_collision_avoidance": False,
-        "finger_dofs_frozen_during_body_ik": True,
-        "collision_solver": "disabled",
-        "post_gmr_arm_refinement": False,
-        "phase_iterations": [
-            GMR_COLLISION_PHASE1_MAX_ITERATIONS,
-            GMR_COLLISION_PHASE2_MAX_ITERATIONS,
-        ],
-    }
-    return diagnostics
-
-
-def _solve_complete_gmr_phase(
-    retarget: GMR,
-    tasks: list[mink.FrameTask],
-    *,
-    iterations: int,
-) -> None:
-    """Run a fixed number of constrained differential-IK iterations."""
-
-    for _ in range(iterations):
-        dt = retarget.configuration.model.opt.timestep
-        velocity = mink.solve_ik(
-            retarget.configuration,
-            tasks,
-            dt,
-            retarget.solver,
-            damping=retarget.damping,
-            limits=retarget.ik_limits,
-        )
-        retarget.configuration.integrate_inplace(velocity, dt)
-
-
-def _complete_gmr_retarget(
-    retarget: GMR,
-    human_frame: dict[str, tuple[np.ndarray, np.ndarray]],
-) -> None:
-    """Solve both GMR phases with frozen O6 joints."""
-
-    retarget.update_targets(human_frame)
-    if retarget.use_ik_match_table1:
-        _solve_complete_gmr_phase(
-            retarget,
-            retarget.tasks1,
-            iterations=GMR_COLLISION_PHASE1_MAX_ITERATIONS,
-        )
-    if retarget.use_ik_match_table2:
-        _solve_complete_gmr_phase(
-            retarget,
-            retarget.tasks2,
-            iterations=GMR_COLLISION_PHASE2_MAX_ITERATIONS,
-        )
-
-
-def _set_gmr_hand_configuration(
-    retarget: GMR,
-    hand: O6HandRetargetTrajectory,
-    frame_index: int,
-) -> None:
-    """Inject the exact O6 state whose geometry GMR must avoid."""
-
-    values = np.asarray(hand.joint_positions[frame_index], dtype=np.float64)
-    if values.shape != (len(hand.joint_names),) or not np.isfinite(values).all():
-        raise ValueError(f"Invalid O6 joint state at frame {frame_index}")
-    for joint_name, value in zip(hand.joint_names, values, strict=True):
-        joint_id = mj.mj_name2id(
-            retarget.model,
-            mj.mjtObj.mjOBJ_JOINT,
-            joint_name,
-        )
-        if joint_id < 0:
-            raise KeyError(f"GMR model is missing O6 joint {joint_name!r}")
-        qpos_address = int(retarget.model.jnt_qposadr[joint_id])
-        retarget.configuration.data.qpos[qpos_address] = value
-    mj.mj_forward(retarget.model, retarget.configuration.data)
-
-
-def _validate_o6_mimic_trajectory(
-    model: pin.Model,
-    hand: O6HandRetargetTrajectory,
-) -> dict[str, object]:
-    """Verify the URDF mimic equations that MuJoCo does not import."""
-
-    mimic_joints = getattr(model, "vision_align_mimic_joints", None)
-    if not isinstance(mimic_joints, dict) or len(mimic_joints) != 10:
-        raise ValueError(
-            "Complete G1+O6 Pinocchio model must expose all 10 URDF mimic "
-            "joint equations"
-        )
-    joint_index = {
-        joint_name: index
-        for index, joint_name in enumerate(hand.joint_names)
-    }
-    maximum_residual = 0.0
-    for child, (master, multiplier, offset) in mimic_joints.items():
-        if child not in joint_index or master not in joint_index:
-            raise ValueError(
-                f"O6 hand trajectory is missing mimic pair {master!r} -> "
-                f"{child!r}"
-            )
-        child_values = hand.joint_positions[:, joint_index[child]]
-        master_values = hand.joint_positions[:, joint_index[master]]
-        residual = child_values - (
-            float(multiplier) * master_values + float(offset)
-        )
-        maximum_residual = max(
-            maximum_residual,
-            float(np.max(np.abs(residual))),
-        )
-    if maximum_residual > 1e-9:
-        raise ValueError(
-            "Retargeted O6 trajectory violates URDF mimic equations; "
-            f"maximum residual={maximum_residual:.3e} rad"
-        )
-    return {
-        "source": "main_with_hand_new.urdf",
-        "equation_count": len(mimic_joints),
-        "enforcement": "validated input plus frozen GMR hand DoFs",
-        "maximum_residual_rad": maximum_residual,
-    }
 
 
 def probe_video(path: Path) -> VideoInfo:
@@ -749,7 +402,7 @@ def load_egodex_episode(
         camera_to_world=camera_to_world,
         source_spine3_to_world=source_spine3,
         points=points,
-        source_to_robot_rotation=source_to_robot,
+        source_to_robot_world_rotation=source_to_robot,
     )
 
 
@@ -841,7 +494,7 @@ def _egodex_gmr_frames(
             f"Tracked Hand trajectory length differs for {episode.stem}"
         )
 
-    basis = episode.source_to_robot_rotation
+    basis = episode.source_to_robot_world_rotation
     reference_camera_to_source = episode.camera_to_world[0]
     robot_from_reference_camera = (
         basis @ reference_camera_to_source[:3, :3]
@@ -1014,25 +667,20 @@ def _direction_alignments(
 def _gmr_body_trajectory(
     episode: EgoDexEpisode,
     model: pin.Model,
-    gmr_model: mj.MjModel,
 ) -> tuple[
     GMR,
     np.ndarray,
     np.ndarray,
-    np.ndarray,
     O6HandRetargetTrajectory,
     float,
-    dict[str, object],
 ]:
+    """Solve EgoDex with the same 29-DoF GMR body path as Nymeria."""
+
     retarget = GMR(
         actual_human_height=None,
-        # The config key supplies GMR's G1 joint/task schema. The injected
-        # model below replaces its legacy 43-DoF hand asset with the complete
-        # 51-joint G1+O6 URDF used by this pipeline.
         src_human="smplx",
-        tgt_robot="unitree_g1_with_hands",
+        tgt_robot="unitree_g1",
         verbose=False,
-        robot_model=gmr_model,
     )
     hand_scale = float(
         np.mean(
@@ -1047,89 +695,28 @@ def _gmr_body_trajectory(
         episode.hdf5_path,
         scale=hand_scale,
     )
-    scene_scale = float(retarget.human_scale_table["spine3"])
-    mimic_diagnostics = _validate_o6_mimic_trajectory(model, hand)
-    gmr_model_diagnostics = _configure_gmr_hand_constraints(
-        retarget,
-        hand.joint_names,
-    )
-    gmr_model_diagnostics["mimic_constraints"] = mimic_diagnostics
-    standing = _standing_gmr_frame(retarget)
     frames = _egodex_gmr_frames(
         episode,
-        standing,
+        _standing_gmr_frame(retarget),
         retarget,
         hand,
     )
-    qpos = np.empty(
+    body_qpos = np.empty(
         (episode.frame_count, retarget.model.nq),
         dtype=np.float64,
     )
-    position_errors = np.empty(
-        (episode.frame_count, len(GMR_UPPER_BODY)),
-        dtype=np.float64,
-    )
     task_errors = np.empty(episode.frame_count, dtype=np.float64)
-    maximum_hand_solver_drift = 0.0
     for frame_index, human_frame in enumerate(frames):
-        _set_gmr_hand_configuration(retarget, hand, frame_index)
-        _complete_gmr_retarget(retarget, human_frame)
-        for joint_index, joint_name in enumerate(hand.joint_names):
-            joint_id = mj.mj_name2id(
-                retarget.model,
-                mj.mjtObj.mjOBJ_JOINT,
-                joint_name,
-            )
-            qpos_address = int(retarget.model.jnt_qposadr[joint_id])
-            drift = abs(
-                float(retarget.configuration.data.qpos[qpos_address])
-                - float(hand.joint_positions[frame_index, joint_index])
-            )
-            maximum_hand_solver_drift = max(
-                maximum_hand_solver_drift,
-                drift,
-            )
-            if drift > 1e-5:
-                raise RuntimeError(
-                    f"GMR failed to freeze O6 joint {joint_name!r} at frame "
-                    f"{frame_index}; drift={drift:.3e} rad"
-                )
-        # The QP backend may leave sub-microradian feasibility residuals on
-        # zero-velocity joints. Reapply the exact retargeted O6 state before
-        # recording the frame.
-        _set_gmr_hand_configuration(retarget, hand, frame_index)
-        qpos[frame_index] = retarget.configuration.data.qpos
-        mj.mj_forward(retarget.model, retarget.configuration.data)
-        for target_index, human_name in enumerate(GMR_UPPER_BODY):
-            body_id = mj.mj_name2id(
-                retarget.model,
-                mj.mjtObj.mjOBJ_BODY,
-                GMR_BODY_LINKS[human_name],
-            )
-            position_errors[frame_index, target_index] = np.linalg.norm(
-                retarget.configuration.data.xpos[body_id]
-                - retarget.scaled_human_data[human_name][0]
-            )
-        task_errors[frame_index] = retarget.error2()
-    gmr_model_diagnostics["solver_step_count"] = int(
-        episode.frame_count
-        * (
-            GMR_COLLISION_PHASE1_MAX_ITERATIONS
-            + GMR_COLLISION_PHASE2_MAX_ITERATIONS
-        )
-    )
-    gmr_model_diagnostics["maximum_frozen_hand_solver_drift_rad"] = (
-        maximum_hand_solver_drift
-    )
+        body_qpos[frame_index] = retarget.retarget(human_frame)
+        task_errors[frame_index] = float(retarget.error2())
     return (
         retarget,
-        qpos,
-        position_errors,
+        body_qpos,
         task_errors,
         hand,
-        scene_scale,
-        gmr_model_diagnostics,
+        float(retarget.human_scale_table["spine3"]),
     )
+
 
 
 def _merge_body_and_hands(
@@ -1139,37 +726,20 @@ def _merge_body_and_hands(
     hand_joint_names: tuple[str, ...],
     hand_joint_positions: np.ndarray,
 ) -> tuple[np.ndarray, list[str]]:
-    joint_names = list(model.names[1:])
-    state = np.repeat(
-        pin.neutral(model)[None],
-        len(body_qpos),
-        axis=0,
+    state, joint_names, _, open_hand_names = merge_body_with_open_hands(
+        model,
+        retarget,
+        body_qpos,
     )
-    hand_index = {
-        name: index for index, name in enumerate(hand_joint_names)
-    }
-    for joint_name in joint_names:
-        robot_joint_id = model.getJointId(joint_name)
-        state_index = model.idx_qs[robot_joint_id]
-        gmr_joint_id = mj.mj_name2id(
-            retarget.model,
-            mj.mjtObj.mjOBJ_JOINT,
-            joint_name,
-        )
-        if gmr_joint_id < 0:
-            raise KeyError(f"Complete GMR model is missing joint {joint_name!r}")
-        gmr_qpos_index = retarget.model.jnt_qposadr[gmr_joint_id]
-        state[:, state_index] = body_qpos[:, gmr_qpos_index]
-        if joint_name in hand_index and not np.allclose(
-            state[:, state_index],
-            hand_joint_positions[:, hand_index[joint_name]],
-            atol=1e-8,
-        ):
-            raise RuntimeError(
-                f"Complete GMR state disagrees with O6 retarget for "
-                f"{joint_name!r}"
-            )
-
+    if set(open_hand_names) != set(hand_joint_names):
+        raise ValueError("EgoDex O6 joints differ from the G1 hand joints")
+    hand_index = {name: index for index, name in enumerate(hand_joint_names)}
+    for joint_name in open_hand_names:
+        joint_id = model.getJointId(joint_name)
+        state[:, model.idx_qs[joint_id]] = hand_joint_positions[
+            :,
+            hand_index[joint_name],
+        ]
     if np.any(state < model.lowerPositionLimit - 1e-6) or np.any(
         state > model.upperPositionLimit + 1e-6
     ):
@@ -1177,222 +747,18 @@ def _merge_body_and_hands(
     return state.astype(np.float32), joint_names
 
 
-def _build_cross_hand_collision_checker(
-    model: pin.Model,
-    urdf_path: Path,
-) -> CrossHandCollisionChecker:
-    geometry_model = pin.buildGeomFromUrdf(
-        model,
-        str(urdf_path),
-        pin.GeometryType.COLLISION,
-        None,
-        [str(urdf_path.parent)],
-    )
-
-    def side_geometry_ids(side: str) -> list[int]:
-        result: list[int] = []
-        for geometry_id, geometry in enumerate(
-            geometry_model.geometryObjects
-        ):
-            link_name = model.frames[geometry.parentFrame].name
-            if not link_name.startswith(f"{side}_"):
-                continue
-            if any(part in link_name for part in HAND_COLLISION_LINK_PARTS):
-                result.append(geometry_id)
-        return result
-
-    left_ids = side_geometry_ids("left")
-    right_ids = side_geometry_ids("right")
-    if len(left_ids) != 12 or len(right_ids) != 12:
-        raise ValueError(
-            "Expected 12 collision geometries per O6 hand, found "
-            f"left={len(left_ids)} and right={len(right_ids)}"
-        )
-
-    pair_names: list[tuple[str, str]] = []
-    palm_pair_index = -1
-    for left_id in left_ids:
-        for right_id in right_ids:
-            left_name = geometry_model.geometryObjects[left_id].name
-            right_name = geometry_model.geometryObjects[right_id].name
-            geometry_model.addCollisionPair(
-                pin.CollisionPair(left_id, right_id)
-            )
-            pair_names.append((left_name, right_name))
-            if (
-                "hand_base_link" in left_name
-                and "hand_base_link" in right_name
-            ):
-                palm_pair_index = len(pair_names) - 1
-    if len(pair_names) != 144 or palm_pair_index < 0:
-        raise RuntimeError(
-            "Failed to construct all 144 cross-hand collision pairs"
-        )
-    return CrossHandCollisionChecker(
-        geometry_model=geometry_model,
-        pair_names=tuple(pair_names),
-        palm_pair_index=palm_pair_index,
-    )
-
-
-def _cross_hand_collision_validation(
-    model: pin.Model,
-    checker: CrossHandCollisionChecker,
-    state: np.ndarray,
-) -> tuple[dict[str, float | int], dict[str, object]]:
-    geometry_model = checker.geometry_model
-    if len(geometry_model.collisionPairs) != len(checker.pair_names):
-        raise RuntimeError("Cross-hand collision pair metadata is inconsistent")
-
-    model_data = model.createData()
-    geometry_data = pin.GeometryData(geometry_model)
-    collision_frames: list[int] = []
-    palm_collision_frames: list[int] = []
-    near_clearance_frames: list[int] = []
-    maximum_penetration = 0.0
-    minimum_signed_distance = np.inf
-    worst_frame = -1
-    worst_pair = ("", "")
-
-    for frame_index, qpos in enumerate(state.astype(np.float64)):
-        pin.computeCollisions(
-            model,
-            model_data,
-            geometry_model,
-            geometry_data,
-            qpos,
-            False,
-        )
-        frame_penetration = 0.0
-        frame_worst_pair = ("", "")
-        palm_penetration = 0.0
-        for pair_index, result in enumerate(
-            geometry_data.collisionResults
-        ):
-            if not result.isCollision():
-                continue
-            penetration = max(
-                (
-                    float(contact.penetration_depth)
-                    for contact in result.getContacts()
-                ),
-                default=0.0,
-            )
-            if penetration > frame_penetration:
-                frame_penetration = penetration
-                frame_worst_pair = checker.pair_names[pair_index]
-            if pair_index == checker.palm_pair_index:
-                palm_penetration = max(palm_penetration, penetration)
-
-        pin.computeDistances(
-            model,
-            model_data,
-            geometry_model,
-            geometry_data,
-            qpos,
-        )
-        frame_clearance = min(
-            float(result.min_distance)
-            for result in geometry_data.distanceResults
-        )
-        signed_distance = (
-            -frame_penetration
-            if frame_penetration > 0.0
-            else frame_clearance
-        )
-        minimum_signed_distance = min(
-            minimum_signed_distance,
-            signed_distance,
-        )
-        if frame_clearance < CROSS_HAND_NEAR_CLEARANCE_M:
-            near_clearance_frames.append(frame_index)
-        if frame_penetration > CROSS_HAND_COLLISION_TOLERANCE_M:
-            collision_frames.append(frame_index)
-            if frame_penetration > maximum_penetration:
-                maximum_penetration = frame_penetration
-                worst_frame = frame_index
-                worst_pair = frame_worst_pair
-        if palm_penetration > CROSS_HAND_COLLISION_TOLERANCE_M:
-            palm_collision_frames.append(frame_index)
-
-    metrics: dict[str, float | int] = {
-        "cross_hand_collision_pair_count": len(checker.pair_names),
-        "cross_hand_collision_frame_count": len(collision_frames),
-        "cross_hand_collision_fraction": (
-            len(collision_frames) / len(state)
-        ),
-        "cross_hand_palm_collision_frame_count": len(
-            palm_collision_frames
-        ),
-        "cross_hand_palm_collision_fraction": (
-            len(palm_collision_frames) / len(state)
-        ),
-        "cross_hand_max_penetration_m": maximum_penetration,
-        "cross_hand_min_signed_distance_m": float(
-            minimum_signed_distance
-        ),
-        "cross_hand_near_clearance_frame_count": len(
-            near_clearance_frames
-        ),
-        "cross_hand_collision_tolerance_m": (
-            CROSS_HAND_COLLISION_TOLERANCE_M
-        ),
-        "cross_hand_near_clearance_threshold_m": (
-            CROSS_HAND_NEAR_CLEARANCE_M
-        ),
-    }
-    diagnostics: dict[str, object] = {
-        "status": "passed" if not collision_frames else "failed",
-        "checked_pair_count": len(checker.pair_names),
-        "collision_frame_indices": collision_frames,
-        "palm_collision_frame_indices": palm_collision_frames,
-        "near_clearance_frame_indices": near_clearance_frames,
-        "worst_frame_index": worst_frame,
-        "worst_geometry_pair": list(worst_pair),
-    }
-    return metrics, diagnostics
-
-
-def _minimum_hand_distance(
-    model: pin.Model,
-    state: np.ndarray,
-) -> float:
-    frame_ids = [
-        model.getFrameId("left_hand_base_link"),
-        model.getFrameId("right_hand_base_link"),
-    ]
-    if any(frame_id >= model.nframes for frame_id in frame_ids):
-        raise KeyError("G1 URDF is missing a hand base frame")
-    data = model.createData()
-    minimum = np.inf
-    for qpos in state:
-        pin.forwardKinematics(model, data, qpos)
-        pin.updateFramePlacements(model, data)
-        distance = np.linalg.norm(
-            data.oMf[frame_ids[0]].translation
-            - data.oMf[frame_ids[1]].translation
-        )
-        minimum = min(minimum, float(distance))
-    return minimum
-
 
 def retarget_episode(
     episode: EgoDexEpisode,
     model: pin.Model,
-    gmr_model: mj.MjModel,
-    collision_checker: CrossHandCollisionChecker,
 ) -> tuple[RetargetedEpisode, list[str]]:
     (
         retarget,
         body_qpos,
-        position_errors,
         task_errors,
         hand,
         scene_scale,
-        gmr_model_diagnostics,
-    ) = (
-        _gmr_body_trajectory(episode, model, gmr_model)
-    )
+    ) = _gmr_body_trajectory(episode, model)
     state, joint_names = _merge_body_and_hands(
         model,
         retarget,
@@ -1400,24 +766,16 @@ def retarget_episode(
         hand.joint_names,
         hand.joint_positions,
     )
-    if not np.isfinite(state).all():
-        raise ValueError(f"GMR produced non-finite state for {episode.stem}")
-    collision_metrics, collision_diagnostics = (
-        _cross_hand_collision_validation(
-            model,
-            collision_checker,
-            state,
-        )
-    )
     action_indices = np.minimum(
         np.arange(episode.frame_count) + ACTION_OFFSET,
         episode.frame_count - 1,
     )
     action = state[action_indices].copy()
-
-    root_quaternion_xyzw = body_qpos[:, 3:7][:, [1, 2, 3, 0]]
     root_pose = np.concatenate(
-        (body_qpos[:, :3], root_quaternion_xyzw),
+        [
+            body_qpos[:, :3],
+            body_qpos[:, 3:7][:, [1, 2, 3, 0]],
+        ],
         axis=1,
     ).astype(np.float32)
     robot_torso_poses_world = robot_frame_poses_world(
@@ -1425,90 +783,69 @@ def retarget_episode(
         joint_names=tuple(joint_names),
         joint_positions=state,
         root_pose_xyzw=root_pose,
-        frame_name=GMR_BODY_LINKS["spine3"],
+        frame_name=HEAD_CAMERA_PARENT_FRAME,
     )
-    source_camera_pose_in_spine3 = source_camera_poses_in_spine3_cv(
+    (
+        camera_pose,
+        source_camera_pose_in_spine3,
+        source_camera_rotation_world,
+        source_spine3_to_robot_torso_rotation,
+    ) = retarget_scene_camera_poses_cv(
         source_camera_to_world=episode.camera_to_world,
         source_spine3_to_world=episode.source_spine3_to_world,
-    )
-    robot_torso_rotation = Rotation.from_quat(
-        robot_torso_poses_world[:, 3:7]
-    ).as_matrix()
-    source_spine3_to_robot_torso_rotation = Rotation.from_matrix(
-        robot_torso_rotation[0].T
-        @ episode.source_to_robot_rotation
-        @ episode.source_spine3_to_world[0, :3, :3]
-    ).as_matrix()
-    camera_pose = torso_anchored_camera_poses_cv(
-        source_camera_pose_in_spine3_xyzw=(
-            source_camera_pose_in_spine3
-        ),
+        source_to_robot_world_rotation=episode.source_to_robot_world_rotation,
         robot_torso_pose_world_xyzw=robot_torso_poses_world,
-        source_spine3_to_robot_torso_rotation=(
-            source_spine3_to_robot_torso_rotation
-        ),
         scene_scale=scene_scale,
-    ).astype(np.float32)
+    )
     intrinsic = np.repeat(
         episode.intrinsic.reshape(1, 9),
         episode.frame_count,
         axis=0,
     ).astype(np.float32)
-
     joint_step = (
         np.abs(np.diff(state.astype(np.float64), axis=0))
         if len(state) > 1
         else np.zeros((1, state.shape[1]), dtype=np.float64)
     )
-    metrics = {
-        "ik_position_rmse_m": float(
-            np.sqrt(np.mean(np.square(position_errors)))
-        ),
-        "ik_position_max_error_m": float(np.max(position_errors)),
-        "gmr_task_error_mean": float(np.mean(task_errors)),
-        "gmr_task_error_max": float(np.max(task_errors)),
-        "min_hand_center_distance_m": _minimum_hand_distance(model, state),
-        "max_joint_step_rad": float(np.max(joint_step)),
-        "mean_joint_step_rad": float(np.mean(joint_step)),
-        "max_leg_deviation_from_neutral_rad": float(
-            np.max(np.abs(state[:, :12]))
-        ),
-        **collision_metrics,
-    }
     hand_diagnostics = dict(hand.diagnostics)
     hand_diagnostics["target_adapter"] = {
+        "body_retargeter": "unitree_g1 (same as Nymeria)",
         "source_action_mode": hand.action_mode,
-        "mapping": (
-            "tracked Hand pose -> fixed side-specific local-axis map -> "
-            "GMR wrist target"
-        ),
         "wrist_rotation_source": "tracked EgoDex Hand orientation",
         "wrist_position_source": "tracked EgoDex Hand wrist-root position",
     }
-    hand_diagnostics["cross_hand_collision_validation"] = (
-        collision_diagnostics
-    )
-    hand_diagnostics["gmr_model"] = gmr_model_diagnostics
     return (
         RetargetedEpisode(
             source=episode,
             state=state,
             action=action,
             root_pose=root_pose,
-            camera_pose=camera_pose,
+            camera_pose=camera_pose.astype(np.float32),
             source_camera_pose_in_spine3=(
                 source_camera_pose_in_spine3.astype(np.float32)
+            ),
+            source_camera_rotation_world=(
+                source_camera_rotation_world.astype(np.float32)
+            ),
+            source_to_robot_world_rotation=(
+                episode.source_to_robot_world_rotation.astype(np.float64)
             ),
             source_spine3_to_robot_torso_rotation=(
                 source_spine3_to_robot_torso_rotation
             ),
             camera_intrinsics=intrinsic,
             scene_scale=float(scene_scale),
-            metrics=metrics,
+            metrics={
+                "gmr_task_error_mean": float(np.mean(task_errors)),
+                "gmr_task_error_max": float(np.max(task_errors)),
+                "max_joint_step_rad": float(np.max(joint_step)),
+                "mean_joint_step_rad": float(np.mean(joint_step)),
+            },
             hand_diagnostics=hand_diagnostics,
         ),
         joint_names,
     )
+
 
 
 def _numeric_stats(values: np.ndarray) -> dict[str, list[Any]]:
@@ -1686,6 +1023,9 @@ def _episode_columns(
         "observation.source_camera_pose_in_spine3_xyzw": (
             episode.source_camera_pose_in_spine3
         ),
+        "observation.source_camera_rotation_world_xyzw": (
+            episode.source_camera_rotation_world
+        ),
         "timestamp": (
             np.arange(length, dtype=np.float32)
             / np.float32(episode.source.video.fps)
@@ -1790,6 +1130,12 @@ def _feature_schema(
             "dtype": "float32",
             "shape": [7],
             "names": pose_names,
+            "fps": int(round(video.fps)),
+        },
+        "observation.source_camera_rotation_world_xyzw": {
+            "dtype": "float32",
+            "shape": [4],
+            "names": ["qx", "qy", "qz", "qw"],
             "fps": int(round(video.fps)),
         },
         VIDEO_KEY: {
@@ -1963,17 +1309,21 @@ def write_lerobot_v3(
                     "source_video": str(source.video_path),
                     "task": source.task,
                     "frame_count": length,
-                    "mapping_mode": TORSO_ANCHORED_CAMERA_MAPPING,
                     "scene_scale": episode.scene_scale,
                     "scene_scale_source": "gmr_spine3_scale",
                     "source_spine3_to_robot_torso_rotation": (
                         episode.source_spine3_to_robot_torso_rotation.tolist()
+                    ),
+                    "source_to_robot_world_rotation": (
+                        episode.source_to_robot_world_rotation.tolist()
                     ),
                     "local_basis_source": (
                         "frame0_source_spine3_axes_mapped_through_initial_"
                         "egodex_hip_world_basis_into_g1_torso_fk"
                     ),
                     "local_basis_reference_frame": 0,
+                    "scene_camera_position_anchor": "g1_torso_fk",
+                    "scene_camera_rotation_anchor": "raw_source_world",
                     "retarget_metrics": episode.metrics,
                     "hand_retarget": episode.hand_diagnostics,
                 }
@@ -2023,35 +1373,12 @@ def write_lerobot_v3(
         write_json_atomic(
             temporary_root / "meta/egodex.json",
             {
-                "schema_version": 9,
+                "schema_version": 10,
                 "source_format": "EgoDex annotated HDF5 + MP4",
                 "robot": "unitree_g1_with_hands",
                 "retargeter": "general_motion_retargeting",
-                "body_solver": "mink_complete_g1_o6",
+                "body_solver": "unitree_g1 (same as Nymeria)",
                 "body_config": "smplx_to_g1.json",
-                "gmr_robot_model": {
-                    "kind": GMR_MODEL_KIND,
-                    "source_urdf": str(G1_URDF.resolve()),
-                    "floating_root": True,
-                    "fixed_link_fusion": False,
-                    "robot_joint_count": 51,
-                    "o6_hand_joint_count": len(HAND_JOINTS),
-                    "o6_mimic_constraints": {
-                        "equation_count": 10,
-                        "policy": (
-                            "validate retargeted values and freeze all hand "
-                            "DoFs during GMR"
-                        ),
-                    },
-                    "cross_hand_collision_avoidance": {
-                        "enabled": False,
-                        "geometry_pairs": 0,
-                        "solver": "disabled",
-                        "final_validation_penetration_tolerance_m": (
-                            CROSS_HAND_COLLISION_TOLERANCE_M
-                        ),
-                    },
-                },
                 "lower_body_target": "G1 neutral standing FK",
                 "hand_retargeter": (
                     "tracked Hand pose to GMR wrist target plus 25-landmark "
@@ -2061,23 +1388,12 @@ def write_lerobot_v3(
                     "tracked Hand pose -> fixed side-specific local-axis map "
                     "-> GMR wrist target"
                 ),
-                "cross_hand_collision_validation": {
-                    "geometry_pairs": 144,
-                    "penetration_tolerance_m": (
-                        CROSS_HAND_COLLISION_TOLERANCE_M
-                    ),
-                    "near_clearance_threshold_m": (
-                        CROSS_HAND_NEAR_CLEARANCE_M
-                    ),
-                    "failure_policy": "audit_only",
-                },
                 "robot_urdf": str(G1_URDF),
                 "joint_order": joint_names,
                 "action_offset_frames": ACTION_OFFSET,
                 "camera": (
-                    "source spine3-to-camera local motion is applied to G1 "
-                    "torso FK; G1 capture camera keeps its independent fixed "
-                    "physical offset"
+                    "source camera world rotation with XYZ anchored to G1 "
+                    "torso FK; G1 capture camera remains independent"
                 ),
                 "episodes": manifest_episodes,
             },
@@ -2134,6 +1450,10 @@ def parse_args() -> argparse.Namespace:
         help="LeRobot v3 output directory; overwritten by default.",
     )
     parser.add_argument(
+        "--stem",
+        help="Convert only this exact source stem relative to --src-root.",
+    )
+    parser.add_argument(
         "--overwrite",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -2147,13 +1467,12 @@ def main() -> None:
     if not G1_URDF.is_file():
         raise FileNotFoundError(f"G1 URDF not found: {G1_URDF}")
     model = build_pinocchio_g1(G1_URDF)
-    gmr_model = _build_gmr_with_hand_model(G1_URDF)
-    collision_checker = _build_cross_hand_collision_checker(
-        model,
-        G1_URDF,
-    )
 
     pairs = discover_source_pairs(args.src_root.resolve())
+    if args.stem is not None:
+        pairs = [pair for pair in pairs if pair.stem == args.stem]
+        if len(pairs) != 1:
+            raise ValueError(f"EgoDex stem {args.stem!r} matched {len(pairs)} episodes")
     episodes = [
         load_egodex_episode(pair)
         for pair in pairs
@@ -2166,8 +1485,6 @@ def main() -> None:
         converted, episode_joint_names = retarget_episode(
             episode,
             model=model,
-            gmr_model=gmr_model,
-            collision_checker=collision_checker,
         )
         if joint_names is None:
             joint_names = episode_joint_names
@@ -2176,7 +1493,7 @@ def main() -> None:
         retargeted.append(converted)
         print(
             f"{episode.stem}: frames={episode.frame_count}, "
-            f"IK_RMSE={converted.metrics['ik_position_rmse_m']:.4f} m, "
+            f"GMR_error={converted.metrics['gmr_task_error_mean']:.4f}, "
             f"max_joint_step={converted.metrics['max_joint_step_rad']:.4f} rad"
         )
 

@@ -23,13 +23,13 @@ from repaint.rgbd_episode import (  # noqa: E402
 )
 from repaint.rgbd_geometry import scale_intrinsic  # noqa: E402
 from repaint.lighting_profile import estimate_lighting_profile  # noqa: E402
-from repaint.robot_camera import TORSO_ANCHORED_CAMERA_MAPPING  # noqa: E402
+from repaint.scene_hand_alignment import (  # noqa: E402
+    initial_palm_scene_translation,
+)
 from repaint.vda_depth import (  # noqa: E402
     DEFAULT_CHECKPOINT,
     DEFAULT_VDA_METRIC_SCALE,
     DecodedVideoFrames,
-    INFERENCE_OVERLAP_FRAMES,
-    INFERENCE_WINDOW_FRAMES,
     MODEL_CONFIGS,
     MODEL_SCALE_NAMES,
     decode_contiguous_video_frames_rgb,
@@ -106,46 +106,15 @@ def _load_nymeria_human_arm_visibility(
     return np.asarray(values, dtype=bool)[selected]
 
 
-def _require_output_layout(output_root: Path) -> tuple[Path, Path]:
-    output_root.mkdir(parents=True, exist_ok=True)
+def _create_output_layout(output_root: Path) -> tuple[Path, Path]:
+    if output_root.exists():
+        raise FileExistsError(f"Output already exists: {output_root}")
+    output_root.mkdir(parents=True)
     frame_root = output_root / "rgb"
     depth_root = output_root / "depth_mm"
     for path in (frame_root, depth_root):
-        if path.exists() and any(path.iterdir()):
-            raise FileExistsError(
-                f"Refusing to mix a new preparation with existing files: {path}"
-            )
-        path.mkdir(parents=True, exist_ok=True)
-    for path in (
-        output_root / "episode_data.npz",
-        output_root / "prepare_report.json",
-        output_root / "lighting_profile.json",
-        output_root / "lighting_profile_samples.jpg",
-    ):
-        if path.exists():
-            raise FileExistsError(f"Output already exists: {path}")
+        path.mkdir()
     return frame_root, depth_root
-
-
-def _validate_output_available(output_root: Path) -> None:
-    """Reject a conflicting output before either expensive VDA pass."""
-
-    if output_root.exists() and not output_root.is_dir():
-        raise NotADirectoryError(output_root)
-    for directory in (output_root / "rgb", output_root / "depth_mm"):
-        if directory.exists() and any(directory.iterdir()):
-            raise FileExistsError(
-                f"Refusing to mix a new preparation with existing files: "
-                f"{directory}"
-            )
-    for path in (
-        output_root / "episode_data.npz",
-        output_root / "prepare_report.json",
-        output_root / "lighting_profile.json",
-        output_root / "lighting_profile_samples.jpg",
-    ):
-        if path.exists():
-            raise FileExistsError(f"Output already exists: {path}")
 
 
 def _resolve_episode_metric_scale(
@@ -205,20 +174,6 @@ def _resolve_episode_metric_scale(
         calibration["resolved_mode"] = "auto"
         return float(calibration["resolved_vda_metric_scale"]), calibration
     reasons = calibration["decision"]["reasons"]
-    if args.vda_scale_failure_policy == "fixed":
-        calibration["requested_mode"] = "auto"
-        calibration["resolved_mode"] = "fixed_fallback"
-        calibration["automatic_candidate_vda_metric_scale"] = calibration[
-            "resolved_vda_metric_scale"
-        ]
-        calibration["resolved_vda_metric_scale"] = fixed_scale
-        calibration["fallback_reason"] = reasons
-        print(
-            "WARNING: automatic VDA scale rejected; using explicitly allowed "
-            f"fixed fallback {fixed_scale}: {reasons}",
-            flush=True,
-        )
-        return fixed_scale, calibration
     raise RuntimeError(
         "Automatic VDA metric scale failed quality gates: "
         f"{reasons}. Use --vda-scale-mode fixed only after choosing an "
@@ -229,7 +184,7 @@ def _resolve_episode_metric_scale(
 def prepare(args: argparse.Namespace) -> dict[str, object]:
     started = time.perf_counter()
     output_root = args.output.resolve()
-    _validate_output_available(output_root)
+    frame_root, depth_root = _create_output_layout(output_root)
     episode = load_rgbd_episode(
         dataset_root=args.dataset,
         source_root=args.source_root,
@@ -238,11 +193,20 @@ def prepare(args: argparse.Namespace) -> dict[str, object]:
         start_frame=args.start_frame,
         end_frame=args.end_frame,
     )
-    camera_mapping_mode = TORSO_ANCHORED_CAMERA_MAPPING
-    # The recorded torso-anchored trajectory is authoritative; replay does not
-    # add another scene-placement transform.
     joint_positions = episode.joint_positions
     camera_pose = episode.camera_pose_cv_xyzw
+    scene_translation_world_xyz_m = np.zeros(3, dtype=np.float64)
+    if episode.source_dataset_kind == "egodex":
+        scene_translation_world_xyz_m = initial_palm_scene_translation(
+            source_hdf5=episode.source_hdf5,
+            frame_indices=episode.frame_indices,
+            scene_scale=episode.scene_scale,
+            scene_camera_pose_cv_xyzw=camera_pose,
+            urdf_path=args.urdf,
+            joint_names=episode.joint_names,
+            joint_positions=joint_positions,
+            root_pose_xyzw=episode.root_pose_xyzw,
+        )
     if episode.source_dataset_kind == "nymeria":
         human_arm_visible = _load_nymeria_human_arm_visibility(
             removed_root=args.removed_root,
@@ -316,60 +280,12 @@ def prepare(args: argparse.Namespace) -> dict[str, object]:
             else None
         ),
     )
-    depth_backend_report: dict[str, object] = {
-        "backend": "video-depth-anything",
-        "model": (
-            "Metric-Video-Depth-Anything-"
-            f"{MODEL_SCALE_NAMES[args.vda_encoder]}"
-        ),
-        "encoder": args.vda_encoder,
-        "metric": True,
-        "checkpoint": str(checkpoint),
-        "checkpoint_bytes": checkpoint.stat().st_size,
-        "checkpoint_sha256": file_sha256(checkpoint),
-        "input_size": args.vda_input_size,
-        "max_video_resolution": args.vda_max_resolution,
-        "precision": "fp32" if args.vda_fp32 else "autocast-fp16",
-        "window_frames": INFERENCE_WINDOW_FRAMES,
-        "window_overlap_frames": INFERENCE_OVERLAP_FRAMES,
-        "inference_size": list(decoded.inference_size),
-        "video_frame_count": decoded.video_frame_count,
-        "selected_frame_indices": decoded.frame_indices.tolist(),
-        "selected_frame_start": int(decoded.frame_indices[0]),
-        "selected_frame_end_exclusive": int(decoded.frame_indices[-1] + 1),
-        "selection_is_contiguous": True,
-        "input_video_sha256": file_sha256(episode.removed_video),
-        "raw_depth": "metric camera-Z meters",
-        "vda_metric_scale": resolved_vda_metric_scale,
-        "vda_metric_scale_source": (
-            "explicit fixed value or explicitly allowed fallback"
-            if scale_calibration["resolved_mode"] != "auto"
-            else (
-                "automatic per-episode Aria MPS semidense background anchor"
-                if scale_calibration.get("method")
-                == "aria-mps-semidense-background-depth"
-                else "automatic per-episode HDF5 hand anchor plus unchanged "
-                "background transfer"
-            )
-        ),
-        "vda_scale_calibration": scale_calibration,
-        "vda_metric_scale_application_count": 1,
-        "scene_scale": episode.scene_scale,
-        "scene_scale_source": "gmr_spine3_scale",
-        "scene_scale_application_count": 1,
-        "effective_raw_depth_to_robot_scale": (
-            resolved_vda_metric_scale * episode.scene_scale
-        ),
-        "far_depth_clipped_pixel_count": int(
-            np.count_nonzero(depths_mesh_m == 0.0)
-        ),
-        "depth_resize_interpolation": "nearest",
-    }
+    checkpoint_sha256 = file_sha256(checkpoint)
+    clipped_depth_pixels = int(np.count_nonzero(depths_mesh_m == 0.0))
     del depths_raw_m, decoded
 
-    frame_root, depth_root = _require_output_layout(output_root)
     lighting_profile_path = output_root / "lighting_profile.json"
-    lighting_profile = estimate_lighting_profile(
+    estimate_lighting_profile(
         inpaint_video=episode.removed_video,
         output_path=lighting_profile_path,
     )
@@ -417,39 +333,33 @@ def prepare(args: argparse.Namespace) -> dict[str, object]:
         removed_capture.release()
 
     episode_data_path = output_root / "episode_data.npz"
-    np.savez_compressed(
-        episode_data_path,
-        episode_index=np.asarray(episode.episode_index, dtype=np.int64),
-        source_dataset_kind=np.asarray(episode.source_dataset_kind),
-        camera_mapping_mode=np.asarray(camera_mapping_mode),
-        fps=np.asarray(episode.fps, dtype=np.float64),
-        source_size=np.asarray(episode.source_size, dtype=np.int64),
-        mesh_size=np.asarray(mesh_size, dtype=np.int64),
-        frame_indices=episode.frame_indices,
-        human_arm_visible=human_arm_visible,
-        joint_names=np.asarray(episode.joint_names),
-        joint_positions=joint_positions.astype(np.float32),
-        root_pose_xyzw=episode.root_pose_xyzw.astype(np.float32),
-        camera_pose_cv_xyzw=camera_pose.astype(np.float32),
-        source_camera_pose_in_spine3_xyzw=(
-            episode.source_camera_pose_in_spine3_xyzw.astype(np.float32)
-        ),
-        intrinsic=episode.intrinsic.astype(np.float64),
-        mesh_intrinsic=mesh_intrinsic.astype(np.float64),
-        scene_scale=np.asarray(episode.scene_scale, dtype=np.float64),
-        source_spine3_to_robot_torso_rotation=(
-            episode.source_spine3_to_robot_torso_rotation.astype(np.float64)
-        ),
-        g1_urdf=np.asarray(str(args.urdf.resolve())),
-        vda_metric_scale=np.asarray(
+    episode_data = {
+        "episode_index": np.asarray(episode.episode_index, dtype=np.int64),
+        "source_dataset_kind": np.asarray(episode.source_dataset_kind),
+        "fps": np.asarray(episode.fps, dtype=np.float64),
+        "source_size": np.asarray(episode.source_size, dtype=np.int64),
+        "mesh_size": np.asarray(mesh_size, dtype=np.int64),
+        "frame_indices": episode.frame_indices,
+        "human_arm_visible": human_arm_visible,
+        "joint_names": np.asarray(episode.joint_names),
+        "joint_positions": joint_positions.astype(np.float32),
+        "root_pose_xyzw": episode.root_pose_xyzw.astype(np.float32),
+        "camera_pose_cv_xyzw": camera_pose.astype(np.float32),
+        "intrinsic": episode.intrinsic.astype(np.float64),
+        "mesh_intrinsic": mesh_intrinsic.astype(np.float64),
+        "scene_scale": np.asarray(episode.scene_scale, dtype=np.float64),
+        "scene_translation_world_xyz_m": scene_translation_world_xyz_m,
+        "g1_urdf": np.asarray(str(args.urdf.resolve())),
+        "vda_metric_scale": np.asarray(
             resolved_vda_metric_scale,
             dtype=np.float64,
         ),
-        vda_scale_mode=np.asarray(
+        "vda_scale_mode": np.asarray(
             str(scale_calibration["resolved_mode"])
         ),
-        lighting_profile=np.asarray(str(lighting_profile_path)),
-    )
+        "lighting_profile": np.asarray(str(lighting_profile_path)),
+    }
+    np.savez_compressed(episode_data_path, **episode_data)
 
     samples = (
         np.concatenate(positive_depth_samples)
@@ -461,11 +371,18 @@ def prepare(args: argparse.Namespace) -> dict[str, object]:
         if samples.size
         else [None, None, None]
     )
+    decision = scale_calibration.get("decision", {})
     depth_report: dict[str, object] = {
-        **depth_backend_report,
-        "method": "offline_metric_video_depth_anything",
-        "input": "removed-arm RGB",
-        "output_unit": "uint16 millimeters in robot-scene scale",
+        "model": f"Metric-VDA-{MODEL_SCALE_NAMES[args.vda_encoder]}",
+        "checkpoint_sha256": checkpoint_sha256,
+        "scale_mode": scale_calibration["resolved_mode"],
+        "calibration_method": scale_calibration.get("method", "fixed"),
+        "calibration_status": decision.get("status", "fixed"),
+        "calibration_reasons": decision.get("reasons", []),
+        "vda_scale": resolved_vda_metric_scale,
+        "scene_scale": episode.scene_scale,
+        "effective_scale": resolved_vda_metric_scale * episode.scene_scale,
+        "clipped_pixels": clipped_depth_pixels,
         "percentiles_mm": {
             "p01": percentiles[0],
             "p50": percentiles[1],
@@ -473,48 +390,17 @@ def prepare(args: argparse.Namespace) -> dict[str, object]:
         },
     }
     report: dict[str, object] = {
-        "schema_version": 2,
-        "method": "handless_rgb_plus_metric_vda_rgbd_mesh",
+        "schema_version": 3,
         "source_dataset_kind": episode.source_dataset_kind,
         "episode_index": episode.episode_index,
         "source_stem": episode.source_stem,
-        "source_video": str(episode.source_video),
-        "removed_video_for_vda": str(episode.removed_video),
-        "rgb_texture": {
-            "source": "processed handless video on every frame",
-            "original_video": str(episode.source_video),
-            "handless_video": str(episode.removed_video),
-        },
-        "arm_replacement": {
-            "method": (
-                "human-arm visibility metadata is retained for removal audit "
-                "only; G1 rendering is independent"
-            ),
-            "manual_review": False,
-            "per_dataset_threshold_tuning": False,
-            "frame_count": episode.frame_count,
-            "human_arm_visible_frames": int(human_arm_visible.sum()),
-        },
-        "frame_indices": episode.frame_indices.tolist(),
         "frame_count": episode.frame_count,
         "fps": episode.fps,
         "source_size": list(episode.source_size),
         "mesh_size": list(mesh_size),
-        "intrinsic": episode.intrinsic.tolist(),
-        "mesh_intrinsic": mesh_intrinsic.tolist(),
         "depth": depth_report,
-        "camera": {
-            "mapping_mode": camera_mapping_mode,
-            "scene_scale": episode.scene_scale,
-            "scene_scale_source": "gmr_spine3_scale",
-        },
-        "lighting": {
-            "profile": str(lighting_profile_path),
-            "analysis_video": lighting_profile["analysis_video"],
-            "isaac": lighting_profile["isaac"],
-            "confidence": lighting_profile["confidence"],
-            "warnings": lighting_profile["warnings"],
-        },
+        "human_arm_visible_frames": int(human_arm_visible.sum()),
+        "lighting_profile": str(lighting_profile_path),
         "episode_data": str(episode_data_path),
         "elapsed_seconds": time.perf_counter() - started,
     }
@@ -537,7 +423,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--source-root",
         type=Path,
         required=True,
-        help="Same-stem source EgoDex MP4/HDF5 directory",
+        help="Source dataset root used to resolve manifest paths",
     )
     parser.add_argument(
         "--removed-root",
@@ -601,17 +487,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_VDA_METRIC_SCALE,
         help=(
-            "Fixed scale used by --vda-scale-mode fixed, or by an explicitly "
-            "allowed fixed fallback (default: legacy 0.525)"
-        ),
-    )
-    parser.add_argument(
-        "--vda-scale-failure-policy",
-        choices=("error", "fixed"),
-        default="error",
-        help=(
-            "Fail when automatic calibration is unreliable, or explicitly "
-            "fall back to --vda-metric-scale (default: error)"
+            "Scale used only by --vda-scale-mode fixed "
+            "(default: legacy 0.525)"
         ),
     )
     parser.add_argument(

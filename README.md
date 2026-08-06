@@ -39,6 +39,10 @@ bash batch_egodex.sh
 bash batch_nymeria.sh
 ```
 
+Batch runs skip completed MP4+JSON renders, continue after an episode failure,
+and permanently delete that episode's intermediate files. Single-task runs
+below retain every intermediate artifact.
+
 ## Run one task and retain intermediates
 
 ```bash
@@ -64,6 +68,7 @@ scratch.
 
 .venv/bin/python -m repaint.traj_replay \
   --dataset egodex
+
 ```
 
 ## Adjustable Isaac view
@@ -81,8 +86,7 @@ To inspect a prepared episode in isaacsim:
   --prepared nymeria/single_task/prepared/episode_000000 \
   --interactive \
   --loop \
-  --no-headless \
-  --scene-alignment none
+  --no-headless
 ```
 
 ## Nymeria
@@ -93,4 +97,19 @@ To inspect a prepared episode in isaacsim:
   --output-root nymeria/vda \
   --session 20230814_s1_david_hall_act0_n9k3wo \
   --clip c024
+```
+
+
+# fill video
+```bash
+.venv/bin/python -m repaint.fill_video \
+  --input_dir egodex_debug/arrange_topple_dominoes/final/episode_000000 \
+  --output_dir egodex_debug/arrange_topple_dominoes/final_fill
+
+.venv/bin/python -m repaint.fill_video \
+  --input_dir egodex_debug/arrange_topple_dominoes/final/episode_000000 \
+  --output_dir egodex_debug/arrange_topple_dominoes/final_fill_sdxl \
+  --inpaint_model flux \
+  --model Inpaint-Anything/pretrained_models/stable-diffusion-xl-1.0-inpainting-0.1
+
 ```

@@ -41,7 +41,6 @@ from repaint.nymeria.nymeria_adapter import (  # noqa: E402
     NymeriaClip,
     ResampledMotion,
     discover_nymeria_clips,
-    frame0_anchored_spine3,
     load_motion_metadata,
     load_participant_height_m,
     load_scaled_intrinsic,
@@ -1008,14 +1007,6 @@ def prepare_clip(
         hand_eye=hand_eye,
         head_index=HEAD_BODY_INDEX,
     )
-    spine3_index = tuple(
-        name for name, _ in MOTION_BODY_JOINTS
-    ).index("spine3")
-    aligned_parts[:, spine3_index] = frame0_anchored_spine3(
-        aligned_head_to_world=aligned_parts[:, HEAD_BODY_INDEX],
-        motion_head_to_world=clip_motion.body_transforms[:, HEAD_BODY_INDEX],
-        motion_spine3_to_world=clip_motion.body_transforms[:, spine3_index],
-    )
     aligned_by_name = {
         name: aligned_parts[:, index]
         for index, (name, _) in enumerate(MOTION_BODY_JOINTS)
@@ -1231,7 +1222,7 @@ def run(args: argparse.Namespace) -> int:
         )
 
     report = {
-        "schema_version": 8,
+        "schema_version": 9,
         "status": "prepared_only",
         "episode": episode_root.name,
         "participant": {
@@ -1300,15 +1291,15 @@ def run(args: argparse.Namespace) -> int:
                 "transforms/camera = T_SourceWorld_CameraOpenCV"
             ),
             "body_transforms": (
-                "208-D body registered by session hand-eye calibration; "
-                "spine3 rotation uses one frame-0 MPS-to-motion anchor"
+                "208-D body registered per frame into the raw Aria world "
+                "through synchronized motion-head/device alignment"
             ),
             "body_transform_datasets": [
                 f"transforms/{name}" for name, _ in MOTION_BODY_JOINTS
             ],
             "spine3_transform": (
-                "frame-0 MPS-to-208-D rotation anchor with per-frame "
-                "MPS head position and 208-D spine3-to-head offset"
+                "per-frame aligned_head_to_world @ "
+                "inverse(motion_head_to_world) @ motion_spine3_to_world"
             ),
             "hand_targets": (
                 "rigid leftHand/rightHand wrist poses; no synthesized "

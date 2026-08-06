@@ -20,9 +20,6 @@ CAMERA_LINK_FROM_CV_OPTICAL = np.asarray(
 )
 
 HEAD_CAMERA_PARENT_FRAME = "torso_link"
-TORSO_ANCHORED_CAMERA_MAPPING = (
-    "g1_torso_pose_anchor_with_source_spine3_camera_delta"
-)
 HEAD_CAM_OFFSET_POS_BASE = np.asarray(
     [0.0576235, 0.01753, 0.42987],
     dtype=np.float64,
@@ -48,6 +45,25 @@ def _continuous_xyzw(quaternions: np.ndarray) -> np.ndarray:
         if np.dot(continuous[frame_id - 1], continuous[frame_id]) < 0.0:
             continuous[frame_id] *= -1.0
     return continuous
+
+
+def _proper_rotation_matrix(value: np.ndarray, name: str) -> np.ndarray:
+    matrix = np.asarray(value, dtype=np.float64)
+    if (
+        matrix.shape != (3, 3)
+        or not np.isfinite(matrix).all()
+        or not np.allclose(matrix @ matrix.T, np.eye(3), atol=1e-5)
+        or np.linalg.det(matrix) < 0.999
+    ):
+        raise ValueError(f"{name} must be a proper 3x3 rotation")
+    return matrix
+
+
+def _finite_rows(value: np.ndarray, width: int, name: str) -> np.ndarray:
+    rows = np.asarray(value, dtype=np.float64)
+    if rows.ndim != 2 or rows.shape[1] != width or not np.isfinite(rows).all():
+        raise ValueError(f"{name} must have finite rows of width {width}")
+    return rows
 
 
 def robot_frame_poses_world(
@@ -145,58 +161,104 @@ def source_camera_poses_in_spine3_cv(
     return poses
 
 
-def torso_anchored_camera_poses_cv(
+def position_anchored_camera_poses_cv(
     *,
     source_camera_pose_in_spine3_xyzw: np.ndarray,
+    source_camera_rotation_world_xyzw: np.ndarray,
     robot_torso_pose_world_xyzw: np.ndarray,
     source_spine3_to_robot_torso_rotation: np.ndarray,
+    source_to_robot_world_rotation: np.ndarray,
     scene_scale: float,
 ) -> np.ndarray:
-    """Apply source spine3-to-camera motion to the retargeted G1 torso."""
+    """Anchor camera XYZ to G1 torso while preserving source-world rotation."""
 
-    camera = np.asarray(source_camera_pose_in_spine3_xyzw, dtype=np.float64)
-    torso = np.asarray(robot_torso_pose_world_xyzw, dtype=np.float64)
-    basis = np.asarray(
+    camera = _finite_rows(
+        source_camera_pose_in_spine3_xyzw,
+        7,
+        "source_camera_pose_in_spine3_xyzw",
+    )
+    torso = _finite_rows(robot_torso_pose_world_xyzw, 7, "robot_torso_pose")
+    basis = _proper_rotation_matrix(
         source_spine3_to_robot_torso_rotation,
-        dtype=np.float64,
+        "source_spine3_to_robot_torso_rotation",
     )
-    frame_count = len(camera)
+    source_rotation = _finite_rows(
+        source_camera_rotation_world_xyzw,
+        4,
+        "source_camera_rotation_world_xyzw",
+    )
+    world_basis = _proper_rotation_matrix(
+        source_to_robot_world_rotation,
+        "source_to_robot_world_rotation",
+    )
     if (
-        camera.shape != (frame_count, 7)
-        or torso.shape != (frame_count, 7)
-        or basis.shape != (3, 3)
-        or not np.isfinite(camera).all()
-        or not np.isfinite(torso).all()
-        or not np.isfinite(basis).all()
-        or np.any(np.linalg.norm(camera[:, 3:7], axis=1) <= 1e-8)
-        or np.any(np.linalg.norm(torso[:, 3:7], axis=1) <= 1e-8)
-        or not np.isfinite(scene_scale)
-        or scene_scale <= 0.0
-        or not np.allclose(basis @ basis.T, np.eye(3), atol=1e-5)
-        or np.linalg.det(basis) < 0.999
+        not len(camera)
+        or len(torso) != len(camera)
+        or len(source_rotation) != len(camera)
     ):
-        raise ValueError("Torso-anchored camera inputs are invalid")
-    camera_rotations = Rotation.from_quat(camera[:, 3:7]).as_matrix()
-    torso_rotations = Rotation.from_quat(torso[:, 3:7]).as_matrix()
-    torso_from_source_spine3 = np.einsum(
-        "nij,jk->nik",
-        torso_rotations,
-        basis,
-    )
+        raise ValueError("Position-anchored camera arrays are invalid")
+    if not np.isfinite(scene_scale) or scene_scale <= 0.0:
+        raise ValueError("scene_scale must be positive and finite")
+    try:
+        torso_rotation = Rotation.from_quat(torso[:, 3:7]).as_matrix()
+        source_rotation = Rotation.from_quat(source_rotation).as_matrix()
+    except ValueError as exc:
+        raise ValueError("Camera quaternions are invalid") from exc
     positions = torso[:, :3] + scene_scale * np.einsum(
-        "nij,nj->ni",
-        torso_from_source_spine3,
+        "nij,jk,nk->ni",
+        torso_rotation,
+        basis,
         camera[:, :3],
     )
-    rotations = np.einsum(
-        "nij,njk->nik",
-        torso_from_source_spine3,
-        camera_rotations,
+    rotations = _continuous_xyzw(
+        Rotation.from_matrix(
+            np.einsum(
+                "ij,njk->nik",
+                world_basis,
+                source_rotation,
+            )
+        ).as_quat()
     )
-    quaternions = _continuous_xyzw(
-        Rotation.from_matrix(rotations).as_quat()
+    return np.concatenate([positions, rotations], axis=1)
+
+
+def retarget_scene_camera_poses_cv(
+    *,
+    source_camera_to_world: np.ndarray,
+    source_spine3_to_world: np.ndarray,
+    source_to_robot_world_rotation: np.ndarray,
+    robot_torso_pose_world_xyzw: np.ndarray,
+    scene_scale: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Build the shared EgoDex/Nymeria position-anchored camera trajectory."""
+
+    source_local = source_camera_poses_in_spine3_cv(
+        source_camera_to_world=source_camera_to_world,
+        source_spine3_to_world=source_spine3_to_world,
     )
-    return np.concatenate([positions, quaternions], axis=1)
+    source_rotation = Rotation.from_matrix(
+        np.asarray(source_camera_to_world)[:, :3, :3]
+    ).as_quat()
+    torso_rotation = Rotation.from_quat(
+        np.asarray(robot_torso_pose_world_xyzw)[:, 3:7]
+    ).as_matrix()
+    local_basis = (
+        torso_rotation[0].T
+        @ _proper_rotation_matrix(
+            source_to_robot_world_rotation,
+            "source_to_robot_world_rotation",
+        )
+        @ np.asarray(source_spine3_to_world)[0, :3, :3]
+    )
+    poses = position_anchored_camera_poses_cv(
+        source_camera_pose_in_spine3_xyzw=source_local,
+        source_camera_rotation_world_xyzw=source_rotation,
+        robot_torso_pose_world_xyzw=robot_torso_pose_world_xyzw,
+        source_spine3_to_robot_torso_rotation=local_basis,
+        source_to_robot_world_rotation=source_to_robot_world_rotation,
+        scene_scale=scene_scale,
+    )
+    return poses, source_local, source_rotation, local_basis
 
 
 def head_camera_poses_world(

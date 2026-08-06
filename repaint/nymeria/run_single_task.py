@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import replace
 from pathlib import Path
 import sys
 
@@ -14,11 +13,7 @@ WORKSPACE_ROOT = SCRIPT_PATH.parents[2]
 if str(WORKSPACE_ROOT) not in sys.path:
     sys.path.insert(0, str(WORKSPACE_ROOT))
 
-from repaint.nymeria.nymeria_vda_pipeline import (  # noqa: E402
-    _config_from_args,
-    build_plan,
-    execute,
-)
+from repaint.nymeria.nymeria_vda_pipeline import run_pipeline  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -62,18 +57,14 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    config = replace(
-        _config_from_args(args),
-        resume=not args.overwrite,
+    run_pipeline(
+        dataset_root=args.dataset_root,
+        output_root=args.output_root,
+        sessions={args.session} if args.session else None,
+        clips={args.clip},
+        python_executable=Path(sys.executable).absolute(),
+        headless=args.headless,
         overwrite=args.overwrite,
-        retain_intermediates=True,
-    )
-    execute(
-        build_plan(
-            config,
-            sessions={args.session} if args.session else None,
-            requested_clips={args.clip},
-        )
     )
 
 

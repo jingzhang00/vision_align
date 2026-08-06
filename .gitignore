@@ -1,24 +1,13 @@
-# Python-generated files
 __pycache__/
 *.py[oc]
 build/
 dist/
 wheels/
 *.egg-info
-mano_v1_2/
 dataset/
-outputs/
-assets/unitree_description/meshes/g1/*_tmp/
 .DS_Store
 ._*
 .venv
-mano_v1_2/models/*.pkl
-output_new/
-nymeria_scripts
-tests/
-/nymeria/vda/
-/egodex_single_task/
-/debug/
-/egodex/
-/egodex_debug/
-/nymeria/
+test_*.py
+tmp/
+stable-diffusion-2-inpainting/

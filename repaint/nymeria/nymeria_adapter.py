@@ -82,46 +82,6 @@ class ResampledMotion:
         return int(len(self.timestamps))
 
 
-def frame0_anchored_spine3(
-    *,
-    aligned_head_to_world: np.ndarray,
-    motion_head_to_world: np.ndarray,
-    motion_spine3_to_world: np.ndarray,
-) -> np.ndarray:
-    """Anchor each 208-D spine3 below the tracked Aria head position."""
-
-    aligned_head = np.asarray(aligned_head_to_world, dtype=np.float64)
-    motion_head = np.asarray(motion_head_to_world, dtype=np.float64)
-    motion_spine3 = np.asarray(motion_spine3_to_world, dtype=np.float64)
-    if (
-        aligned_head.ndim != 3
-        or aligned_head.shape[1:] != (4, 4)
-        or motion_head.shape != aligned_head.shape
-        or motion_spine3.shape != aligned_head.shape
-        or not all(
-            np.isfinite(value).all()
-            for value in (aligned_head, motion_head, motion_spine3)
-        )
-    ):
-        raise ValueError("Nymeria camera/body transforms must align")
-
-    anchored_spine3 = motion_spine3.copy()
-    world_from_motion_rotation = (
-        aligned_head[0, :3, :3] @ motion_head[0, :3, :3].T
-    )
-    anchored_spine3[:, :3, :3] = np.einsum(
-        "ij,njk->nik",
-        world_from_motion_rotation,
-        motion_spine3[:, :3, :3],
-    )
-    anchored_spine3[:, :3, 3] = aligned_head[:, :3, 3] + np.einsum(
-        "ij,nj->ni",
-        world_from_motion_rotation,
-        motion_spine3[:, :3, 3] - motion_head[:, :3, 3],
-    )
-    return anchored_spine3
-
-
 def _parse_positive_rate(value: str, *, label: str) -> float:
     try:
         rate = float(Fraction(value))
