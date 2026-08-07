@@ -1,4 +1,4 @@
-"""Fill white view holes in every video with LaMa or diffusion inpainting.
+"""Fill white view holes in every video with LaMa, diffusion, or ProPainter.
 
 Example (run from the repository root):
     .venv/bin/python -m repaint.fill_video \
@@ -25,10 +25,12 @@ from tqdm import tqdm
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
 INPAINT_DIR = Path(__file__).resolve().parents[1] / "Inpaint-Anything"
+PROPAINTER_DIR = Path(__file__).resolve().parents[1] / "ProPainter"
 DEFAULT_SD_MODEL = Path(__file__).resolve().parents[1] / "stable-diffusion-2-inpainting"
 DEFAULT_FLUX_MODEL = INPAINT_DIR / "pretrained_models/FLUX.1-Fill-dev"
 DEFAULT_LAMA_CONFIG = INPAINT_DIR / "lama/configs/prediction/default.yaml"
 DEFAULT_LAMA_CKPT = INPAINT_DIR / "pretrained_models/big-lama"
+DEFAULT_PROPAINTER_CKPT = INPAINT_DIR / "pretrained_models/propainter"
 
 
 def infer_hole_lab(frame, min_value=200, max_saturation=45, min_area=256):
@@ -218,6 +220,86 @@ def process_video(input_path, output_path, args, fill_frame):
     return processed_frames, filled_frames
 
 
+def process_video_propainter(input_path, output_path, args, model, device):
+    """Fill a video temporally with the repository's existing ProPainter."""
+    from PIL import Image
+    from propainter_video_inpaint import inpaint_video_with_builded_propainter
+
+    capture = cv2.VideoCapture(str(input_path))
+    if not capture.isOpened():
+        raise RuntimeError(f"Cannot open video: {input_path}")
+    width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = float(capture.get(cv2.CAP_PROP_FPS))
+    if not math.isfinite(fps) or fps <= 0:
+        fps = args.fps
+
+    packed_masks = load_render_hole_masks(
+        input_path, width, height, frame_count)
+    if packed_masks is None:
+        capture.release()
+        raise ValueError(
+            f"ProPainter requires an exact render mask: "
+            f"{input_path.with_suffix('.mask.npz')}")
+
+    frames, masks = [], []
+    for index in range(frame_count):
+        ok, bgr = capture.read()
+        if not ok:
+            break
+        mask = np.unpackbits(
+            packed_masks[index], count=height * width,
+        ).reshape(height, width).astype(np.uint8) * 255
+        if args.dilate:
+            mask = cv2.dilate(
+                mask, np.ones((args.dilate, args.dilate), np.uint8))
+        frames.append(Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)))
+        masks.append(Image.fromarray(mask))
+    capture.release()
+    if len(frames) != frame_count:
+        raise RuntimeError(
+            f"Video frame count changed while reading {input_path}: "
+            f"{frame_count} -> {len(frames)}")
+
+    outputs = [None] * frame_count
+    chunk_size = args.chunk_size or frame_count
+    for start in tqdm(range(0, frame_count, chunk_size),
+                      desc=input_path.name, unit="chunk"):
+        end = min(frame_count, start + chunk_size)
+        lower = max(0, start - args.chunk_overlap)
+        chunk = inpaint_video_with_builded_propainter(
+            model, frames[lower:end], masks[lower:end], device=device,
+            fp16=args.fp16, subvideo_length=args.subvideo_length,
+            mask_dilation=0)
+        outputs[start:end] = chunk[start - lower:]
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-loglevel", "error",
+        "-f", "rawvideo", "-pix_fmt", "rgb24", "-s:v", f"{width}x{height}",
+        "-r", f"{fps:.12g}", "-i", "pipe:0", "-c:v", "libx264", "-crf", "18",
+        "-preset", "medium", "-pix_fmt", "yuv420p", str(output_path),
+    ]
+    encoder = subprocess.Popen(command, stdin=subprocess.PIPE,
+                               stderr=subprocess.PIPE)
+    try:
+        for frame in outputs:
+            encoder.stdin.write(np.asarray(frame, dtype=np.uint8).tobytes())
+        encoder.stdin.close()
+        error = encoder.stderr.read().decode("utf-8", errors="replace")
+        if encoder.wait() != 0:
+            raise RuntimeError(f"FFmpeg failed for {input_path}:\n{error}")
+    except Exception:
+        if encoder.stdin and not encoder.stdin.closed:
+            encoder.stdin.close()
+        encoder.terminate()
+        encoder.wait()
+        output_path.unlink(missing_ok=True)
+        raise
+    return frame_count, sum(bool(np.asarray(mask).any()) for mask in masks)
+
+
 def self_check():
     frame = np.zeros((12, 12, 3), dtype=np.uint8)
     frame[:2, :3] = (230, 221, 206)
@@ -258,12 +340,15 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input_dir", type=Path)
     parser.add_argument("--output_dir", type=Path)
-    parser.add_argument("--inpaint_model", choices=("lama", "sd", "flux"),
+    parser.add_argument("--inpaint_model",
+                        choices=("lama", "sd", "flux", "propainter"),
                         default="lama")
     parser.add_argument("--model", "--sd_model", "--flux_model", dest="model",
                         help="diffusion model directory or HuggingFace id")
     parser.add_argument("--lama_config", default=str(DEFAULT_LAMA_CONFIG))
     parser.add_argument("--lama_ckpt", default=str(DEFAULT_LAMA_CKPT))
+    parser.add_argument("--propainter_ckpt",
+                        default=str(DEFAULT_PROPAINTER_CKPT))
     parser.add_argument("--prompt", default="")
     parser.add_argument("--negative_prompt",
                         default="blurry, low quality, distorted")
@@ -280,6 +365,11 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--steps", type=int)
     parser.add_argument("--guidance_scale", type=float)
+    parser.add_argument("--chunk_size", type=int, default=20)
+    parser.add_argument("--chunk_overlap", type=int, default=5)
+    parser.add_argument("--subvideo_length", type=int, default=20)
+    parser.add_argument("--fp16", action=argparse.BooleanOptionalAction,
+                        default=True)
     parser.add_argument("--fps", type=float, default=25,
                         help="fallback when video metadata has no FPS")
     parser.add_argument("--overwrite", action="store_true")
@@ -304,6 +394,10 @@ def parse_args():
         parser.error("--steps must be positive")
     if args.guidance_scale is not None and args.guidance_scale < 0:
         parser.error("--guidance_scale cannot be negative")
+    if args.chunk_size < 0 or args.chunk_overlap < 0 or args.subvideo_length < 1:
+        parser.error("ProPainter chunk sizes must be non-negative and subvideo_length positive")
+    if args.chunk_size and args.chunk_overlap >= args.chunk_size:
+        parser.error("--chunk_overlap must be smaller than --chunk_size")
     return args
 
 
@@ -319,6 +413,7 @@ def main():
 
     try:
         import sys
+        sys.path.insert(0, str(PROPAINTER_DIR))
         sys.path.insert(0, str(INPAINT_DIR))
         import torch
     except ModuleNotFoundError as error:
@@ -327,7 +422,11 @@ def main():
             "python -m pip install -r requirements.txt") from error
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    if args.inpaint_model == "lama":
+    if args.inpaint_model == "propainter":
+        from propainter_video_inpaint import build_propainter_model
+        model = build_propainter_model(args.propainter_ckpt, device)
+        fill_frame = None
+    elif args.inpaint_model == "lama":
         from lama_inpaint import inpaint_img_with_builded_lama
         from repaint.inpaint_adapter import build_lama_model
         model = build_lama_model(args.lama_config, args.lama_ckpt, device=device)
@@ -357,8 +456,12 @@ def main():
             print(f"[{index}/{len(videos)}] skip existing: {output_path}")
             continue
         print(f"[{index}/{len(videos)}] {input_path} -> {output_path}")
-        frames, filled = process_video(
-            input_path, output_path, args, fill_frame)
+        if args.inpaint_model == "propainter":
+            frames, filled = process_video_propainter(
+                input_path, output_path, args, model, device)
+        else:
+            frames, filled = process_video(
+                input_path, output_path, args, fill_frame)
         print(f"  done: {filled}/{frames} frames contained holes")
 
 

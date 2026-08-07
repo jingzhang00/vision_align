@@ -12,3 +12,4 @@ test_*.py
 tmp/
 stable-diffusion-*/
 EgoHumanoid/
+models/

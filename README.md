@@ -8,7 +8,6 @@ Download [Releases V0.1.0](https://github.com/sczhou/ProPainter/releases/tag/v0.
 ```bash
 uv sync
 pip install "isaacsim[all,extscache]==5.1.0" --extra-index-url https://pypi.nvidia.com
-hf download sd2-community/stable-diffusion-2-inpainting --local-dir stable-diffusion-2-inpainting
 ```
 
 - follow `Inpaint-Anything/README.md -> Download the weights` to put the weights in:
@@ -30,16 +29,15 @@ weights/
 ```bash
 bash batch_egodex.sh
 ```
+**Note: current batch_egodex.sh only runs episode 0 from each task folder for quick check.**
 
 ```bash
 bash batch_nymeria.sh
 ```
 
-Batch runs skip completed MP4+JSON renders, continue after an episode failure,
-and permanently delete that episode's intermediate files. Single-task runs
-below retain every intermediate artifact.
+Batch runs skip completed MP4+JSON renders, continue after an episode failure, and permanently delete that episode's intermediate files. Single-task runs below retain every intermediate artifact.
 
-## Run one task and retain intermediates
+## Run one task with intermediates to debug
 
 ```bash
 .venv/bin/python repaint/egodex/run_single_task.py \
@@ -64,7 +62,6 @@ scratch.
 
 .venv/bin/python -m repaint.traj_replay \
   --dataset egodex
-
 ```
 
 ## Adjustable Isaac view
@@ -109,16 +106,6 @@ To inspect a prepared episode in isaacsim:
   --prompt "" \
   --negative_prompt "blurry, low quality, distorted" \
   --overwrite
-
-.venv/bin/python -m repaint.fill_video \
-  --input_dir tmp/replay_then_render/egodex/basic_pick_place/final \
-  --output_dir tmp/replay_then_render/egodex/basic_pick_place/final_fill \
-  --inpaint_model sd \
-  --model stable-diffusion-xl-1.0-inpainting-0.1 \
-  --steps 20 \
-  --guidance_scale 7.5 \
-  --seed 42 \
-  --prompt "seamless continuation of the existing indoor scene, matching the surrounding floor, furniture, geometry, perspective, materials, colors and warm lighting, photorealistic" \
-  --negative_prompt "new objects, extra furniture, extra robot parts, people, text, logo, repeating patterns, seams, borders, color shift, inconsistent lighting, blurry, distorted, low quality" \
-  --overwrite
 ```
+optional: `--inpaint_model propainter`
+

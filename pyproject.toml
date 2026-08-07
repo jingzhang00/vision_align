@@ -38,6 +38,7 @@ dependencies = [
     "typing-extensions==4.12.2",
     "opencv-python>=4.11.0.86",
     "pin>=2.7.0",
+    "cmake>=4.4.2",
 ]
 
 [tool.uv]
