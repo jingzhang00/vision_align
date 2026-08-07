@@ -1,0 +1,516 @@
+#!/usr/bin/env python3
+"""Prepare one handless EgoDex episode for VDA + G1 Isaac replay."""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+import sys
+import time
+
+import cv2
+import numpy as np
+
+
+WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
+if str(WORKSPACE_ROOT) not in sys.path:
+    sys.path.insert(0, str(WORKSPACE_ROOT))
+
+from repaint.rgbd_episode import (  # noqa: E402
+    RgbdEpisode,
+    load_rgbd_episode,
+)
+from repaint.rgbd_geometry import scale_intrinsic  # noqa: E402
+from repaint.lighting_profile import estimate_lighting_profile  # noqa: E402
+from repaint.scene_hand_alignment import (  # noqa: E402
+    initial_palm_scene_translation,
+)
+from repaint.vda_depth import (  # noqa: E402
+    DEFAULT_CHECKPOINT,
+    DEFAULT_VDA_METRIC_SCALE,
+    DecodedVideoFrames,
+    MODEL_CONFIGS,
+    MODEL_SCALE_NAMES,
+    decode_contiguous_video_frames_rgb,
+    depth_m_to_uint16_mm,
+    file_sha256,
+    infer_metric_vda_sequence,
+    scale_and_resize_metric_depths,
+    validate_metric_checkpoint,
+)
+from repaint.vda_scale_validation import (  # noqa: E402
+    estimate_semidense_handless_metric_scale,
+    infer_and_estimate_handless_metric_scale,
+)
+
+DEFAULT_G1_URDF = (
+    WORKSPACE_ROOT
+    / "assets/unitree_description/urdf/g1/main_with_hand_new.urdf"
+)
+
+
+def _open_at(path: Path, frame_index: int) -> cv2.VideoCapture:
+    capture = cv2.VideoCapture(str(path))
+    if not capture.isOpened():
+        raise RuntimeError(f"Failed to open video: {path}")
+    if frame_index:
+        capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+        actual = int(capture.get(cv2.CAP_PROP_POS_FRAMES))
+        if actual != frame_index:
+            capture.release()
+            raise RuntimeError(
+                f"Could not seek {path} to frame {frame_index}; got {actual}"
+            )
+    return capture
+
+
+def _load_nymeria_human_arm_visibility(
+    *,
+    removed_root: Path,
+    removed_video: Path,
+    frame_indices: np.ndarray,
+) -> np.ndarray:
+    """Load the exact per-frame SAM decision emitted by arm removal."""
+
+    manifest_path = removed_root.resolve() / "manifest.json"
+    with manifest_path.open("r", encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    matches = []
+    for entry in manifest.get("episodes", ()):
+        output = Path(str(entry.get("output", ""))).expanduser()
+        if not output.is_absolute():
+            output = WORKSPACE_ROOT / output
+        if output.resolve() == removed_video.resolve():
+            matches.append(entry)
+    if len(matches) != 1:
+        raise ValueError(
+            f"Expected one repaint manifest entry for {removed_video}, "
+            f"found {len(matches)}"
+        )
+    values = matches[0].get("human_arm_visible")
+    if (
+        not isinstance(values, list)
+        or not all(isinstance(value, bool) for value in values)
+    ):
+        raise ValueError(
+            "Nymeria repaint manifest has no boolean "
+            "human_arm_visible timeline"
+        )
+    selected = np.asarray(frame_indices, dtype=np.int64)
+    if len(values) <= int(selected[-1]):
+        raise ValueError(
+            "Nymeria human-arm visibility timeline is shorter than the "
+            "selected episode"
+        )
+    return np.asarray(values, dtype=bool)[selected]
+
+
+def _create_output_layout(output_root: Path) -> tuple[Path, Path]:
+    if output_root.exists():
+        raise FileExistsError(f"Output already exists: {output_root}")
+    output_root.mkdir(parents=True)
+    frame_root = output_root / "rgb"
+    depth_root = output_root / "depth_mm"
+    for path in (frame_root, depth_root):
+        path.mkdir()
+    return frame_root, depth_root
+
+
+def _resolve_episode_metric_scale(
+    *,
+    args: argparse.Namespace,
+    episode: RgbdEpisode,
+    handless_decoded: DecodedVideoFrames,
+    handless_depth_raw_m: np.ndarray,
+    checkpoint: Path,
+) -> tuple[float, dict[str, object]]:
+    fixed_scale = float(args.vda_metric_scale)
+    if not np.isfinite(fixed_scale) or fixed_scale <= 0.0:
+        raise ValueError("--vda-metric-scale must be positive and finite")
+    if args.vda_scale_mode == "fixed":
+        return fixed_scale, {
+            "schema_version": 1,
+            "requested_mode": "fixed",
+            "resolved_mode": "fixed",
+            "resolved_vda_metric_scale": fixed_scale,
+            "scale_excludes_scene_scale": True,
+        }
+
+    if episode.source_dataset_kind == "nymeria":
+        calibration = estimate_semidense_handless_metric_scale(
+            original_video=episode.source_video,
+            handless_video=episode.removed_video,
+            source_hdf5=episode.source_hdf5,
+            semidense_points=(
+                episode.source_video.parents[1]
+                / "recording_head/mps/slam/semidense_points.csv.gz"
+            ),
+            frame_indices=episode.frame_indices,
+            handless_video_frame_count=episode.full_frame_count,
+            handless_depth_raw_m=handless_depth_raw_m,
+            source_size=handless_decoded.source_size,
+            inference_size=handless_decoded.inference_size,
+            mask_dir=args.vda_scale_mask_dir,
+        )
+    else:
+        calibration = infer_and_estimate_handless_metric_scale(
+            original_video=episode.source_video,
+            handless_video=episode.removed_video,
+            source_hdf5=episode.source_hdf5,
+            frame_indices=episode.frame_indices,
+            handless_decoded=handless_decoded,
+            handless_depth_raw_m=handless_depth_raw_m,
+            checkpoint=checkpoint,
+            encoder=args.vda_encoder,
+            input_size=args.vda_input_size,
+            max_resolution=args.vda_max_resolution,
+            fp32=args.vda_fp32,
+            mask_dir=args.vda_scale_mask_dir,
+        )
+    status = str(calibration["decision"]["status"])
+    if status == "validated":
+        calibration["requested_mode"] = "auto"
+        calibration["resolved_mode"] = "auto"
+        return float(calibration["resolved_vda_metric_scale"]), calibration
+    reasons = calibration["decision"]["reasons"]
+    raise RuntimeError(
+        "Automatic VDA metric scale failed quality gates: "
+        f"{reasons}. Use --vda-scale-mode fixed only after choosing an "
+        "episode-specific scale."
+    )
+
+
+def prepare(args: argparse.Namespace) -> dict[str, object]:
+    started = time.perf_counter()
+    output_root = args.output.resolve()
+    frame_root, depth_root = _create_output_layout(output_root)
+    episode = load_rgbd_episode(
+        dataset_root=args.dataset,
+        source_root=args.source_root,
+        removed_root=args.removed_root,
+        episode_index=args.episode,
+        start_frame=args.start_frame,
+        end_frame=args.end_frame,
+    )
+    joint_positions = episode.joint_positions
+    camera_pose = episode.camera_pose_cv_xyzw
+    scene_translation_world_xyz_m = np.zeros(3, dtype=np.float64)
+    if episode.source_dataset_kind == "egodex":
+        scene_translation_world_xyz_m = initial_palm_scene_translation(
+            source_hdf5=episode.source_hdf5,
+            frame_indices=episode.frame_indices,
+            scene_scale=episode.scene_scale,
+            scene_camera_pose_cv_xyzw=camera_pose,
+            urdf_path=args.urdf,
+            joint_names=episode.joint_names,
+            joint_positions=joint_positions,
+            root_pose_xyzw=episode.root_pose_xyzw,
+        )
+    if episode.source_dataset_kind == "nymeria":
+        human_arm_visible = _load_nymeria_human_arm_visibility(
+            removed_root=args.removed_root,
+            removed_video=episode.removed_video,
+            frame_indices=episode.frame_indices,
+        )
+    else:
+        human_arm_visible = np.ones(episode.frame_count, dtype=bool)
+    source_width, source_height = episode.source_size
+    mesh_width = args.mesh_width
+    mesh_height = int(round(source_height * mesh_width / source_width))
+    if mesh_height < 2:
+        raise ValueError("Derived mesh height is too small")
+    mesh_size = (mesh_width, mesh_height)
+    mesh_intrinsic = scale_intrinsic(
+        episode.intrinsic,
+        source_size=episode.source_size,
+        target_size=mesh_size,
+    )
+
+    checkpoint = validate_metric_checkpoint(
+        args.vda_checkpoint,
+        args.vda_encoder,
+    )
+    decoded = decode_contiguous_video_frames_rgb(
+        episode.removed_video,
+        frame_indices=episode.frame_indices,
+        max_resolution=args.vda_max_resolution,
+    )
+    if decoded.frame_count != episode.frame_count:
+        raise ValueError(
+            "VDA/video episode frame mismatch: "
+            f"{decoded.frame_count} != {episode.frame_count}"
+        )
+    if decoded.source_size != episode.source_size:
+        raise ValueError(
+            "VDA/video episode size mismatch: "
+            f"{decoded.source_size} != {episode.source_size}"
+        )
+    if not np.isclose(decoded.fps, episode.fps, atol=1e-3):
+        raise ValueError(
+            f"VDA/video episode FPS mismatch: "
+            f"{decoded.fps} != {episode.fps}"
+        )
+    depths_raw_m = infer_metric_vda_sequence(
+        decoded,
+        checkpoint=checkpoint,
+        encoder=args.vda_encoder,
+        input_size=args.vda_input_size,
+        fp32=args.vda_fp32,
+    )
+    # Scale calibration only needs handless metadata after inference.
+    decoded = decoded.without_rgb_frames()
+    resolved_vda_metric_scale, scale_calibration = (
+        _resolve_episode_metric_scale(
+            args=args,
+            episode=episode,
+            handless_decoded=decoded,
+            handless_depth_raw_m=depths_raw_m,
+            checkpoint=checkpoint,
+        )
+    )
+    depths_mesh_m = scale_and_resize_metric_depths(
+        depths_raw_m,
+        scene_scale=episode.scene_scale,
+        vda_metric_scale=resolved_vda_metric_scale,
+        mesh_size=mesh_size,
+        maximum_depth_m=(
+            np.iinfo(np.uint16).max / 1000.0
+            if episode.source_dataset_kind == "nymeria"
+            else None
+        ),
+    )
+    checkpoint_sha256 = file_sha256(checkpoint)
+    clipped_depth_pixels = int(np.count_nonzero(depths_mesh_m == 0.0))
+    del depths_raw_m, decoded
+
+    lighting_profile_path = output_root / "lighting_profile.json"
+    estimate_lighting_profile(
+        inpaint_video=episode.removed_video,
+        output_path=lighting_profile_path,
+    )
+
+    removed_capture = _open_at(
+        episode.removed_video,
+        int(episode.frame_indices[0]),
+    )
+    completed = 0
+    positive_depth_samples: list[np.ndarray] = []
+    try:
+        while completed < episode.frame_count:
+            expected_source_index = int(episode.frame_indices[completed])
+            if (
+                completed > 0
+                and expected_source_index
+                != int(episode.frame_indices[0]) + completed
+            ):
+                raise ValueError(
+                    "Selected source frame indices must be contiguous"
+                )
+            removed_ok, rgb_frame = removed_capture.read()
+            if not removed_ok:
+                raise RuntimeError(
+                    f"Video decode failed at source frame "
+                    f"{expected_source_index}"
+                )
+            frame_path = frame_root / f"{completed:05d}.png"
+            if not cv2.imwrite(str(frame_path), rgb_frame):
+                raise RuntimeError(f"Failed to write {frame_path}")
+            depth_mm = depth_m_to_uint16_mm(depths_mesh_m[completed])
+            depth_path = depth_root / f"{completed:05d}.png"
+            if not cv2.imwrite(str(depth_path), depth_mm):
+                raise RuntimeError(f"Failed to write {depth_path}")
+            positive = depth_mm[depth_mm > 0]
+            if positive.size:
+                stride = max(1, positive.size // 4096)
+                positive_depth_samples.append(positive[::stride])
+            completed += 1
+            print(
+                f"Prepared RGB-D frames {completed}/{episode.frame_count}",
+                flush=True,
+            )
+    finally:
+        removed_capture.release()
+
+    episode_data_path = output_root / "episode_data.npz"
+    episode_data = {
+        "episode_index": np.asarray(episode.episode_index, dtype=np.int64),
+        "source_dataset_kind": np.asarray(episode.source_dataset_kind),
+        "fps": np.asarray(episode.fps, dtype=np.float64),
+        "source_size": np.asarray(episode.source_size, dtype=np.int64),
+        "mesh_size": np.asarray(mesh_size, dtype=np.int64),
+        "frame_indices": episode.frame_indices,
+        "human_arm_visible": human_arm_visible,
+        "joint_names": np.asarray(episode.joint_names),
+        "joint_positions": joint_positions.astype(np.float32),
+        "root_pose_xyzw": episode.root_pose_xyzw.astype(np.float32),
+        "camera_pose_cv_xyzw": camera_pose.astype(np.float32),
+        "intrinsic": episode.intrinsic.astype(np.float64),
+        "mesh_intrinsic": mesh_intrinsic.astype(np.float64),
+        "scene_scale": np.asarray(episode.scene_scale, dtype=np.float64),
+        "scene_translation_world_xyz_m": scene_translation_world_xyz_m,
+        "g1_urdf": np.asarray(str(args.urdf.resolve())),
+        "vda_metric_scale": np.asarray(
+            resolved_vda_metric_scale,
+            dtype=np.float64,
+        ),
+        "vda_scale_mode": np.asarray(
+            str(scale_calibration["resolved_mode"])
+        ),
+        "lighting_profile": np.asarray(str(lighting_profile_path)),
+    }
+    np.savez_compressed(episode_data_path, **episode_data)
+
+    samples = (
+        np.concatenate(positive_depth_samples)
+        if positive_depth_samples
+        else np.empty(0, dtype=np.uint16)
+    )
+    percentiles = (
+        np.percentile(samples, [1, 50, 99]).tolist()
+        if samples.size
+        else [None, None, None]
+    )
+    decision = scale_calibration.get("decision", {})
+    depth_report: dict[str, object] = {
+        "model": f"Metric-VDA-{MODEL_SCALE_NAMES[args.vda_encoder]}",
+        "checkpoint_sha256": checkpoint_sha256,
+        "scale_mode": scale_calibration["resolved_mode"],
+        "calibration_method": scale_calibration.get("method", "fixed"),
+        "calibration_status": decision.get("status", "fixed"),
+        "calibration_reasons": decision.get("reasons", []),
+        "vda_scale": resolved_vda_metric_scale,
+        "scene_scale": episode.scene_scale,
+        "effective_scale": resolved_vda_metric_scale * episode.scene_scale,
+        "clipped_pixels": clipped_depth_pixels,
+        "percentiles_mm": {
+            "p01": percentiles[0],
+            "p50": percentiles[1],
+            "p99": percentiles[2],
+        },
+    }
+    report: dict[str, object] = {
+        "schema_version": 3,
+        "source_dataset_kind": episode.source_dataset_kind,
+        "episode_index": episode.episode_index,
+        "source_stem": episode.source_stem,
+        "frame_count": episode.frame_count,
+        "fps": episode.fps,
+        "source_size": list(episode.source_size),
+        "mesh_size": list(mesh_size),
+        "depth": depth_report,
+        "human_arm_visible_frames": int(human_arm_visible.sum()),
+        "lighting_profile": str(lighting_profile_path),
+        "episode_data": str(episode_data_path),
+        "elapsed_seconds": time.perf_counter() - started,
+    }
+    report_path = output_root / "prepare_report.json"
+    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    print(json.dumps(report, indent=2), flush=True)
+    return report
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Prepare one retargeted G1 episode as handless RGB plus automatically "
+            "calibrated metric Video Depth Anything for the unified Isaac "
+            "replay."
+        )
+    )
+    parser.add_argument("--dataset", type=Path, required=True)
+    parser.add_argument(
+        "--source-root",
+        type=Path,
+        required=True,
+        help="Source dataset root used to resolve manifest paths",
+    )
+    parser.add_argument(
+        "--removed-root",
+        type=Path,
+        required=True,
+        help=(
+            "Handless root mirroring the retargeted video layout"
+        ),
+    )
+    parser.add_argument("--episode", type=int, default=0)
+    parser.add_argument("--urdf", type=Path, default=DEFAULT_G1_URDF)
+    parser.add_argument("--start-frame", type=int, default=0)
+    parser.add_argument("--end-frame", type=int)
+    parser.add_argument(
+        "--mesh-width",
+        type=int,
+        default=480,
+        help=(
+            "Internal RGB-D mesh width; its height is derived from the source "
+            "video aspect ratio. This does not change output video size."
+        ),
+    )
+    parser.add_argument(
+        "--vda-checkpoint",
+        type=Path,
+        default=DEFAULT_CHECKPOINT,
+        help="Metric Video Depth Anything checkpoint",
+    )
+    parser.add_argument(
+        "--vda-encoder",
+        choices=tuple(MODEL_CONFIGS),
+        default="vitl",
+    )
+    parser.add_argument(
+        "--vda-input-size",
+        type=int,
+        default=518,
+        help="Video Depth Anything network input size (default: 518)",
+    )
+    parser.add_argument(
+        "--vda-max-resolution",
+        type=int,
+        default=1280,
+        help=(
+            "Maximum source-frame dimension retained for VDA inference; "
+            "0 disables the cap (default: 1280)"
+        ),
+    )
+    parser.add_argument(
+        "--vda-scale-mode",
+        choices=("auto", "fixed"),
+        default="auto",
+        help=(
+            "Estimate one per-episode VDA-to-source metric scale from an "
+            "available metric anchor, or use a fixed value "
+            "(default: auto)"
+        ),
+    )
+    parser.add_argument(
+        "--vda-metric-scale",
+        type=float,
+        default=DEFAULT_VDA_METRIC_SCALE,
+        help=(
+            "Scale used only by --vda-scale-mode fixed "
+            "(default: legacy 0.525)"
+        ),
+    )
+    parser.add_argument(
+        "--vda-scale-mask-dir",
+        type=Path,
+        help=(
+            "Optional changed-region PNG directory indexed by source frame; "
+            "default derives the changed region from original/handless RGB"
+        ),
+    )
+    parser.add_argument(
+        "--vda-fp32",
+        action="store_true",
+        help="Disable CUDA autocast for VDA inference",
+    )
+    parser.add_argument("--output", type=Path, required=True)
+    return parser
+
+
+def main() -> None:
+    prepare(build_parser().parse_args())
+
+
+if __name__ == "__main__":
+    main()

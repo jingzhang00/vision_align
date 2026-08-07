@@ -1,0 +1,13 @@
+[submodule "sam3"]
+	path = sam3
+	url = https://github.com/facebookresearch/sam3.git
+[submodule "ProPainter"]
+	path = ProPainter
+	url = https://github.com/sczhou/ProPainter.git
+[submodule "Inpaint-Anything"]
+	path = Inpaint-Anything
+	url = https://github.com/geekyutao/Inpaint-Anything.git
+	branch = main_2026
+[submodule "Video-Depth-Anything"]
+	path = Video-Depth-Anything
+	url = https://github.com/DepthAnything/Video-Depth-Anything.git
