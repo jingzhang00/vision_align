@@ -38,11 +38,11 @@ from scipy.spatial.transform import Rotation
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 WORKSPACE_ROOT = SCRIPT_DIR.parents[1]
-STREAM_ROOT = WORKSPACE_ROOT / "stream"
+GMR_ROOT = WORKSPACE_ROOT / "GMR"
 if str(WORKSPACE_ROOT) not in sys.path:
     sys.path.insert(0, str(WORKSPACE_ROOT))
-if str(STREAM_ROOT) not in sys.path:
-    sys.path.insert(0, str(STREAM_ROOT))
+if str(GMR_ROOT) not in sys.path:
+    sys.path.insert(0, str(GMR_ROOT))
 
 from general_motion_retargeting import (  # noqa: E402
     GeneralMotionRetargeting as GMR,

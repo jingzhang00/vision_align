@@ -11,3 +11,6 @@
 [submodule "Video-Depth-Anything"]
 	path = Video-Depth-Anything
 	url = https://github.com/DepthAnything/Video-Depth-Anything.git
+[submodule "GMR"]
+	path = GMR
+	url = https://github.com/YanjieZe/GMR.git

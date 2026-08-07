@@ -24,8 +24,8 @@ from typing import Any, Iterable
 
 SCRIPT_PATH = Path(__file__).resolve()
 WORKSPACE_ROOT = SCRIPT_PATH.parents[2]
-STREAM_ROOT = WORKSPACE_ROOT / "stream"
-for import_root in (WORKSPACE_ROOT, STREAM_ROOT):
+GMR_ROOT = WORKSPACE_ROOT / "GMR"
+for import_root in (WORKSPACE_ROOT, GMR_ROOT):
     if str(import_root) not in sys.path:
         sys.path.insert(0, str(import_root))
 
