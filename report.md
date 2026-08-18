@@ -119,11 +119,7 @@ $$
 
 session 级 hand-eye 标定求唯一的固定 head-to-device 外参，使两条相对运动链一致：
 
-$$
-\Delta\mathbf T_D(i,j)\mathbf T^D_H
-=
-\mathbf T^D_H\Delta\mathbf T_H(i,j)
-$$
+$$\Delta\mathbf T_D(i,j)\mathbf T^D_H=\mathbf T^D_H\Delta\mathbf T_H(i,j)$$
 
 参数：`T^D_H` 始终表示 motion-head → Aria-device 的固定安装变换；同一 session 的所有可用 clip 共同估计它，但不跨 clip 构造相对运动。
 
